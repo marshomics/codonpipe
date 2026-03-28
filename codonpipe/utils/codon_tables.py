@@ -85,6 +85,28 @@ AMINO_ACID_FAMILIES = {
     "Gly": ["Gly-GGU", "Gly-GGC", "Gly-GGA", "Gly-GGG"],
 }
 
+# Synonymous codon families for RSCU computation.
+# Ser, Leu, and Arg are SPLIT into 4-fold and 2-fold subfamilies because
+# the two groups occupy different codon boxes and cannot interconvert via
+# single nucleotide substitutions.  Pooling all 6 codons inflates/deflates
+# RSCU values across subfamilies (see Shields et al. 1988; Sharp et al. 1986).
+# ENC computation (Wright 1990) should still treat them as 6-fold —
+# use AA_CODON_GROUPS for that purpose.
+AA_CODON_GROUPS_RSCU: dict[str, list[str]] = {}
+for _aa, _codons in AA_CODON_GROUPS.items():
+    if _aa == "Ser":
+        AA_CODON_GROUPS_RSCU["Ser4"] = [c for c in _codons if c.startswith("UC")]
+        AA_CODON_GROUPS_RSCU["Ser2"] = [c for c in _codons if not c.startswith("UC")]
+    elif _aa == "Leu":
+        AA_CODON_GROUPS_RSCU["Leu4"] = [c for c in _codons if c.startswith("CU")]
+        AA_CODON_GROUPS_RSCU["Leu2"] = [c for c in _codons if not c.startswith("CU")]
+    elif _aa == "Arg":
+        AA_CODON_GROUPS_RSCU["Arg4"] = [c for c in _codons if c.startswith("CG")]
+        AA_CODON_GROUPS_RSCU["Arg2"] = [c for c in _codons if not c.startswith("CG")]
+    else:
+        AA_CODON_GROUPS_RSCU[_aa] = _codons
+
+
 # DNA to RNA codon conversion
 def dna_to_rna(seq: str) -> str:
     """Convert a DNA sequence to RNA."""
