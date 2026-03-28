@@ -35,6 +35,91 @@ logger = logging.getLogger("codonpipe")
 # Minimum gene length (nucleotides) for analyses
 MIN_GENE_LENGTH = 240
 
+# Prefixes commonly prepended to gene IDs in GFF3 ID= attributes
+_GFF_ID_PREFIXES = ("cds-", "gene-", "rna-", "mrna-", "CDS:", "gene:", "cds_", "gene_")
+
+
+def _extract_gene_ids_from_attrs(attrs: str) -> list[str]:
+    """Extract candidate gene IDs from a GFF3 attributes string.
+
+    Tries ID=, Name=, locus_tag=, protein_id=, and Parent= fields.
+    For each raw value also generates prefix-stripped variants
+    (e.g. ``cds-WP_123`` → ``WP_123``).
+
+    Returns a list of candidate IDs, ordered from most to least
+    specific (Name/locus_tag first, then ID/Parent).
+    """
+    candidates: list[str] = []
+    # Fields in priority order — Name and locus_tag are the most
+    # likely to match FASTA record.id values produced by Prokka / PGAP.
+    for field in ("Name", "locus_tag", "protein_id", "ID", "Parent"):
+        m = re.search(rf"{field}=([^;\n]+)", attrs)
+        if m:
+            raw = m.group(1)
+            candidates.append(raw)
+            # Strip common prefixes
+            for pfx in _GFF_ID_PREFIXES:
+                if raw.startswith(pfx):
+                    candidates.append(raw[len(pfx):])
+    return candidates
+
+
+def _parse_gff_gene_map(
+    gff_path: Path,
+    known_genes: set[str],
+    feature_types: tuple[str, ...] = ("gene", "CDS"),
+) -> dict[str, tuple[int, int, str]]:
+    """Parse a GFF3 file and return ``{gene_id: (start, end, strand)}``
+    where *gene_id* is resolved against *known_genes* (RSCU gene names).
+
+    When the GFF ``ID=`` value doesn't match any known gene, the function
+    tries alternative attribute fields and prefix-stripped forms.
+    """
+    gene_coords: dict[str, tuple[int, int, str]] = {}
+    unresolved = 0
+
+    with open(gff_path) as fh:
+        for line in fh:
+            if line.startswith("#") or line.startswith(">"):
+                continue
+            parts = line.strip().split("\t")
+            if len(parts) < 9 or parts[2] not in feature_types:
+                continue
+            start, end, strand = int(parts[3]), int(parts[4]), parts[6]
+            attrs = parts[8]
+
+            candidates = _extract_gene_ids_from_attrs(attrs)
+            resolved = None
+            for cid in candidates:
+                if cid in known_genes:
+                    resolved = cid
+                    break
+            if resolved is None:
+                unresolved += 1
+                continue
+            # Keep first occurrence (don't overwrite gene with CDS for
+            # same locus).
+            if resolved not in gene_coords:
+                gene_coords[resolved] = (start, end, strand)
+
+    total_features = len(gene_coords) + unresolved
+    if unresolved and total_features:
+        pct = 100 * unresolved / total_features
+        logger.debug(
+            "GFF ID resolution: %d/%d features matched known genes "
+            "(%.0f%% unresolved)",
+            len(gene_coords), total_features, pct,
+        )
+        if not gene_coords:
+            # Log some examples of what we saw vs what we expected
+            logger.warning(
+                "No GFF features could be matched to RSCU gene names. "
+                "Example RSCU genes: %s",
+                list(known_genes)[:5],
+            )
+
+    return gene_coords
+
 
 def detect_hgt_candidates(
     rscu_gene_df: pd.DataFrame,
@@ -550,26 +635,23 @@ def compute_strand_asymmetry(
         logger.warning("No GFF path provided; cannot compute strand asymmetry")
         return None
 
-    # Parse GFF to get gene -> strand mapping
-    gene_strand = {}
+    # Parse GFF to get gene -> strand mapping, resolving IDs against
+    # RSCU gene names when available
+    known_genes: set[str] = set()
+    if rscu_gene_df is not None and not rscu_gene_df.empty:
+        known_genes = set(rscu_gene_df["gene"].astype(str))
+    # Also include FASTA record IDs so we still get strand info even
+    # without an RSCU table
+    for rec in SeqIO.parse(str(ffn_path), "fasta"):
+        known_genes.add(rec.id)
+
     try:
-        with open(gff_path) as f:
-            for line in f:
-                if line.startswith("#") or line.startswith(">"):
-                    continue
-                parts = line.strip().split("\t")
-                if len(parts) < 9 or parts[2] not in ("gene", "CDS"):
-                    continue
-                strand = parts[6]
-                attrs = parts[8]
-                # Extract gene ID
-                match = re.search(r"ID=([^;]+)", attrs)
-                if match:
-                    gene_id = match.group(1)
-                    gene_strand[gene_id] = strand
+        gene_coords = _parse_gff_gene_map(gff_path, known_genes)
     except Exception as e:
         logger.warning("Error parsing GFF: %s", e)
         return None
+
+    gene_strand = {gid: strand for gid, (_, _, strand) in gene_coords.items()}
 
     if not gene_strand:
         logger.warning("No genes with strand info found in GFF")
@@ -648,33 +730,29 @@ def compute_operon_codon_coadaptation(
     for _, row in rscu_gene_df.iterrows():
         rscu_map[row["gene"]] = row[rscu_cols].values
 
-    # Parse GFF for gene order
-    genes_plus = []
-    genes_minus = []
-    gene_coords = {}  # gene -> (start, end, strand)
+    # Parse GFF for gene order, resolving IDs against RSCU gene names
+    known_genes = set(rscu_map.keys())
     try:
-        with open(gff_path) as f:
-            for line in f:
-                if line.startswith("#") or line.startswith(">"):
-                    continue
-                parts = line.strip().split("\t")
-                if len(parts) < 9 or parts[2] not in ("gene", "CDS"):
-                    continue
-                start, end, strand = int(parts[3]), int(parts[4]), parts[6]
-                attrs = parts[8]
-                match = re.search(r"ID=([^;]+)", attrs)
-                if match:
-                    gene_id = match.group(1)
-                    gene_coords[gene_id] = (start, end, strand)
-                    if strand == "+":
-                        genes_plus.append((start, gene_id))
-                    else:
-                        genes_minus.append((start, gene_id))
+        gene_coords = _parse_gff_gene_map(gff_path, known_genes)
     except Exception as e:
         logger.warning("Error parsing GFF: %s", e)
         return None
 
-    # Sort by position
+    if not gene_coords:
+        logger.warning(
+            "No GFF features matched RSCU gene names (%d RSCU genes, GFF: %s)",
+            len(known_genes), gff_path,
+        )
+        return None
+
+    # Split by strand and sort by position
+    genes_plus = []
+    genes_minus = []
+    for gid, (start, end, strand) in gene_coords.items():
+        if strand == "+":
+            genes_plus.append((start, gid))
+        else:
+            genes_minus.append((start, gid))
     genes_plus.sort()
     genes_minus.sort()
 
@@ -683,9 +761,6 @@ def compute_operon_codon_coadaptation(
         for i in range(len(gene_list) - 1):
             g1_id = gene_list[i][1]
             g2_id = gene_list[i + 1][1]
-
-            if g1_id not in rscu_map or g2_id not in rscu_map:
-                continue
 
             rscu1 = rscu_map[g1_id]
             rscu2 = rscu_map[g2_id]
