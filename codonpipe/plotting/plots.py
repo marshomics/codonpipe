@@ -1892,7 +1892,7 @@ def plot_strand_asymmetry(
         plus = aa_data["rscu_plus"].values
         minus = aa_data["rscu_minus"].values
         colors_plus = ["red" if s else "steelblue" for s in aa_data["significant"]]
-        colors_minus = ["darkred" if s else "darksteelblue" for s in aa_data["significant"]]
+        colors_minus = ["darkred" if s else "slategray" for s in aa_data["significant"]]
 
         bars1 = ax.bar(x_pos - width / 2, plus, width, label="+", color=colors_plus, alpha=0.7, edgecolor="black", linewidth=0.5)
         bars2 = ax.bar(x_pos + width / 2, minus, width, label="-", color=colors_minus, alpha=0.7, edgecolor="black", linewidth=0.5)
