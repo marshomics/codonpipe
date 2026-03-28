@@ -1233,6 +1233,7 @@ def plot_hgt_burden_comparison(
          "Proportion of Genes Flagged as HGT"),
     ]
 
+    n_conds = len(conditions)
     for ax, (burden_key, metric_col, ylabel, title) in zip(axes, panels):
         if metric_col in metrics_df.columns:
             plot_data = metrics_df[[condition_col, metric_col]].dropna()
@@ -1254,15 +1255,27 @@ def plot_hgt_burden_comparison(
                 ax.set_title(title, fontsize=11)
 
                 # Annotate with test results
-                if burden_key in hgt_burden:
-                    info = hgt_burden[burden_key]
-                    p_val = info.get("p_value", 1)
-                    delta = info.get("cliffs_delta", 0)
-                    label = info.get("effect_size", "")
-                    sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else "ns"
-                    ax.text(0.5, 0.98, f"p = {p_val:.3e}  |  δ = {delta:.3f} ({label}) {sig}",
-                            transform=ax.transAxes, ha="center", va="top", fontsize=9,
-                            bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray", alpha=0.8))
+                if n_conds == 2:
+                    # 2-condition: use backward-compat "mahalanobis" key
+                    if burden_key in hgt_burden:
+                        info = hgt_burden[burden_key]
+                        p_val = info.get("p_value", 1)
+                        delta = info.get("cliffs_delta", 0)
+                        label = info.get("effect_size", "")
+                        sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else "ns"
+                        ax.text(0.5, 0.98, f"p = {p_val:.3e}  |  δ = {delta:.3f} ({label}) {sig}",
+                                transform=ax.transAxes, ha="center", va="top", fontsize=9,
+                                bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray", alpha=0.8))
+                else:
+                    # 3+ conditions: use omnibus key if available
+                    omnibus_key = f"{burden_key}_omnibus"
+                    if omnibus_key in hgt_burden:
+                        info = hgt_burden[omnibus_key]
+                        p_val = info.get("p_value", 1)
+                        sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else "ns"
+                        ax.text(0.5, 0.98, f"Omnibus: p = {p_val:.3e} {sig}",
+                                transform=ax.transAxes, ha="center", va="top", fontsize=9,
+                                bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray", alpha=0.8))
         else:
             ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center", va="center")
             ax.set_title(title, fontsize=11)
@@ -1338,7 +1351,8 @@ def plot_optimal_codon_divergence(
 ) -> None:
     """Dot plot showing which codons are optimal in each condition.
 
-    X-axis: delta-RSCU in condition A, Y-axis: delta-RSCU in condition B.
+    For 2 conditions: X-axis: delta-RSCU in condition A, Y-axis: delta-RSCU in condition B.
+    For 3+ conditions: Heatmap of mean_delta_rscu across all conditions with optimal indicator.
     Points are colored by agreement (green = same, red = divergent).
     Quadrant lines at 0 divide optimal/non-optimal per condition.
     """
@@ -1351,55 +1365,100 @@ def plot_optimal_codon_divergence(
     if len(delta_cols) < 2:
         return
 
-    cond_a = delta_cols[0].replace("mean_delta_rscu_", "")
-    cond_b = delta_cols[1].replace("mean_delta_rscu_", "")
+    if len(delta_cols) == 2:
+        # 2-condition scatter plot
+        cond_a = delta_cols[0].replace("mean_delta_rscu_", "")
+        cond_b = delta_cols[1].replace("mean_delta_rscu_", "")
 
-    fig, ax = plt.subplots(figsize=(8, 8))
+        fig, ax = plt.subplots(figsize=(8, 8))
 
-    agree = optimal_codons_df["agreement"]
-    ax.scatter(
-        optimal_codons_df.loc[agree, delta_cols[0]],
-        optimal_codons_df.loc[agree, delta_cols[1]],
-        c="#2ca02c", alpha=0.6, s=40, label="Agree", edgecolors="none",
-    )
-    ax.scatter(
-        optimal_codons_df.loc[~agree, delta_cols[0]],
-        optimal_codons_df.loc[~agree, delta_cols[1]],
-        c="#d62728", alpha=0.8, s=60, label="Diverge", edgecolors="black", linewidths=0.5,
-    )
-
-    # Label the most divergent codons
-    top_div = optimal_codons_df.loc[~agree].nlargest(10, "delta_difference", keep="first")
-    bottom_div = optimal_codons_df.loc[~agree].nsmallest(10, "delta_difference", keep="first")
-    for _, row in pd.concat([top_div, bottom_div]).iterrows():
-        ax.annotate(
-            row["codon"], (row[delta_cols[0]], row[delta_cols[1]]),
-            fontsize=7, ha="left", va="bottom",
-            xytext=(3, 3), textcoords="offset points",
+        agree = optimal_codons_df.get("unanimous", optimal_codons_df.get("agreement", pd.Series(True, index=optimal_codons_df.index)))
+        ax.scatter(
+            optimal_codons_df.loc[agree, delta_cols[0]],
+            optimal_codons_df.loc[agree, delta_cols[1]],
+            c="#2ca02c", alpha=0.6, s=40, label="Agree", edgecolors="none",
+        )
+        ax.scatter(
+            optimal_codons_df.loc[~agree, delta_cols[0]],
+            optimal_codons_df.loc[~agree, delta_cols[1]],
+            c="#d62728", alpha=0.8, s=60, label="Diverge", edgecolors="black", linewidths=0.5,
         )
 
-    ax.axhline(0, color="gray", linewidth=0.5, linestyle="--")
-    ax.axvline(0, color="gray", linewidth=0.5, linestyle="--")
-    ax.set_xlabel(f"ΔRSCU (high-expr enrichment) — {cond_a}", fontsize=11)
-    ax.set_ylabel(f"ΔRSCU (high-expr enrichment) — {cond_b}", fontsize=11)
-    ax.set_title("Optimal Codon Divergence Between Conditions", fontsize=12)
-    ax.legend(loc="upper left", fontsize=9)
+        # Label the most divergent codons
+        if "delta_difference" in optimal_codons_df.columns:
+            top_div = optimal_codons_df.loc[~agree].nlargest(10, "delta_difference", keep="first")
+            bottom_div = optimal_codons_df.loc[~agree].nsmallest(10, "delta_difference", keep="first")
+            for _, row in pd.concat([top_div, bottom_div]).iterrows():
+                ax.annotate(
+                    row["codon"], (row[delta_cols[0]], row[delta_cols[1]]),
+                    fontsize=7, ha="left", va="bottom",
+                    xytext=(3, 3), textcoords="offset points",
+                )
 
-    # Quadrant labels
-    lim = max(abs(ax.get_xlim()[0]), abs(ax.get_xlim()[1]),
-              abs(ax.get_ylim()[0]), abs(ax.get_ylim()[1])) * 1.1
-    ax.set_xlim(-lim, lim)
-    ax.set_ylim(-lim, lim)
-    ax.text(lim * 0.6, lim * 0.9, f"Optimal in both", fontsize=8, color="gray", ha="center")
-    ax.text(-lim * 0.6, -lim * 0.9, f"Non-optimal in both", fontsize=8, color="gray", ha="center")
-    ax.text(lim * 0.6, -lim * 0.9, f"Optimal only\nin {cond_a}", fontsize=8, color="gray", ha="center")
-    ax.text(-lim * 0.6, lim * 0.9, f"Optimal only\nin {cond_b}", fontsize=8, color="gray", ha="center")
+        ax.axhline(0, color="gray", linewidth=0.5, linestyle="--")
+        ax.axvline(0, color="gray", linewidth=0.5, linestyle="--")
+        ax.set_xlabel(f"ΔRSCU (high-expr enrichment) — {cond_a}", fontsize=11)
+        ax.set_ylabel(f"ΔRSCU (high-expr enrichment) — {cond_b}", fontsize=11)
+        ax.set_title("Optimal Codon Divergence Between Conditions", fontsize=12)
+        ax.legend(loc="upper left", fontsize=9)
 
-    n_agree = agree.sum()
-    n_disagree = (~agree).sum()
-    ax.text(0.02, 0.02, f"Agreement: {n_agree}/{len(agree)} codons  ({100*n_agree/len(agree):.0f}%)",
-            transform=ax.transAxes, fontsize=9,
-            bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.8))
+        # Quadrant labels
+        lim = max(abs(ax.get_xlim()[0]), abs(ax.get_xlim()[1]),
+                  abs(ax.get_ylim()[0]), abs(ax.get_ylim()[1])) * 1.1
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.text(lim * 0.6, lim * 0.9, f"Optimal in both", fontsize=8, color="gray", ha="center")
+        ax.text(-lim * 0.6, -lim * 0.9, f"Non-optimal in both", fontsize=8, color="gray", ha="center")
+        ax.text(lim * 0.6, -lim * 0.9, f"Optimal only\nin {cond_a}", fontsize=8, color="gray", ha="center")
+        ax.text(-lim * 0.6, lim * 0.9, f"Optimal only\nin {cond_b}", fontsize=8, color="gray", ha="center")
+
+        n_agree = agree.sum()
+        n_disagree = (~agree).sum()
+        ax.text(0.02, 0.02, f"Agreement: {n_agree}/{len(agree)} codons  ({100*n_agree/len(agree):.0f}%)",
+                transform=ax.transAxes, fontsize=9,
+                bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.8))
+
+    else:
+        # 3+ conditions: heatmap of delta-RSCU values
+        conditions = [c.replace("mean_delta_rscu_", "") for c in delta_cols]
+        df = optimal_codons_df.copy()
+        df = df.sort_values(delta_cols[0], key=abs, ascending=False)
+
+        # Build heatmap matrix
+        heat_data = df[delta_cols].copy()
+        heat_data.columns = conditions
+        heat_data.index = df["codon"]
+
+        # Build heatmap with n_conditions_optimal as side column
+        fig, (ax_heat, ax_side) = plt.subplots(
+            1, 2, figsize=(10 + len(conditions) * 0.8, max(8, len(df) * 0.25)),
+            gridspec_kw={"width_ratios": [1, 0.15]}
+        )
+
+        # Heatmap
+        vmax = max(abs(heat_data.values.min()), abs(heat_data.values.max()), 0.1)
+        im = ax_heat.imshow(heat_data.values, aspect="auto", cmap="RdBu_r",
+                            vmin=-vmax, vmax=vmax)
+        ax_heat.set_xticks(range(len(conditions)))
+        ax_heat.set_xticklabels(conditions, fontsize=10)
+        ax_heat.set_yticks(range(len(heat_data)))
+        ax_heat.set_yticklabels(heat_data.index, fontsize=7)
+        ax_heat.set_title("ΔRSCU (high-expr enrichment) Across Conditions", fontsize=11)
+        plt.colorbar(im, ax=ax_heat, shrink=0.8, label="ΔRSCU")
+
+        # Side column: n_conditions_optimal
+        if "n_conditions_optimal" in df.columns:
+            n_opt = df["n_conditions_optimal"].values
+            n_opt_normalized = n_opt / len(conditions)
+            ax_side.imshow(n_opt_normalized.reshape(-1, 1), aspect="auto", cmap="YlGn",
+                           vmin=0, vmax=1)
+            ax_side.set_xticks([0])
+            ax_side.set_xticklabels(["n_opt"], fontsize=9)
+            ax_side.set_yticks(range(len(heat_data)))
+            ax_side.set_yticklabels([""] * len(heat_data), fontsize=7)
+            # Add text annotations for n_conditions_optimal
+            for i, val in enumerate(n_opt):
+                ax_side.text(0, i, str(int(val)), ha="center", va="center", fontsize=7, fontweight="bold")
 
     fig.tight_layout()
     _save_fig(fig, output_path)
@@ -1413,56 +1472,133 @@ def plot_strand_asymmetry_pattern_comparison(
 
     Top: heatmap of mean asymmetry (plus-minus RSCU) per condition per codon.
     Bottom: lollipop plot of difference in asymmetry, colored by significance.
+    For 3+ conditions: multi-panel lollipops (one per pair) with shared heatmap.
     """
     _apply_style()
     if strand_asym_patterns_df.empty:
         return
 
-    # Identify condition columns
-    asym_cols = [c for c in strand_asym_patterns_df.columns if c.startswith("mean_asymmetry_")]
-    if len(asym_cols) < 2:
-        return
-
-    cond_a = asym_cols[0].replace("mean_asymmetry_", "")
-    cond_b = asym_cols[1].replace("mean_asymmetry_", "")
-
     df = strand_asym_patterns_df.copy()
-    df = df.sort_values("diff", key=abs, ascending=False)
 
-    fig, (ax_heat, ax_lollipop) = plt.subplots(
-        2, 1, figsize=(max(12, len(df) * 0.35), 10),
-        gridspec_kw={"height_ratios": [1, 2]},
-    )
+    # Check for pairwise format (test, group1, group2 columns)
+    has_pairs = "test" in df.columns and "group1" in df.columns and "group2" in df.columns
 
-    # -- Heatmap --
-    heat_data = df[[asym_cols[0], asym_cols[1]]].T
-    heat_data.columns = df["codon"].values
-    heat_data.index = [cond_a, cond_b]
-    vmax = max(abs(heat_data.values.min()), abs(heat_data.values.max()))
-    im = ax_heat.imshow(heat_data.values, aspect="auto", cmap="RdBu_r",
-                        vmin=-vmax, vmax=vmax)
-    ax_heat.set_xticks(range(len(heat_data.columns)))
-    ax_heat.set_xticklabels(heat_data.columns, rotation=90, fontsize=7)
-    ax_heat.set_yticks(range(2))
-    ax_heat.set_yticklabels([cond_a, cond_b], fontsize=10)
-    ax_heat.set_title("Per-Codon Strand Asymmetry (+ minus − strand RSCU)", fontsize=11)
-    plt.colorbar(im, ax=ax_heat, shrink=0.6, label="ΔRSCU (plus − minus)")
+    if has_pairs:
+        # Filter to pairwise mann_whitney_u results
+        df = df[df["test"] == "mann_whitney_u"].copy()
+        if df.empty:
+            return
 
-    # -- Lollipop --
-    x = range(len(df))
-    sig_mask = df["significant"].values
-    colors_lollipop = ["#d62728" if s else "#cccccc" for s in sig_mask]
-    ax_lollipop.vlines(x, 0, df["diff"].values, colors=colors_lollipop, linewidth=1.5)
-    ax_lollipop.scatter(x, df["diff"].values, c=colors_lollipop, s=30, zorder=3)
-    ax_lollipop.axhline(0, color="black", linewidth=0.5)
-    ax_lollipop.set_xticks(list(x))
-    ax_lollipop.set_xticklabels(df["codon"].values, rotation=90, fontsize=7)
-    ax_lollipop.set_ylabel(f"Asymmetry Difference ({cond_a} − {cond_b})", fontsize=10)
-    ax_lollipop.set_title(
-        f"Condition Difference in Strand Asymmetry  "
-        f"(red = FDR < 0.05, {sig_mask.sum()}/{len(sig_mask)} significant)",
-        fontsize=11,
-    )
+        # Get unique pairs
+        pair_list = []
+        for (g1, g2), group_data in df.groupby(["group1", "group2"], sort=False):
+            pair_list.append((g1, g2, group_data))
+
+        n_pairs = len(pair_list)
+        fig = plt.figure(figsize=(max(12, 8 * n_pairs), 10))
+        gs = gridspec.GridSpec(2, n_pairs, height_ratios=[1, 2], figure=fig)
+
+        # Collect all conditions for heatmap
+        all_conditions = set()
+        for g1, g2, _ in pair_list:
+            all_conditions.add(g1)
+            all_conditions.add(g2)
+        all_conditions = sorted(all_conditions)
+
+        # Build heatmap from mean_group1/mean_group2 values
+        # For simplicity, reconstruct per-condition means from first pair's data
+        first_pair_data = pair_list[0][2]
+        all_codons = sorted(first_pair_data["codon"].unique()) if "codon" in first_pair_data.columns else []
+
+        # Create heatmap for all conditions
+        ax_heat = fig.add_subplot(gs[0, :])
+        heat_data = pd.DataFrame(index=all_codons)
+
+        for pair_idx, (cond_a, cond_b, pair_df) in enumerate(pair_list):
+            pair_df = pair_df.sort_values("diff", key=abs, ascending=False)
+            # Use mean_group1 and mean_group2 for this pair
+            if pair_idx == 0:
+                # First pair: use its values for heatmap columns
+                heat_data[cond_a] = pair_df.set_index("codon").reindex(all_codons)["mean_group1"]
+                heat_data[cond_b] = pair_df.set_index("codon").reindex(all_codons)["mean_group2"]
+
+        if not heat_data.empty and heat_data.notna().any().any():
+            vmax = max(abs(heat_data.values.min()), abs(heat_data.values.max()))
+            im = ax_heat.imshow(heat_data.T.values, aspect="auto", cmap="RdBu_r",
+                                vmin=-vmax, vmax=vmax)
+            ax_heat.set_xticks(range(len(all_codons)))
+            ax_heat.set_xticklabels(all_codons, rotation=90, fontsize=7)
+            ax_heat.set_yticks(range(len(heat_data.columns)))
+            ax_heat.set_yticklabels(heat_data.columns, fontsize=9)
+            ax_heat.set_title("Per-Codon Strand Asymmetry (+ minus − strand RSCU)", fontsize=11)
+            plt.colorbar(im, ax=ax_heat, shrink=0.8, label="ΔRSCU (plus − minus)")
+
+        # Create lollipop plots for each pair
+        for pair_idx, (cond_a, cond_b, pair_df) in enumerate(pair_list):
+            ax_lollipop = fig.add_subplot(gs[1, pair_idx])
+            pair_df = pair_df.sort_values("diff", key=abs, ascending=False)
+
+            x = range(len(pair_df))
+            sig_mask = pair_df["significant"].values
+            colors_lollipop = ["#d62728" if s else "#cccccc" for s in sig_mask]
+            ax_lollipop.vlines(x, 0, pair_df["diff"].values, colors=colors_lollipop, linewidth=1.5)
+            ax_lollipop.scatter(x, pair_df["diff"].values, c=colors_lollipop, s=30, zorder=3)
+            ax_lollipop.axhline(0, color="black", linewidth=0.5)
+            ax_lollipop.set_xticks(list(x))
+            ax_lollipop.set_xticklabels(pair_df["codon"].values, rotation=90, fontsize=7)
+            ax_lollipop.set_ylabel(f"Asymmetry Difference", fontsize=9)
+            ax_lollipop.set_title(
+                f"{cond_a} vs {cond_b}  "
+                f"(red = FDR < 0.05, {sig_mask.sum()}/{len(sig_mask)} significant)",
+                fontsize=10,
+            )
+
+    else:
+        # Legacy 2-condition format
+        # Identify condition columns
+        asym_cols = [c for c in df.columns if c.startswith("mean_asymmetry_")]
+        if len(asym_cols) < 2:
+            return
+
+        cond_a = asym_cols[0].replace("mean_asymmetry_", "")
+        cond_b = asym_cols[1].replace("mean_asymmetry_", "")
+
+        df = df.sort_values("diff", key=abs, ascending=False)
+
+        fig, (ax_heat, ax_lollipop) = plt.subplots(
+            2, 1, figsize=(max(12, len(df) * 0.35), 10),
+            gridspec_kw={"height_ratios": [1, 2]},
+        )
+
+        # -- Heatmap --
+        heat_data = df[[asym_cols[0], asym_cols[1]]].T
+        heat_data.columns = df["codon"].values
+        heat_data.index = [cond_a, cond_b]
+        vmax = max(abs(heat_data.values.min()), abs(heat_data.values.max()))
+        im = ax_heat.imshow(heat_data.values, aspect="auto", cmap="RdBu_r",
+                            vmin=-vmax, vmax=vmax)
+        ax_heat.set_xticks(range(len(heat_data.columns)))
+        ax_heat.set_xticklabels(heat_data.columns, rotation=90, fontsize=7)
+        ax_heat.set_yticks(range(2))
+        ax_heat.set_yticklabels([cond_a, cond_b], fontsize=10)
+        ax_heat.set_title("Per-Codon Strand Asymmetry (+ minus − strand RSCU)", fontsize=11)
+        plt.colorbar(im, ax=ax_heat, shrink=0.6, label="ΔRSCU (plus − minus)")
+
+        # -- Lollipop --
+        x = range(len(df))
+        sig_mask = df["significant"].values
+        colors_lollipop = ["#d62728" if s else "#cccccc" for s in sig_mask]
+        ax_lollipop.vlines(x, 0, df["diff"].values, colors=colors_lollipop, linewidth=1.5)
+        ax_lollipop.scatter(x, df["diff"].values, c=colors_lollipop, s=30, zorder=3)
+        ax_lollipop.axhline(0, color="black", linewidth=0.5)
+        ax_lollipop.set_xticks(list(x))
+        ax_lollipop.set_xticklabels(df["codon"].values, rotation=90, fontsize=7)
+        ax_lollipop.set_ylabel(f"Asymmetry Difference ({cond_a} − {cond_b})", fontsize=10)
+        ax_lollipop.set_title(
+            f"Condition Difference in Strand Asymmetry  "
+            f"(red = FDR < 0.05, {sig_mask.sum()}/{len(sig_mask)} significant)",
+            fontsize=11,
+        )
 
     fig.tight_layout()
     _save_fig(fig, output_path)
@@ -1532,6 +1668,7 @@ def plot_expression_class_rscu_volcano(
 
     X-axis: log2 fold-change, Y-axis: -log10(adjusted p-value).
     Significant codons (FDR < 0.05, |log2FC| > 0.3) are labeled.
+    For 3+ conditions, creates multi-panel figure (one subplot per pair).
     """
     _apply_style()
     if rscu_tests_df.empty or "p_adjusted" not in rscu_tests_df.columns:
@@ -1540,43 +1677,94 @@ def plot_expression_class_rscu_volcano(
     df = rscu_tests_df.copy()
     df["-log10_padj"] = -np.log10(df["p_adjusted"].clip(lower=1e-50))
 
-    sig_mask = df["significant"] & (df["log2_fc"].abs() > 0.3)
-    nonsig = df[~sig_mask]
-    sig = df[sig_mask]
+    # Check for new format (group1/group2 columns for pairwise results)
+    if "group1" in df.columns and "group2" in df.columns:
+        # Multi-pair format: group by pair
+        pairs = df.groupby(["group1", "group2"]).size().reset_index(drop=True)[["group1", "group2"]].drop_duplicates()
+        n_pairs = len(pairs.groupby(["group1", "group2"]).ngroups)
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.scatter(nonsig["log2_fc"], nonsig["-log10_padj"], c="#cccccc", s=30,
-               alpha=0.5, edgecolors="none", label="Not significant")
+        # Handle the unique pairs
+        pair_list = []
+        for (g1, g2), group_data in df.groupby(["group1", "group2"], sort=False):
+            pair_list.append((g1, g2, group_data))
 
-    # Color by direction
-    sig_up = sig[sig["log2_fc"] > 0]
-    sig_down = sig[sig["log2_fc"] < 0]
-    cond_cols = [c for c in df.columns if c.startswith("mean_")]
-    cond_names = [c.replace("mean_", "") for c in cond_cols]
-    label_up = f"Higher in {cond_names[0]}" if len(cond_names) >= 1 else "Higher in cond1"
-    label_down = f"Higher in {cond_names[1]}" if len(cond_names) >= 2 else "Higher in cond2"
+        n_pairs = len(pair_list)
+        fig, axes = plt.subplots(1, n_pairs, figsize=(8 * n_pairs, 6))
+        if n_pairs == 1:
+            axes = [axes]
 
-    ax.scatter(sig_up["log2_fc"], sig_up["-log10_padj"], c="#d62728", s=50,
-               alpha=0.8, edgecolors="black", linewidths=0.5, label=label_up)
-    ax.scatter(sig_down["log2_fc"], sig_down["-log10_padj"], c="#1f77b4", s=50,
-               alpha=0.8, edgecolors="black", linewidths=0.5, label=label_down)
+        for ax, (cond_a, cond_b, pair_df) in zip(axes, pair_list):
+            sig_mask = pair_df["significant"] & (pair_df["log2_fc"].abs() > 0.3)
+            nonsig = pair_df[~sig_mask]
+            sig = pair_df[sig_mask]
 
-    # Label significant codons
-    for _, row in sig.iterrows():
-        codon_label = f"{row['amino_acid']}-{row['codon']}" if row.get("amino_acid") else row["codon"]
-        ax.annotate(codon_label, (row["log2_fc"], row["-log10_padj"]),
-                    fontsize=7, ha="left", va="bottom",
-                    xytext=(3, 3), textcoords="offset points")
+            ax.scatter(nonsig["log2_fc"], nonsig["-log10_padj"], c="#cccccc", s=30,
+                       alpha=0.5, edgecolors="none", label="Not significant")
 
-    ax.axhline(-np.log10(0.05), color="gray", linestyle="--", linewidth=0.8, alpha=0.5)
-    ax.axvline(0.3, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
-    ax.axvline(-0.3, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
-    ax.set_xlabel("log₂ Fold-Change", fontsize=11)
-    ax.set_ylabel("-log₁₀(adjusted p-value)", fontsize=11)
-    title_label = "Ribosomal Protein" if gene_set_label == "ribosomal" else "High-Expression"
-    ax.set_title(f"{title_label} RSCU: Condition Differences", fontsize=12)
-    ax.legend(fontsize=9, loc="best")
-    ax.grid(True, alpha=0.15)
+            # Color by direction
+            sig_up = sig[sig["log2_fc"] > 0]
+            sig_down = sig[sig["log2_fc"] < 0]
+
+            ax.scatter(sig_up["log2_fc"], sig_up["-log10_padj"], c="#d62728", s=50,
+                       alpha=0.8, edgecolors="black", linewidths=0.5, label=f"Higher in {cond_a}")
+            ax.scatter(sig_down["log2_fc"], sig_down["-log10_padj"], c="#1f77b4", s=50,
+                       alpha=0.8, edgecolors="black", linewidths=0.5, label=f"Higher in {cond_b}")
+
+            # Label significant codons
+            for _, row in sig.iterrows():
+                codon_label = f"{row['amino_acid']}-{row['codon']}" if row.get("amino_acid") else row["codon"]
+                ax.annotate(codon_label, (row["log2_fc"], row["-log10_padj"]),
+                            fontsize=7, ha="left", va="bottom",
+                            xytext=(3, 3), textcoords="offset points")
+
+            ax.axhline(-np.log10(0.05), color="gray", linestyle="--", linewidth=0.8, alpha=0.5)
+            ax.axvline(0.3, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
+            ax.axvline(-0.3, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
+            ax.set_xlabel("log₂ Fold-Change", fontsize=11)
+            ax.set_ylabel("-log₁₀(adjusted p-value)", fontsize=11)
+            title_label = "Ribosomal Protein" if gene_set_label == "ribosomal" else "High-Expression"
+            ax.set_title(f"{title_label} ({cond_a} vs {cond_b})", fontsize=11)
+            ax.legend(fontsize=8, loc="best")
+            ax.grid(True, alpha=0.15)
+    else:
+        # Legacy 2-condition format
+        sig_mask = df["significant"] & (df["log2_fc"].abs() > 0.3)
+        nonsig = df[~sig_mask]
+        sig = df[sig_mask]
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.scatter(nonsig["log2_fc"], nonsig["-log10_padj"], c="#cccccc", s=30,
+                   alpha=0.5, edgecolors="none", label="Not significant")
+
+        # Color by direction
+        sig_up = sig[sig["log2_fc"] > 0]
+        sig_down = sig[sig["log2_fc"] < 0]
+        cond_cols = [c for c in df.columns if c.startswith("mean_")]
+        cond_names = [c.replace("mean_", "") for c in cond_cols]
+        label_up = f"Higher in {cond_names[0]}" if len(cond_names) >= 1 else "Higher in cond1"
+        label_down = f"Higher in {cond_names[1]}" if len(cond_names) >= 2 else "Higher in cond2"
+
+        ax.scatter(sig_up["log2_fc"], sig_up["-log10_padj"], c="#d62728", s=50,
+                   alpha=0.8, edgecolors="black", linewidths=0.5, label=label_up)
+        ax.scatter(sig_down["log2_fc"], sig_down["-log10_padj"], c="#1f77b4", s=50,
+                   alpha=0.8, edgecolors="black", linewidths=0.5, label=label_down)
+
+        # Label significant codons
+        for _, row in sig.iterrows():
+            codon_label = f"{row['amino_acid']}-{row['codon']}" if row.get("amino_acid") else row["codon"]
+            ax.annotate(codon_label, (row["log2_fc"], row["-log10_padj"]),
+                        fontsize=7, ha="left", va="bottom",
+                        xytext=(3, 3), textcoords="offset points")
+
+        ax.axhline(-np.log10(0.05), color="gray", linestyle="--", linewidth=0.8, alpha=0.5)
+        ax.axvline(0.3, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
+        ax.axvline(-0.3, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
+        ax.set_xlabel("log₂ Fold-Change", fontsize=11)
+        ax.set_ylabel("-log₁₀(adjusted p-value)", fontsize=11)
+        title_label = "Ribosomal Protein" if gene_set_label == "ribosomal" else "High-Expression"
+        ax.set_title(f"{title_label} RSCU: Condition Differences", fontsize=12)
+        ax.legend(fontsize=9, loc="best")
+        ax.grid(True, alpha=0.15)
 
     fig.tight_layout()
     _save_fig(fig, output_path)
@@ -1589,7 +1777,7 @@ def plot_expression_class_rscu_heatmap(
 ) -> None:
     """Side-by-side heatmap of log2FC for ribosomal and high-expression RSCU.
 
-    Codons on y-axis grouped by amino acid, two columns (ribosomal, high-expr).
+    Codons on y-axis, columns per gene set per pair (for 3+ conditions).
     Significant codons marked with asterisks.
     """
     _apply_style()
@@ -1607,36 +1795,78 @@ def plot_expression_class_rscu_heatmap(
     # Get union of codons
     all_codons = set()
     for df in dfs:
-        all_codons.update(df["codon_col"].values)
+        codon_col = "codon_col" if "codon_col" in df.columns else "codon"
+        all_codons.update(df[codon_col].values)
     all_codons = sorted(all_codons)
 
-    # Build heatmap matrix
-    heat_data = pd.DataFrame(index=all_codons)
-    sig_data = pd.DataFrame(index=all_codons)
-    for df, label in zip(dfs, labels):
-        fc_map = dict(zip(df["codon_col"], df["log2_fc"]))
-        sig_map = dict(zip(df["codon_col"], df.get("significant", pd.Series(dtype=bool))))
-        heat_data[label] = [fc_map.get(c, 0) for c in all_codons]
-        sig_data[label] = [sig_map.get(c, False) for c in all_codons]
+    # Check if data has pairwise structure (group1/group2 columns)
+    has_pairs = any("group1" in df.columns and "group2" in df.columns for df in dfs)
 
-    fig, ax = plt.subplots(figsize=(4 + len(labels) * 1.5, max(8, len(all_codons) * 0.22)))
-    vmax = max(abs(heat_data.values.min()), abs(heat_data.values.max()), 0.1)
-    im = ax.imshow(heat_data.values, aspect="auto", cmap="RdBu_r",
-                   vmin=-vmax, vmax=vmax)
+    if has_pairs:
+        # Multi-pair format: build column per gene set per pair
+        heat_data = pd.DataFrame(index=all_codons)
+        sig_data = pd.DataFrame(index=all_codons)
 
-    # Asterisks for significant
-    for i in range(len(all_codons)):
-        for j in range(len(labels)):
-            if sig_data.iloc[i, j]:
-                ax.text(j, i, "*", ha="center", va="center", fontsize=8, fontweight="bold")
+        for df, gene_set_label in zip(dfs, labels):
+            codon_col = "codon_col" if "codon_col" in df.columns else "codon"
+            # Get unique pairs from this dataframe
+            pairs = df.groupby(["group1", "group2"]).size().reset_index(drop=True)[["group1", "group2"]].drop_duplicates()
+            for _, row in pairs.iterrows():
+                g1, g2 = row["group1"], row["group2"]
+                pair_data = df[(df["group1"] == g1) & (df["group2"] == g2)]
+                col_name = f"{gene_set_label} ({g1} vs {g2})"
+                fc_map = dict(zip(pair_data[codon_col], pair_data["log2_fc"]))
+                sig_map = dict(zip(pair_data[codon_col], pair_data.get("significant", pd.Series(dtype=bool))))
+                heat_data[col_name] = [fc_map.get(c, 0) for c in all_codons]
+                sig_data[col_name] = [sig_map.get(c, False) for c in all_codons]
 
-    ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, fontsize=10)
-    ax.set_yticks(range(len(all_codons)))
-    ax.set_yticklabels(all_codons, fontsize=7)
-    ax.set_title("Expression-Class RSCU Differences Between Conditions\n(log₂FC, * = FDR < 0.05)",
-                 fontsize=11)
-    plt.colorbar(im, ax=ax, shrink=0.6, label="log₂ Fold-Change")
+        fig, ax = plt.subplots(figsize=(4 + heat_data.shape[1] * 1.5, max(8, len(all_codons) * 0.22)))
+        vmax = max(abs(heat_data.values.min()), abs(heat_data.values.max()), 0.1)
+        im = ax.imshow(heat_data.values, aspect="auto", cmap="RdBu_r",
+                       vmin=-vmax, vmax=vmax)
+
+        # Asterisks for significant
+        for i in range(len(all_codons)):
+            for j in range(heat_data.shape[1]):
+                if sig_data.iloc[i, j]:
+                    ax.text(j, i, "*", ha="center", va="center", fontsize=8, fontweight="bold")
+
+        ax.set_xticks(range(heat_data.shape[1]))
+        ax.set_xticklabels(heat_data.columns, rotation=45, ha="right", fontsize=8)
+        ax.set_yticks(range(len(all_codons)))
+        ax.set_yticklabels(all_codons, fontsize=7)
+        ax.set_title("Expression-Class RSCU Differences Between Conditions\n(log₂FC, * = FDR < 0.05)",
+                     fontsize=11)
+        plt.colorbar(im, ax=ax, shrink=0.6, label="log₂ Fold-Change")
+    else:
+        # Legacy 2-condition format
+        heat_data = pd.DataFrame(index=all_codons)
+        sig_data = pd.DataFrame(index=all_codons)
+        codon_col = "codon_col" if "codon_col" in dfs[0].columns else "codon"
+        for df, label in zip(dfs, labels):
+            fc_map = dict(zip(df[codon_col], df["log2_fc"]))
+            sig_map = dict(zip(df[codon_col], df.get("significant", pd.Series(dtype=bool))))
+            heat_data[label] = [fc_map.get(c, 0) for c in all_codons]
+            sig_data[label] = [sig_map.get(c, False) for c in all_codons]
+
+        fig, ax = plt.subplots(figsize=(4 + len(labels) * 1.5, max(8, len(all_codons) * 0.22)))
+        vmax = max(abs(heat_data.values.min()), abs(heat_data.values.max()), 0.1)
+        im = ax.imshow(heat_data.values, aspect="auto", cmap="RdBu_r",
+                       vmin=-vmax, vmax=vmax)
+
+        # Asterisks for significant
+        for i in range(len(all_codons)):
+            for j in range(len(labels)):
+                if sig_data.iloc[i, j]:
+                    ax.text(j, i, "*", ha="center", va="center", fontsize=8, fontweight="bold")
+
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, fontsize=10)
+        ax.set_yticks(range(len(all_codons)))
+        ax.set_yticklabels(all_codons, fontsize=7)
+        ax.set_title("Expression-Class RSCU Differences Between Conditions\n(log₂FC, * = FDR < 0.05)",
+                     fontsize=11)
+        plt.colorbar(im, ax=ax, shrink=0.6, label="log₂ Fold-Change")
 
     fig.tight_layout()
     _save_fig(fig, output_path)
@@ -1650,64 +1880,134 @@ def plot_enrichment_comparison(
 
     Each pathway is a row. Dot size = fraction of samples enriched.
     Color = -log10(adjusted p-value). Only pathways enriched in ≥1 sample shown.
+    For 3+ conditions, creates one subplot per pair.
     """
     _apply_style()
     if enrichment_df.empty:
         return
 
-    # Get condition names from column names
-    frac_cols = [c for c in enrichment_df.columns if c.startswith("frac_enriched_")]
-    if len(frac_cols) < 2:
-        return
-
-    cond_a = frac_cols[0].replace("frac_enriched_", "")
-    cond_b = frac_cols[1].replace("frac_enriched_", "")
-
-    # Filter to pathways with at least some enrichment
     df = enrichment_df.copy()
-    df = df[(df[frac_cols[0]] > 0) | (df[frac_cols[1]] > 0)]
-    if df.empty:
-        return
 
-    # Sort by significance
-    df = df.sort_values("p_adjusted").head(30)  # Top 30 most significant
-    df = df.sort_values("p_adjusted", ascending=False)  # Reverse for plot
+    # Check for pairwise format (test, group1, group2 columns)
+    has_pairs = "test" in df.columns and "group1" in df.columns and "group2" in df.columns
 
-    # Use pathway_name if available, else pathway
-    y_labels = df["pathway_name"].fillna(df["pathway"]).values
-    y_pos = np.arange(len(df))
+    if has_pairs:
+        # Filter to pairwise fisher_exact results
+        df = df[df["test"] == "fisher_exact"].copy()
+        if df.empty:
+            return
 
-    fig, ax = plt.subplots(figsize=(10, max(5, len(df) * 0.35)))
+        # Get unique pairs
+        pair_list = []
+        for (g1, g2), group_data in df.groupby(["group1", "group2"], sort=False):
+            pair_list.append((g1, g2, group_data))
 
-    # Plot two columns of dots
-    offset = 0.15
-    for i, (frac_col, cond, color, marker) in enumerate([
-        (frac_cols[0], cond_a, "#1f77b4", "o"),
-        (frac_cols[1], cond_b, "#d62728", "s"),
-    ]):
-        sizes = df[frac_col].values * 300 + 20  # Scale for visibility
-        ax.scatter(
-            df[frac_col].values, y_pos + (i - 0.5) * offset,
-            s=sizes, c=color, marker=marker, alpha=0.7,
-            edgecolors="black", linewidths=0.5, label=cond,
-        )
+        n_pairs = len(pair_list)
+        fig, axes = plt.subplots(1, n_pairs, figsize=(10 * n_pairs, max(5, 8)))
+        if n_pairs == 1:
+            axes = [axes]
 
-    # Mark significant with bold y-label
-    sig_mask = df["significant"].values
-    for idx, (label, is_sig) in enumerate(zip(y_labels, sig_mask)):
-        weight = "bold" if is_sig else "normal"
-        ax.text(-0.02, idx, label, ha="right", va="center", fontsize=8,
-                fontweight=weight, transform=ax.get_yaxis_transform())
+        for ax, (cond_a, cond_b, pair_df) in zip(axes, pair_list):
+            frac_cols = [c for c in pair_df.columns if c.startswith("frac_enriched_")]
+            if len(frac_cols) < 2:
+                continue
 
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels([""] * len(y_pos))  # Labels drawn manually
-    ax.set_xlabel("Fraction of Samples with Pathway Enriched (FDR < 0.05)", fontsize=10)
-    ax.set_title("Pathway Enrichment Comparison Between Conditions\n(bold = significantly different)",
-                 fontsize=11)
-    ax.legend(fontsize=9, loc="lower right")
-    ax.set_xlim(-0.05, 1.05)
-    ax.grid(True, axis="x", alpha=0.2)
-    ax.axvline(0.5, color="gray", linestyle=":", linewidth=0.5, alpha=0.5)
+            cond_a_col = next((c for c in frac_cols if cond_a in c), frac_cols[0])
+            cond_b_col = next((c for c in frac_cols if cond_b in c), frac_cols[1])
+
+            # Filter to pathways with at least some enrichment
+            plot_df = pair_df[(pair_df[cond_a_col] > 0) | (pair_df[cond_b_col] > 0)].copy()
+            if plot_df.empty:
+                continue
+
+            # Sort by significance
+            plot_df = plot_df.sort_values("p_adjusted").head(30)
+            plot_df = plot_df.sort_values("p_adjusted", ascending=False)
+
+            y_labels = plot_df["pathway_name"].fillna(plot_df["pathway"]).values
+            y_pos = np.arange(len(plot_df))
+
+            # Plot two columns of dots
+            offset = 0.15
+            colors_palette = _condition_colors([cond_a, cond_b])
+            for i, (frac_col, cond, color) in enumerate([
+                (cond_a_col, cond_a, colors_palette[cond_a]),
+                (cond_b_col, cond_b, colors_palette[cond_b]),
+            ]):
+                sizes = plot_df[frac_col].values * 300 + 20
+                ax.scatter(
+                    plot_df[frac_col].values, y_pos + (i - 0.5) * offset,
+                    s=sizes, c=color, marker="o" if i == 0 else "s", alpha=0.7,
+                    edgecolors="black", linewidths=0.5, label=cond,
+                )
+
+            # Mark significant with bold y-label
+            sig_mask = plot_df["significant"].values
+            for idx, (label, is_sig) in enumerate(zip(y_labels, sig_mask)):
+                weight = "bold" if is_sig else "normal"
+                ax.text(-0.02, idx, label, ha="right", va="center", fontsize=8,
+                        fontweight=weight, transform=ax.get_yaxis_transform())
+
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels([""] * len(y_pos))
+            ax.set_xlabel("Fraction Enriched (FDR < 0.05)", fontsize=9)
+            ax.set_title(f"Pathway Enrichment ({cond_a} vs {cond_b})", fontsize=10)
+            ax.legend(fontsize=8, loc="lower right")
+            ax.set_xlim(-0.05, 1.05)
+            ax.grid(True, axis="x", alpha=0.2)
+            ax.axvline(0.5, color="gray", linestyle=":", linewidth=0.5, alpha=0.5)
+    else:
+        # Legacy 2-condition format
+        frac_cols = [c for c in df.columns if c.startswith("frac_enriched_")]
+        if len(frac_cols) < 2:
+            return
+
+        cond_a = frac_cols[0].replace("frac_enriched_", "")
+        cond_b = frac_cols[1].replace("frac_enriched_", "")
+
+        # Filter to pathways with at least some enrichment
+        df = df[(df[frac_cols[0]] > 0) | (df[frac_cols[1]] > 0)]
+        if df.empty:
+            return
+
+        # Sort by significance
+        df = df.sort_values("p_adjusted").head(30)
+        df = df.sort_values("p_adjusted", ascending=False)
+
+        y_labels = df["pathway_name"].fillna(df["pathway"]).values
+        y_pos = np.arange(len(df))
+
+        fig, ax = plt.subplots(figsize=(10, max(5, len(df) * 0.35)))
+
+        # Plot two columns of dots
+        offset = 0.15
+        for i, (frac_col, cond, color, marker) in enumerate([
+            (frac_cols[0], cond_a, "#1f77b4", "o"),
+            (frac_cols[1], cond_b, "#d62728", "s"),
+        ]):
+            sizes = df[frac_col].values * 300 + 20
+            ax.scatter(
+                df[frac_col].values, y_pos + (i - 0.5) * offset,
+                s=sizes, c=color, marker=marker, alpha=0.7,
+                edgecolors="black", linewidths=0.5, label=cond,
+            )
+
+        # Mark significant with bold y-label
+        sig_mask = df["significant"].values
+        for idx, (label, is_sig) in enumerate(zip(y_labels, sig_mask)):
+            weight = "bold" if is_sig else "normal"
+            ax.text(-0.02, idx, label, ha="right", va="center", fontsize=8,
+                    fontweight=weight, transform=ax.get_yaxis_transform())
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([""] * len(y_pos))
+        ax.set_xlabel("Fraction of Samples with Pathway Enriched (FDR < 0.05)", fontsize=10)
+        ax.set_title("Pathway Enrichment Comparison Between Conditions\n(bold = significantly different)",
+                     fontsize=11)
+        ax.legend(fontsize=9, loc="lower right")
+        ax.set_xlim(-0.05, 1.05)
+        ax.grid(True, axis="x", alpha=0.2)
+        ax.axvline(0.5, color="gray", linestyle=":", linewidth=0.5, alpha=0.5)
 
     fig.tight_layout()
     _save_fig(fig, output_path)
