@@ -96,6 +96,21 @@ def collect_sample_metrics(
         # --- CBI ---
         _read_cbi(paths, row)
 
+        # --- Ribosomal protein RSCU profile ---
+        _read_ribosomal_rscu(paths, row)
+
+        # --- High-expression gene RSCU profile ---
+        _read_high_expression_rscu(paths, row)
+
+        # --- Pathway enrichment summary ---
+        _read_enrichment_summary(paths, row)
+
+        # --- Phage / mobile element prevalence ---
+        _read_phage_mobile_summary(paths, row)
+
+        # --- HGT Mahalanobis distance (genome heterogeneity) ---
+        _read_hgt_mahalanobis(paths, row)
+
         rows.append(row)
 
     return pd.DataFrame(rows)
@@ -167,9 +182,16 @@ def _read_hgt_summary(paths: dict, row: dict) -> None:
             try:
                 df = pd.read_csv(p, sep="\t")
                 row["n_hgt_candidates"] = len(df)
-                if "is_hgt" in df.columns:
+                if "hgt_flag" in df.columns:
+                    row["n_hgt_positive"] = int(df["hgt_flag"].sum())
+                    row["hgt_fraction"] = df["hgt_flag"].mean()
+                elif "is_hgt" in df.columns:
                     row["n_hgt_positive"] = int(df["is_hgt"].sum())
                     row["hgt_fraction"] = df["is_hgt"].mean()
+                elif "p_adjusted" in df.columns:
+                    n_sig = (df["p_adjusted"] < 0.001).sum()
+                    row["n_hgt_positive"] = int(n_sig)
+                    row["hgt_fraction"] = n_sig / len(df) if len(df) > 0 else 0
                 elif "p_value" in df.columns:
                     n_sig = (df["p_value"] < 0.05).sum()
                     row["n_hgt_positive"] = int(n_sig)
@@ -185,9 +207,11 @@ def _read_strand_asymmetry(paths: dict, row: dict) -> None:
         if p and Path(p).exists():
             try:
                 df = pd.read_csv(p, sep="\t")
-                if "p_value" in df.columns:
-                    row["n_strand_asym_codons"] = len(df)
-                    row["n_strand_asym_sig"] = int((df["p_value"] < 0.05).sum())
+                row["n_strand_asym_codons"] = len(df)
+                # Use FDR-adjusted p-values if available, fall back to raw
+                p_col = "p_adjusted" if "p_adjusted" in df.columns else "p_value"
+                if p_col in df.columns:
+                    row["n_strand_asym_sig"] = int((df[p_col] < 0.05).sum())
                     row["strand_asym_fraction"] = row["n_strand_asym_sig"] / max(len(df), 1)
                 return
             except Exception:
@@ -319,6 +343,95 @@ def _read_cbi(paths: dict, row: dict) -> None:
                 if cbi_col:
                     row["mean_CBI"] = df[cbi_col].mean()
                     return
+            except Exception:
+                pass
+
+
+def _read_ribosomal_rscu(paths: dict, row: dict) -> None:
+    """Read ribosomal protein RSCU profile (concatenated)."""
+    p = paths.get("rscu_ribosomal")
+    if p and Path(p).exists():
+        try:
+            df = pd.read_csv(p, sep="\t")
+            rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
+            for c in rscu_cols:
+                row[f"rp_{c}"] = df[c].iloc[0] if len(df) > 0 else np.nan
+        except Exception:
+            pass
+
+
+def _read_high_expression_rscu(paths: dict, row: dict) -> None:
+    """Read high-expression gene RSCU from codon table format (long format)."""
+    p = paths.get("high_expression_rscu")
+    if p and Path(p).exists():
+        try:
+            df = pd.read_csv(p, sep="\t")
+            if "codon" in df.columns and "rscu" in df.columns:
+                # Convert long format to wide using RSCU_COLUMN_NAMES mapping
+                for _, r in df.iterrows():
+                    codon = r["codon"]
+                    aa = r.get("amino_acid", "")
+                    col_name = f"{aa}-{codon}" if aa else codon
+                    if col_name in RSCU_COLUMN_NAMES:
+                        row[f"he_{col_name}"] = r["rscu"]
+        except Exception:
+            pass
+
+
+def _read_enrichment_summary(paths: dict, row: dict) -> None:
+    """Read pathway enrichment results and extract counts of significant pathways."""
+    for metric in ("CAI", "MELP", "Fop"):
+        key = f"enrichment_{metric}_high"
+        p = paths.get(key)
+        if p and Path(p).exists():
+            try:
+                df = pd.read_csv(p, sep="\t")
+                sig_col = "significant" if "significant" in df.columns else None
+                fdr_col = "fdr" if "fdr" in df.columns else None
+                if sig_col:
+                    row[f"n_enriched_{metric}_high"] = int(df[sig_col].sum())
+                    row[f"n_pathways_{metric}_high"] = len(df)
+                elif fdr_col:
+                    row[f"n_enriched_{metric}_high"] = int((df[fdr_col] < 0.05).sum())
+                    row[f"n_pathways_{metric}_high"] = len(df)
+            except Exception:
+                pass
+
+
+def _read_phage_mobile_summary(paths: dict, row: dict) -> None:
+    """Read phage/mobile element detection results."""
+    for key in ("bio_phage_mobile_elements", "phage_mobile_elements"):
+        p = paths.get(key)
+        if p and Path(p).exists():
+            try:
+                df = pd.read_csv(p, sep="\t")
+                row["n_phage_mobile"] = len(df)
+                # Count mobilome-flagged genes
+                mob_col = next((c for c in ("is_mobilome", "mobilome") if c in df.columns), None)
+                if mob_col:
+                    row["n_mobilome"] = int(df[mob_col].sum())
+                phage_col = next((c for c in ("is_phage", "phage_related") if c in df.columns), None)
+                if phage_col:
+                    row["n_phage"] = int(df[phage_col].sum())
+                return
+            except Exception:
+                pass
+
+
+def _read_hgt_mahalanobis(paths: dict, row: dict) -> None:
+    """Read mean Mahalanobis distance from HGT results as genome heterogeneity metric."""
+    for key in ("bio_hgt_candidates", "hgt_candidates"):
+        p = paths.get(key)
+        if p and Path(p).exists():
+            try:
+                df = pd.read_csv(p, sep="\t")
+                if "mahalanobis_dist" in df.columns:
+                    vals = df["mahalanobis_dist"].dropna()
+                    row["mean_mahalanobis_dist"] = vals.mean()
+                    row["median_mahalanobis_dist"] = vals.median()
+                if "gc3_deviation" in df.columns:
+                    row["mean_abs_gc3_deviation"] = df["gc3_deviation"].abs().mean()
+                return
             except Exception:
                 pass
 
@@ -774,6 +887,502 @@ def _effect_size_label(d: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 3b. Expression-class RSCU and enrichment between-condition comparisons
+# ---------------------------------------------------------------------------
+
+
+def between_condition_expression_class_rscu(
+    metrics_df: pd.DataFrame,
+    condition_col: str,
+    prefix: str = "rp_",
+    label: str = "ribosomal",
+) -> pd.DataFrame:
+    """Compare expression-class-specific RSCU between conditions.
+
+    Tests each codon's RSCU (ribosomal or high-expression) between conditions
+    using Mann-Whitney U with BH FDR correction.
+
+    Args:
+        metrics_df: Sample metrics with prefixed RSCU columns.
+        condition_col: Condition column name.
+        prefix: Column prefix (``"rp_"`` for ribosomal, ``"he_"`` for high-expression).
+        label: Human label for output table.
+
+    Returns:
+        DataFrame with per-codon test results sorted by adjusted p-value.
+    """
+    conditions = metrics_df[condition_col].dropna().unique()
+    if len(conditions) < 2:
+        return pd.DataFrame()
+
+    rscu_cols = [c for c in metrics_df.columns
+                 if c.startswith(prefix) and c.replace(prefix, "") in RSCU_COLUMN_NAMES]
+    if not rscu_cols:
+        return pd.DataFrame()
+
+    cond_list = sorted(conditions)
+    rows = []
+    for col in rscu_cols:
+        codon_name = col.replace(prefix, "")
+        v1 = metrics_df.loc[metrics_df[condition_col] == cond_list[0], col].dropna()
+        v2 = metrics_df.loc[metrics_df[condition_col] == cond_list[1], col].dropna()
+        if len(v1) < 3 or len(v2) < 3:
+            continue
+        try:
+            stat, p_val = sp_stats.mannwhitneyu(v1, v2, alternative="two-sided")
+        except ValueError:
+            continue
+
+        delta = _cliffs_delta(v1.values, v2.values)
+        m1, m2 = v1.mean(), v2.mean()
+        log2fc = np.log2(m1 / m2) if m2 > 0 and m1 > 0 else 0
+
+        parts = codon_name.split("-")
+        aa = parts[0] if len(parts) == 2 else ""
+        codon = parts[-1]
+
+        rows.append({
+            "gene_set": label,
+            "amino_acid": aa,
+            "codon": codon,
+            "codon_col": codon_name,
+            f"mean_{cond_list[0]}": round(m1, 4),
+            f"mean_{cond_list[1]}": round(m2, 4),
+            "log2_fc": round(log2fc, 4),
+            "U_statistic": round(stat, 2),
+            "p_value": p_val,
+            "cliffs_delta": round(delta, 4),
+            "effect_size": _effect_size_label(abs(delta)),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(rows)
+    # BH FDR
+    n = len(result)
+    order = np.argsort(result["p_value"].values)
+    ranks = np.empty_like(order)
+    ranks[order] = np.arange(1, n + 1)
+    fdr = np.minimum(result["p_value"].values * n / ranks, 1.0)
+    sorted_fdr = fdr[order]
+    for k in range(n - 2, -1, -1):
+        sorted_fdr[k] = min(sorted_fdr[k], sorted_fdr[k + 1])
+    fdr[order] = sorted_fdr
+    result["p_adjusted"] = np.round(fdr, 6)
+    result["significant"] = result["p_adjusted"] < 0.05
+    return result.sort_values("p_adjusted")
+
+
+def between_condition_enrichment_comparison(
+    sample_outputs: dict[str, dict[str, Path]],
+    metrics_df: pd.DataFrame,
+    condition_col: str,
+) -> pd.DataFrame:
+    """Compare pathway enrichment results between conditions.
+
+    For each KEGG pathway, counts how many samples in each condition had it
+    significantly enriched in high-expression genes, then tests for a
+    condition effect using Fisher's exact test.
+
+    Returns a DataFrame with pathway, per-condition enrichment counts,
+    Fisher's p-value, and FDR-adjusted p-value.
+    """
+    conditions = metrics_df[condition_col].dropna().unique()
+    if len(conditions) < 2:
+        return pd.DataFrame()
+
+    sid_cond = dict(zip(metrics_df["sample_id"], metrics_df[condition_col]))
+    cond_list = sorted(conditions)
+
+    # Collect enrichment results per sample for CAI_high (primary metric)
+    cond_pathways: dict[str, dict[str, int]] = {c: {} for c in cond_list}
+    cond_n_samples: dict[str, int] = {c: 0 for c in cond_list}
+    all_pathways: dict[str, str] = {}  # pathway_id -> pathway_name
+
+    for sid, paths in sample_outputs.items():
+        if sid not in sid_cond:
+            continue
+        cond = sid_cond[sid]
+
+        # Try CAI_high first, then MELP_high, then Fop_high
+        for metric in ("CAI", "MELP", "Fop"):
+            key = f"enrichment_{metric}_high"
+            p = paths.get(key)
+            if p and Path(p).exists():
+                try:
+                    df = pd.read_csv(p, sep="\t")
+                    sig_col = "significant" if "significant" in df.columns else None
+                    fdr_col = "fdr" if "fdr" in df.columns else None
+                    pw_col = "pathway" if "pathway" in df.columns else None
+                    name_col = "pathway_name" if "pathway_name" in df.columns else None
+
+                    if pw_col:
+                        if sig_col:
+                            sig_df = df[df[sig_col]]
+                        elif fdr_col:
+                            sig_df = df[df[fdr_col] < 0.05]
+                        else:
+                            sig_df = pd.DataFrame()
+
+                        cond_n_samples[cond] = cond_n_samples.get(cond, 0) + 1
+                        for _, row in sig_df.iterrows():
+                            pw = row[pw_col]
+                            cond_pathways[cond][pw] = cond_pathways[cond].get(pw, 0) + 1
+                            if name_col and pw not in all_pathways:
+                                all_pathways[pw] = row[name_col]
+                except Exception:
+                    pass
+                break  # Use first available metric only
+
+    if not all_pathways:
+        return pd.DataFrame()
+
+    # For each pathway: Fisher's exact test for enrichment frequency
+    rows = []
+    for pw in sorted(all_pathways.keys()):
+        n1_enriched = cond_pathways[cond_list[0]].get(pw, 0)
+        n2_enriched = cond_pathways[cond_list[1]].get(pw, 0)
+        n1_total = cond_n_samples[cond_list[0]]
+        n2_total = cond_n_samples[cond_list[1]]
+
+        if n1_total == 0 or n2_total == 0:
+            continue
+
+        # 2x2 contingency table
+        table = np.array([
+            [n1_enriched, n1_total - n1_enriched],
+            [n2_enriched, n2_total - n2_enriched],
+        ])
+        try:
+            odds_ratio, p_val = sp_stats.fisher_exact(table, alternative="two-sided")
+        except ValueError:
+            continue
+
+        rows.append({
+            "pathway": pw,
+            "pathway_name": all_pathways.get(pw, ""),
+            f"n_enriched_{cond_list[0]}": n1_enriched,
+            f"n_samples_{cond_list[0]}": n1_total,
+            f"frac_enriched_{cond_list[0]}": round(n1_enriched / n1_total, 3),
+            f"n_enriched_{cond_list[1]}": n2_enriched,
+            f"n_samples_{cond_list[1]}": n2_total,
+            f"frac_enriched_{cond_list[1]}": round(n2_enriched / n2_total, 3),
+            "odds_ratio": round(odds_ratio, 3) if np.isfinite(odds_ratio) else np.inf,
+            "p_value": p_val,
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(rows)
+    # BH FDR
+    n = len(result)
+    if n > 1:
+        order = np.argsort(result["p_value"].values)
+        ranks = np.empty_like(order)
+        ranks[order] = np.arange(1, n + 1)
+        fdr = np.minimum(result["p_value"].values * n / ranks, 1.0)
+        sorted_fdr = fdr[order]
+        for k in range(n - 2, -1, -1):
+            sorted_fdr[k] = min(sorted_fdr[k], sorted_fdr[k + 1])
+        fdr[order] = sorted_fdr
+        result["p_adjusted"] = np.round(fdr, 6)
+    else:
+        result["p_adjusted"] = result["p_value"]
+    result["significant"] = result["p_adjusted"] < 0.05
+
+    return result.sort_values("p_adjusted")
+
+
+# ---------------------------------------------------------------------------
+# 3c. Bio/ecology between-condition comparisons
+# ---------------------------------------------------------------------------
+
+
+def between_condition_strand_asymmetry_patterns(
+    sample_outputs: dict[str, dict[str, Path]],
+    metrics_df: pd.DataFrame,
+    condition_col: str,
+) -> pd.DataFrame:
+    """Compare per-codon strand asymmetry patterns between conditions.
+
+    For each codon, aggregates the plus-minus RSCU difference across samples
+    within each condition, then tests for a significant difference in that
+    asymmetry between conditions using Mann-Whitney U.
+
+    Returns a DataFrame with one row per codon: mean asymmetry per condition,
+    Mann-Whitney p-value, FDR-adjusted p-value, and Cliff's delta.
+    """
+    conditions = metrics_df[condition_col].dropna().unique()
+    if len(conditions) < 2:
+        return pd.DataFrame()
+
+    # Build sample→condition map
+    sid_cond = dict(zip(metrics_df["sample_id"], metrics_df[condition_col]))
+
+    # Collect per-sample strand asymmetry data
+    per_sample: dict[str, pd.DataFrame] = {}
+    for sid, paths in sample_outputs.items():
+        if sid not in sid_cond:
+            continue
+        for key in ("bio_strand_asymmetry", "strand_asymmetry"):
+            p = paths.get(key)
+            if p and Path(p).exists():
+                try:
+                    df = pd.read_csv(p, sep="\t")
+                    if "mean_rscu_plus" in df.columns and "mean_rscu_minus" in df.columns:
+                        df["asymmetry"] = df["mean_rscu_plus"] - df["mean_rscu_minus"]
+                        per_sample[sid] = df
+                except Exception:
+                    pass
+                break
+
+    if len(per_sample) < 4:
+        return pd.DataFrame()
+
+    # Identify common codons
+    all_codons = set()
+    for df in per_sample.values():
+        codon_col = "codon_col" if "codon_col" in df.columns else "codon"
+        all_codons.update(df[codon_col].values)
+
+    rows = []
+    for codon in sorted(all_codons):
+        cond_vals: dict[str, list] = {c: [] for c in conditions}
+        for sid, df in per_sample.items():
+            codon_col = "codon_col" if "codon_col" in df.columns else "codon"
+            match = df.loc[df[codon_col] == codon, "asymmetry"]
+            if not match.empty:
+                cond_vals[sid_cond[sid]].append(match.iloc[0])
+
+        # Need ≥3 samples per condition
+        if any(len(v) < 3 for v in cond_vals.values()):
+            continue
+
+        cond_list = list(conditions)
+        v1 = np.array(cond_vals[cond_list[0]])
+        v2 = np.array(cond_vals[cond_list[1]])
+        try:
+            stat, p_val = sp_stats.mannwhitneyu(v1, v2, alternative="two-sided")
+        except ValueError:
+            continue
+
+        delta = _cliffs_delta(v1, v2)
+        rows.append({
+            "codon": codon,
+            f"mean_asymmetry_{cond_list[0]}": round(np.mean(v1), 5),
+            f"mean_asymmetry_{cond_list[1]}": round(np.mean(v2), 5),
+            "diff": round(np.mean(v1) - np.mean(v2), 5),
+            "U_statistic": round(stat, 2),
+            "p_value": p_val,
+            "cliffs_delta": round(delta, 4),
+            "effect_size": _effect_size_label(abs(delta)),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(rows)
+    # BH FDR correction
+    n = len(result)
+    order = np.argsort(result["p_value"].values)
+    ranks = np.empty_like(order)
+    ranks[order] = np.arange(1, n + 1)
+    fdr = np.minimum(result["p_value"].values * n / ranks, 1.0)
+    sorted_fdr = fdr[order]
+    for k in range(n - 2, -1, -1):
+        sorted_fdr[k] = min(sorted_fdr[k], sorted_fdr[k + 1])
+    fdr[order] = sorted_fdr
+    result["p_adjusted"] = np.round(fdr, 6)
+    result["significant"] = result["p_adjusted"] < 0.05
+    return result.sort_values("p_adjusted")
+
+
+def between_condition_optimal_codons(
+    sample_outputs: dict[str, dict[str, Path]],
+    metrics_df: pd.DataFrame,
+    condition_col: str,
+) -> pd.DataFrame:
+    """Compare optimal codon identity between conditions.
+
+    Pools optimal codon tables across samples within each condition,
+    computing mean delta-RSCU per codon per condition. Flags codons that
+    are optimal in one condition but not the other.
+
+    Returns a DataFrame with codon, amino_acid, mean delta-RSCU per condition,
+    and an agreement flag.
+    """
+    conditions = metrics_df[condition_col].dropna().unique()
+    if len(conditions) < 2:
+        return pd.DataFrame()
+
+    sid_cond = dict(zip(metrics_df["sample_id"], metrics_df[condition_col]))
+
+    # Collect per-sample optimal codon data
+    cond_deltas: dict[str, list[pd.DataFrame]] = {c: [] for c in conditions}
+    for sid, paths in sample_outputs.items():
+        if sid not in sid_cond:
+            continue
+        for key in ("bio_trans_sel_optimal_codons",):
+            p = paths.get(key)
+            if p and Path(p).exists():
+                try:
+                    df = pd.read_csv(p, sep="\t")
+                    if "delta_rscu" in df.columns and "codon" in df.columns:
+                        cond_deltas[sid_cond[sid]].append(df[["amino_acid", "codon", "delta_rscu"]])
+                except Exception:
+                    pass
+                break
+
+    cond_list = list(conditions)
+    if not cond_deltas[cond_list[0]] or not cond_deltas[cond_list[1]]:
+        return pd.DataFrame()
+
+    # Average delta-RSCU per codon within each condition
+    rows = []
+    combined = {}
+    for cond in cond_list:
+        all_df = pd.concat(cond_deltas[cond], ignore_index=True)
+        agg = all_df.groupby(["amino_acid", "codon"])["delta_rscu"].mean().reset_index()
+        agg.rename(columns={"delta_rscu": f"mean_delta_rscu_{cond}"}, inplace=True)
+        combined[cond] = agg
+
+    merged = combined[cond_list[0]].merge(
+        combined[cond_list[1]], on=["amino_acid", "codon"], how="outer"
+    ).fillna(0)
+
+    # Determine optimal status per condition (delta > 0 = enriched in high-expr genes)
+    merged[f"optimal_in_{cond_list[0]}"] = merged[f"mean_delta_rscu_{cond_list[0]}"] > 0
+    merged[f"optimal_in_{cond_list[1]}"] = merged[f"mean_delta_rscu_{cond_list[1]}"] > 0
+    merged["agreement"] = (
+        merged[f"optimal_in_{cond_list[0]}"] == merged[f"optimal_in_{cond_list[1]}"]
+    )
+    merged["delta_difference"] = (
+        merged[f"mean_delta_rscu_{cond_list[0]}"] - merged[f"mean_delta_rscu_{cond_list[1]}"]
+    ).round(4)
+
+    return merged.sort_values("delta_difference", key=abs, ascending=False)
+
+
+def between_condition_hgt_burden(
+    sample_outputs: dict[str, dict[str, Path]],
+    metrics_df: pd.DataFrame,
+    condition_col: str,
+) -> dict:
+    """Compare HGT burden distributions between conditions.
+
+    Computes per-sample summary of Mahalanobis distances and tests whether
+    the distribution of distances differs between conditions.
+
+    Returns a dict with per-condition summary stats and test results.
+    """
+    conditions = metrics_df[condition_col].dropna().unique()
+    if len(conditions) < 2:
+        return {}
+
+    sid_cond = dict(zip(metrics_df["sample_id"], metrics_df[condition_col]))
+    cond_list = list(conditions)
+
+    # Collect per-sample Mahalanobis distance distributions
+    cond_medians: dict[str, list[float]] = {c: [] for c in conditions}
+    cond_hgt_fracs: dict[str, list[float]] = {c: [] for c in conditions}
+    for sid, paths in sample_outputs.items():
+        if sid not in sid_cond:
+            continue
+        for key in ("bio_hgt_candidates", "hgt_candidates"):
+            p = paths.get(key)
+            if p and Path(p).exists():
+                try:
+                    df = pd.read_csv(p, sep="\t")
+                    if "mahalanobis_dist" in df.columns:
+                        cond_medians[sid_cond[sid]].append(df["mahalanobis_dist"].median())
+                    if "hgt_flag" in df.columns:
+                        cond_hgt_fracs[sid_cond[sid]].append(df["hgt_flag"].mean())
+                except Exception:
+                    pass
+                break
+
+    result: dict = {}
+    # Test median Mahalanobis distance between conditions
+    v1 = np.array(cond_medians.get(cond_list[0], []))
+    v2 = np.array(cond_medians.get(cond_list[1], []))
+    if len(v1) >= 3 and len(v2) >= 3:
+        stat, p_val = sp_stats.mannwhitneyu(v1, v2, alternative="two-sided")
+        delta = _cliffs_delta(v1, v2)
+        result["mahalanobis"] = {
+            "conditions": cond_list,
+            f"median_{cond_list[0]}": round(float(np.median(v1)), 4),
+            f"median_{cond_list[1]}": round(float(np.median(v2)), 4),
+            "U_statistic": round(float(stat), 2),
+            "p_value": round(p_val, 6),
+            "cliffs_delta": round(delta, 4),
+            "effect_size": _effect_size_label(abs(delta)),
+            f"values_{cond_list[0]}": v1.tolist(),
+            f"values_{cond_list[1]}": v2.tolist(),
+        }
+
+    # Test HGT fraction between conditions
+    f1 = np.array(cond_hgt_fracs.get(cond_list[0], []))
+    f2 = np.array(cond_hgt_fracs.get(cond_list[1], []))
+    if len(f1) >= 3 and len(f2) >= 3:
+        stat, p_val = sp_stats.mannwhitneyu(f1, f2, alternative="two-sided")
+        delta = _cliffs_delta(f1, f2)
+        result["hgt_fraction"] = {
+            "conditions": cond_list,
+            f"median_{cond_list[0]}": round(float(np.median(f1)), 4),
+            f"median_{cond_list[1]}": round(float(np.median(f2)), 4),
+            "U_statistic": round(float(stat), 2),
+            "p_value": round(p_val, 6),
+            "cliffs_delta": round(delta, 4),
+            "effect_size": _effect_size_label(abs(delta)),
+            f"values_{cond_list[0]}": f1.tolist(),
+            f"values_{cond_list[1]}": f2.tolist(),
+        }
+
+    return result
+
+
+def between_condition_gc3_gc12(
+    sample_outputs: dict[str, dict[str, Path]],
+    metrics_df: pd.DataFrame,
+    condition_col: str,
+) -> dict[str, pd.DataFrame]:
+    """Collect per-gene GC3 vs GC12 data split by condition for neutrality plots.
+
+    Returns dict: {condition_name: DataFrame with GC3, GC12 columns}.
+    """
+    conditions = metrics_df[condition_col].dropna().unique()
+    sid_cond = dict(zip(metrics_df["sample_id"], metrics_df[condition_col]))
+
+    cond_data: dict[str, list[pd.DataFrame]] = {c: [] for c in conditions}
+    for sid, paths in sample_outputs.items():
+        if sid not in sid_cond:
+            continue
+        p = paths.get("gc12_gc3")
+        if p and Path(p).exists():
+            try:
+                df = pd.read_csv(p, sep="\t")
+                gc12_col = next((c for c in ("GC12", "gc12") if c in df.columns), None)
+                gc3_col = next((c for c in ("GC3", "gc3") if c in df.columns), None)
+                if gc12_col and gc3_col:
+                    sub = df[[gc3_col, gc12_col]].rename(
+                        columns={gc3_col: "GC3", gc12_col: "GC12"}
+                    ).dropna()
+                    if not sub.empty:
+                        sub["sample_id"] = sid
+                        cond_data[sid_cond[sid]].append(sub)
+            except Exception:
+                pass
+
+    result = {}
+    for cond, dfs in cond_data.items():
+        if dfs:
+            result[cond] = pd.concat(dfs, ignore_index=True)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 4. Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -877,6 +1486,108 @@ def run_comparative_analyses(
                     "Effect summary: %d Mann-Whitney U results sorted by effect size",
                     len(effect_summary),
                 )
+
+            # ── Expression-class RSCU comparisons ─────────────────────────
+            logger.info("Running expression-class RSCU comparisons")
+
+            # Ribosomal protein RSCU
+            rp_rscu_tests = between_condition_expression_class_rscu(
+                metrics_df, condition_col, prefix="rp_", label="ribosomal",
+            )
+            if not rp_rscu_tests.empty:
+                p = comp_dir / "between_condition_ribosomal_rscu.tsv"
+                rp_rscu_tests.to_csv(p, sep="\t", index=False)
+                outputs["between_condition_ribosomal_rscu"] = p
+                n_sig = rp_rscu_tests["significant"].sum()
+                logger.info("Ribosomal RSCU: %d codons tested, %d significant",
+                            len(rp_rscu_tests), n_sig)
+
+            # High-expression gene RSCU
+            he_rscu_tests = between_condition_expression_class_rscu(
+                metrics_df, condition_col, prefix="he_", label="high_expression",
+            )
+            if not he_rscu_tests.empty:
+                p = comp_dir / "between_condition_high_expression_rscu.tsv"
+                he_rscu_tests.to_csv(p, sep="\t", index=False)
+                outputs["between_condition_high_expression_rscu"] = p
+                n_sig = he_rscu_tests["significant"].sum()
+                logger.info("High-expression RSCU: %d codons tested, %d significant",
+                            len(he_rscu_tests), n_sig)
+
+            # Pathway enrichment comparison
+            enrichment_comp = between_condition_enrichment_comparison(
+                sample_outputs, metrics_df, condition_col,
+            )
+            if not enrichment_comp.empty:
+                p = comp_dir / "between_condition_enrichment_comparison.tsv"
+                enrichment_comp.to_csv(p, sep="\t", index=False)
+                outputs["between_condition_enrichment_comparison"] = p
+                n_sig = enrichment_comp["significant"].sum()
+                logger.info("Enrichment comparison: %d pathways, %d with differential enrichment",
+                            len(enrichment_comp), n_sig)
+
+            # ── Bio/ecology between-condition comparisons ─────────────────
+            logger.info("Running bio/ecology between-condition comparisons")
+
+            # Per-codon strand asymmetry pattern comparison
+            strand_asym_patterns = between_condition_strand_asymmetry_patterns(
+                sample_outputs, metrics_df, condition_col,
+            )
+            if not strand_asym_patterns.empty:
+                p = comp_dir / "between_condition_strand_asymmetry_patterns.tsv"
+                strand_asym_patterns.to_csv(p, sep="\t", index=False)
+                outputs["between_condition_strand_asymmetry_patterns"] = p
+                n_sig = strand_asym_patterns["significant"].sum()
+                logger.info("Strand asymmetry patterns: %d codons tested, %d significant",
+                            len(strand_asym_patterns), n_sig)
+
+            # Optimal codon identity comparison
+            opt_codons = between_condition_optimal_codons(
+                sample_outputs, metrics_df, condition_col,
+            )
+            if not opt_codons.empty:
+                p = comp_dir / "between_condition_optimal_codons.tsv"
+                opt_codons.to_csv(p, sep="\t", index=False)
+                outputs["between_condition_optimal_codons"] = p
+                n_disagree = (~opt_codons["agreement"]).sum()
+                logger.info("Optimal codons: %d codons compared, %d differ between conditions",
+                            len(opt_codons), n_disagree)
+
+            # HGT burden comparison
+            hgt_burden = between_condition_hgt_burden(
+                sample_outputs, metrics_df, condition_col,
+            )
+            if hgt_burden:
+                rows_list = []
+                for test_name, vals in hgt_burden.items():
+                    row_out = {k: v for k, v in vals.items()
+                               if not isinstance(v, list) and k != "conditions"}
+                    row_out["test"] = test_name
+                    rows_list.append(row_out)
+                if rows_list:
+                    p = comp_dir / "between_condition_hgt_burden.tsv"
+                    pd.DataFrame(rows_list).to_csv(p, sep="\t", index=False)
+                    outputs["between_condition_hgt_burden"] = p
+                logger.info("HGT burden comparison: %d tests", len(hgt_burden))
+
+            # GC3 vs GC12 per-condition data (for neutrality scatter plot)
+            gc3_gc12_data = between_condition_gc3_gc12(
+                sample_outputs, metrics_df, condition_col,
+            )
+            if gc3_gc12_data:
+                # Save combined data for plotting
+                combined_rows = []
+                for cond, df in gc3_gc12_data.items():
+                    df_copy = df.copy()
+                    df_copy["condition"] = cond
+                    combined_rows.append(df_copy)
+                if combined_rows:
+                    combined_df = pd.concat(combined_rows, ignore_index=True)
+                    p = comp_dir / "between_condition_gc3_gc12.tsv"
+                    combined_df.to_csv(p, sep="\t", index=False)
+                    outputs["between_condition_gc3_gc12"] = p
+                    logger.info("GC3-GC12 neutrality data: %d genes across %d conditions",
+                                len(combined_df), len(gc3_gc12_data))
     else:
         logger.info("No condition column specified; skipping condition-aware analyses")
 
