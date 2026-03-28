@@ -210,8 +210,23 @@ def detect_hgt_candidates(
             gc3_deviations.append(np.nan)
     gc3_deviations = np.array(gc3_deviations)
 
-    # Flag putative HGT: p < 0.001
-    hgt_flags = p_values < 0.001
+    # Benjamini-Hochberg FDR correction across all genes
+    n_genes = len(p_values)
+    if n_genes > 1:
+        order = np.argsort(p_values)
+        ranks = np.empty_like(order)
+        ranks[order] = np.arange(1, n_genes + 1)
+        p_adjusted = np.minimum(p_values * n_genes / ranks, 1.0)
+        # Enforce monotonicity
+        sorted_adj = p_adjusted[order]
+        for k in range(n_genes - 2, -1, -1):
+            sorted_adj[k] = min(sorted_adj[k], sorted_adj[k + 1])
+        p_adjusted[order] = sorted_adj
+    else:
+        p_adjusted = p_values.copy()
+
+    # Flag putative HGT: adjusted p < 0.001
+    hgt_flags = p_adjusted < 0.001
 
     # Build result DataFrame
     result = pd.DataFrame({
@@ -219,6 +234,7 @@ def detect_hgt_candidates(
         "mahalanobis_dist": mahal_dists,
         "gc3_deviation": gc3_deviations,
         "p_value": p_values,
+        "p_adjusted": p_adjusted,
         "hgt_flag": hgt_flags,
     })
 
@@ -705,7 +721,30 @@ def compute_strand_asymmetry(
             })
 
     result_df = pd.DataFrame(rows) if rows else None
-    if result_df is not None:
+    if result_df is not None and len(result_df) > 1:
+        # Benjamini-Hochberg FDR correction across all per-codon tests
+        pvals = result_df["p_value"].values
+        n = len(pvals)
+        order = np.argsort(pvals)
+        ranks = np.empty_like(order)
+        ranks[order] = np.arange(1, n + 1)
+        fdr = np.minimum(pvals * n / ranks, 1.0)
+        # Enforce monotonicity (descending rank order)
+        for i in reversed(order[:-1]):
+            j = order[np.searchsorted(order, i) + 1] if np.searchsorted(order, i) + 1 < n else i
+            fdr[i] = min(fdr[i], fdr[j]) if i != j else fdr[i]
+        # Simpler monotonicity: walk sorted order in reverse
+        fdr_sorted = fdr[order]
+        for k in range(n - 2, -1, -1):
+            fdr_sorted[k] = min(fdr_sorted[k], fdr_sorted[k + 1])
+        fdr[order] = fdr_sorted
+        result_df["p_adjusted"] = np.round(fdr, 6)
+        result_df["significant"] = result_df["p_adjusted"] < 0.05
+        logger.info("Strand asymmetry: analyzed %d codons, %d significant (FDR < 0.05)",
+                     len(result_df), result_df["significant"].sum())
+    elif result_df is not None:
+        result_df["p_adjusted"] = result_df["p_value"]
+        result_df["significant"] = result_df["p_adjusted"] < 0.05
         logger.info("Strand asymmetry: analyzed %d codons", len(result_df))
     return result_df
 
