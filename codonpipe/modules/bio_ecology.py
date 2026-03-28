@@ -826,10 +826,11 @@ def compute_operon_codon_coadaptation(
         logger.info("SKIPPED: operon coadaptation (no RSCU columns)")
         return None
 
-    # Build RSCU lookup
+    # Build RSCU lookup (fill NaN with 0.0 — unobserved family → zero usage
+    # for Euclidean distance computation)
     rscu_map = {}
     for _, row in rscu_gene_df.iterrows():
-        rscu_map[row["gene"]] = row[rscu_cols].values
+        rscu_map[row["gene"]] = np.nan_to_num(row[rscu_cols].values, nan=0.0)
 
     # Parse GFF for gene order, resolving IDs against RSCU gene names
     known_genes = set(rscu_map.keys())
