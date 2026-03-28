@@ -23,6 +23,8 @@ from codonpipe.modules.expression import run_expression_analysis
 from codonpipe.modules.cu_statistics import run_cu_statistics
 from codonpipe.modules.enrichment import run_enrichment_analysis
 from codonpipe.modules.advanced_analyses import run_advanced_analyses
+from codonpipe.modules.bio_ecology import run_bio_ecology_analyses
+from codonpipe.modules.codon_table_formats import generate_all_codon_tables
 from codonpipe.modules.statistics import run_batch_statistics
 from codonpipe.plotting.plots import (
     generate_single_genome_plots,
@@ -86,7 +88,12 @@ def run_single_genome(
         8. Advanced analyses (COA, S-value, neutrality, PR2, delta RSCU,
            tRNA-codon correlation, COG enrichment, gene length vs bias,
            ENC-ENC' difference)
-        9. Publication-ready plots
+        9. Biological/ecological analyses (HGT detection, growth rate
+           prediction, translational selection, phage detection, strand
+           asymmetry, operon co-adaptation)
+       10. Codon usage tables in all standard formats (RSCU, counts,
+           per-thousand, W values, adaptation weights, CBI)
+       11. Publication-ready plots
 
     Args:
         genome_fasta: Path to genome assembly FASTA.
@@ -128,13 +135,13 @@ def run_single_genome(
 
     # ── Step 1: Prokka (or use pre-existing files) ─────────────────────
     if prokka_files is not None:
-        logger.info("[Step 1/9] Using pre-existing Prokka files (skipping Prokka)")
+        logger.info("[Step 1/11] Using pre-existing Prokka files (skipping Prokka)")
         _validate_prokka_files(prokka_files)
         # Convert all values to Path objects
         prokka_out = {k: Path(v) for k, v in prokka_files.items()}
         all_outputs.update({f"prokka_{k}": v for k, v in prokka_out.items()})
     else:
-        logger.info("[Step 1/9] Running Prokka gene prediction")
+        logger.info("[Step 1/11] Running Prokka gene prediction")
         prokka_out = run_prokka(
             genome_fasta, output_dir, sample_id,
             kingdom=kingdom, cpus=cpus, metagenome=metagenome, force=force,
@@ -145,7 +152,7 @@ def run_single_genome(
     ffn_path = prokka_out["ffn"]
 
     # ── Step 2: COGclassifier ───────────────────────────────────────────
-    logger.info("[Step 2/9] Running COGclassifier for ribosomal protein identification")
+    logger.info("[Step 2/11] Running COGclassifier for ribosomal protein identification")
     cog_result = run_cogclassifier(faa_path, output_dir, sample_id, cpus=cpus, force=force)
     all_outputs["cog_result"] = cog_result
 
@@ -160,7 +167,7 @@ def run_single_genome(
     # ── Step 3: KofamScan ───────────────────────────────────────────────
     kofam_df = None
     if kofam_results_file is not None:
-        logger.info("[Step 3/9] Loading pre-computed KofamScan results from %s", kofam_results_file)
+        logger.info("[Step 3/11] Loading pre-computed KofamScan results from %s", kofam_results_file)
         try:
             kofam_df = parse_kofamscan(kofam_results_file)
             kofam_out = output_dir / "kofamscan" / f"{sample_id}_kofam_parsed.tsv"
@@ -170,7 +177,7 @@ def run_single_genome(
         except Exception as e:
             logger.warning("Failed to parse pre-computed KofamScan results: %s. Continuing without annotations.", e)
     elif not skip_kofamscan:
-        logger.info("[Step 3/9] Running KofamScan annotation")
+        logger.info("[Step 3/11] Running KofamScan annotation")
         try:
             kofam_result = run_kofamscan(
                 faa_path, output_dir, sample_id,
@@ -184,10 +191,10 @@ def run_single_genome(
         except (FileNotFoundError, RuntimeError) as e:
             logger.warning("KofamScan failed: %s. Continuing without annotations.", e)
     else:
-        logger.info("[Step 3/9] Skipping KofamScan (--skip-kofamscan)")
+        logger.info("[Step 3/11] Skipping KofamScan (--skip-kofamscan)")
 
     # ── Step 4: RSCU analysis ───────────────────────────────────────────
-    logger.info("[Step 4/9] Running RSCU analysis")
+    logger.info("[Step 4/11] Running RSCU analysis")
     rscu_outputs = run_rscu_analysis(ffn_path, rp_ffn, output_dir, sample_id)
     all_outputs.update(rscu_outputs)
 
@@ -209,7 +216,7 @@ def run_single_genome(
     encprime_df = None
     milc_df = None
     if not skip_expression:
-        logger.info("[Step 5/9] Computing CU bias statistics (ENCprime, MILC)")
+        logger.info("[Step 5/11] Computing CU bias statistics (ENCprime, MILC)")
         try:
             cu_stat_outputs = run_cu_statistics(
                 ffn_path, output_dir, sample_id, force=force,
@@ -223,12 +230,12 @@ def run_single_genome(
         except (FileNotFoundError, RuntimeError) as e:
             logger.warning("CU statistics failed: %s. Continuing.", e)
     else:
-        logger.info("[Step 5/9] Skipping CU bias statistics (--skip-expression)")
+        logger.info("[Step 5/11] Skipping CU bias statistics (--skip-expression)")
 
     # ── Step 6: Expression analysis ─────────────────────────────────────
     expr_df = None
     if not skip_expression and rp_ids_file and rp_ids_file.exists():
-        logger.info("[Step 6/9] Running expression level prediction (MELP/CAI/Fop)")
+        logger.info("[Step 6/11] Running expression level prediction (MELP/CAI/Fop)")
         try:
             expr_outputs = run_expression_analysis(
                 ffn_path, rp_ids_file, output_dir, sample_id, force=force,
@@ -247,14 +254,14 @@ def run_single_genome(
         except (FileNotFoundError, RuntimeError) as e:
             logger.warning("Expression analysis failed: %s. Continuing.", e)
     elif skip_expression:
-        logger.info("[Step 6/9] Skipping expression analysis (--skip-expression)")
+        logger.info("[Step 6/11] Skipping expression analysis (--skip-expression)")
     else:
-        logger.info("[Step 6/9] Skipping expression analysis (no ribosomal proteins found)")
+        logger.info("[Step 6/11] Skipping expression analysis (no ribosomal proteins found)")
 
     # ── Step 7: Pathway enrichment ───────────────────────────────────────
     enrichment_results = {}
     if expr_df is not None and kofam_df is not None and not kofam_df.empty:
-        logger.info("[Step 7/9] Running pathway enrichment (hypergeometric test)")
+        logger.info("[Step 7/11] Running pathway enrichment (hypergeometric test)")
         try:
             enrich_outputs = run_enrichment_analysis(
                 expr_df, kofam_df, output_dir, sample_id,
@@ -269,12 +276,12 @@ def run_single_genome(
             logger.warning("Pathway enrichment failed: %s. Continuing.", e)
     else:
         logger.info(
-            "[Step 7/9] Skipping pathway enrichment (%s)",
+            "[Step 7/11] Skipping pathway enrichment (%s)",
             "no expression data" if expr_df is None else "no KofamScan annotations",
         )
 
     # ── Step 8: Advanced analyses ────────────────────────────────────────
-    logger.info("[Step 8/9] Running advanced codon usage analyses")
+    logger.info("[Step 8/11] Running advanced codon usage analyses")
     advanced_results = {}
     try:
         # Resolve GFF path: explicit > Prokka output > batch table
@@ -310,8 +317,50 @@ def run_single_genome(
     except Exception as e:
         logger.warning("Advanced analyses failed: %s. Continuing.", e)
 
-    # ── Step 9: Plots ─────────────────────────────────────────────────────
-    logger.info("[Step 9/9] Generating publication-ready plots")
+    # ── Step 9: Biological/ecological analyses ──────────────────────────
+    logger.info("[Step 9/11] Running biological and ecological analyses")
+    bio_ecology_results = {}
+    try:
+        bio_outputs = run_bio_ecology_analyses(
+            ffn_path=ffn_path,
+            output_dir=output_dir,
+            sample_id=sample_id,
+            rscu_gene_df=rscu_gene_df,
+            enc_df=enc_df,
+            expr_df=expr_df,
+            rp_ids_file=rp_ids_file,
+            cog_result_tsv=all_outputs.get("cog_result"),
+            kofam_df=kofam_df,
+            gff_path=resolved_gff,
+        )
+        for key, val in bio_outputs.items():
+            if isinstance(val, Path):
+                all_outputs[f"bio_{key}"] = val
+            elif isinstance(val, pd.DataFrame):
+                bio_ecology_results[key] = val
+            elif isinstance(val, dict):
+                bio_ecology_results[key] = val
+    except Exception as e:
+        logger.warning("Biological/ecological analyses failed: %s. Continuing.", e)
+
+    # ── Step 10: Codon usage tables ──────────────────────────────────────
+    logger.info("[Step 10/11] Generating codon usage tables in all standard formats")
+    try:
+        rp_ffn = rp_outputs.get("rp_ffn")
+        table_outputs = generate_all_codon_tables(
+            ffn_path=ffn_path,
+            rp_ffn_path=rp_ffn,
+            output_dir=output_dir,
+            sample_id=sample_id,
+            expr_df=expr_df,
+            rp_ids_file=rp_ids_file,
+        )
+        all_outputs.update(table_outputs)
+    except Exception as e:
+        logger.warning("Codon usage table generation failed: %s. Continuing.", e)
+
+    # ── Step 11: Plots ────────────────────────────────────────────────────
+    logger.info("[Step 11/11] Generating publication-ready plots")
     plot_outputs = generate_single_genome_plots(
         sample_id, output_dir,
         freq_df=freq_df,
@@ -324,6 +373,7 @@ def run_single_genome(
         milc_df=milc_df,
         enrichment_results=enrichment_results if enrichment_results else None,
         advanced_results=advanced_results if advanced_results else None,
+        bio_ecology_results=bio_ecology_results if bio_ecology_results else None,
     )
     all_outputs.update(plot_outputs)
 
