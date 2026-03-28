@@ -31,6 +31,8 @@ output_file <- args[2]
 
 tryCatch({{
     fasta <- readSet(file = fasta_file)
+    # Strip FASTA headers to first word for consistent gene IDs
+    names(fasta) <- sub(" .*", "", names(fasta))
     codons <- codonTable(fasta)
     codons@KO <- codons@ID
 
@@ -62,6 +64,8 @@ output_file <- args[2]
 
 tryCatch({{
     fasta <- readSet(file = fasta_file)
+    # Strip FASTA headers to first word for consistent gene IDs
+    names(fasta) <- sub(" .*", "", names(fasta))
     codons <- codonTable(fasta)
     codons@KO <- codons@ID
 
