@@ -59,11 +59,15 @@ def run_cogclassifier(
     """
     check_tool("COGclassifier")
     cog_dir = output_dir / "cogclassifier"
-    result_file = cog_dir / "result.tsv"
 
-    if result_file.exists() and not force:
-        logger.info("COGclassifier output exists for %s, skipping", sample_id)
-        return result_file
+    # COGclassifier v1 writes result.tsv; v2 writes cog_classify.tsv
+    result_candidates = [cog_dir / "result.tsv", cog_dir / "cog_classify.tsv"]
+
+    if not force:
+        for candidate in result_candidates:
+            if candidate.exists():
+                logger.info("COGclassifier output exists for %s, skipping", sample_id)
+                return candidate
 
     cog_dir.mkdir(parents=True, exist_ok=True)
 
@@ -75,12 +79,14 @@ def run_cogclassifier(
     ]
     run_cmd(cmd, description=f"Running COGclassifier on {sample_id}")
 
-    if not result_file.exists():
-        raise FileNotFoundError(
-            f"COGclassifier did not produce result.tsv for {sample_id}. "
-            f"Check {cog_dir} for error logs."
-        )
-    return result_file
+    for candidate in result_candidates:
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        f"COGclassifier did not produce result.tsv or cog_classify.tsv for {sample_id}. "
+        f"Check {cog_dir} for error logs."
+    )
 
 
 def extract_ribosomal_proteins(
