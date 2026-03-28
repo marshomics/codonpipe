@@ -462,9 +462,10 @@ def plot_rscu_boxplots_by_group(
 
         order = sorted(plot_data[group_col].unique())
         sns.boxplot(
-            data=plot_data, x=group_col, y=col, order=order,
+            data=plot_data, x=group_col, y=col, hue=group_col,
+            order=order, hue_order=order,
             ax=ax, fliersize=1, linewidth=0.8,
-            palette="Set2",
+            palette="Set2", legend=False,
         )
         ax.axhline(y=1.0, color="gray", linestyle="--", alpha=0.5)
         ax.set_ylabel("RSCU")
@@ -825,7 +826,7 @@ def plot_s_value_scatter(
 
     # Regression line
     valid = merged.dropna(subset=[metric, "S_value"])
-    if len(valid) > 10:
+    if len(valid) > 10 and valid[metric].nunique() > 1:
         slope, intercept, r, p_val, _ = stats.linregress(valid[metric], valid["S_value"])
         x_line = np.linspace(valid[metric].min(), valid[metric].max(), 100)
         ax.plot(x_line, slope * x_line + intercept, "r-", linewidth=1,
@@ -933,7 +934,7 @@ def plot_neutrality(
 
     # Regression line
     valid = gc12_gc3_df[["GC3", "GC12"]].dropna()
-    if len(valid) > 10:
+    if len(valid) > 10 and valid["GC3"].nunique() > 1:
         slope, intercept, r, p_val, _ = stats.linregress(valid["GC3"], valid["GC12"])
         x_line = np.linspace(valid["GC3"].min(), valid["GC3"].max(), 100)
         ax.plot(x_line, slope * x_line + intercept, "r-", linewidth=1.2,
@@ -1099,27 +1100,24 @@ def plot_trna_codon_correlation(
 
     # Correlation
     valid = df[df["tRNA_copy_number"] > 0]
-    if len(valid) > 5:
+    label_text = "high-expression genes" if rscu_col == "rscu_high_expr" else "all genes"
+    ax.set_xlabel("tRNA Gene Copy Number")
+    ax.set_ylabel(f"RSCU ({label_text})")
+    if len(valid) > 5 and valid["tRNA_copy_number"].nunique() > 1 and valid[rscu_col].nunique() > 1:
         r, p_val = stats.spearmanr(valid["tRNA_copy_number"], valid[rscu_col])
-        ax.set_xlabel(f"tRNA Gene Copy Number")
-        label_text = "high-expression genes" if rscu_col == "rscu_high_expr" else "all genes"
-        ax.set_ylabel(f"RSCU ({label_text})")
         ax.set_title(f"r = {r:.3f}, p = {p_val:.2e}")
 
         # Regression line
         slope, intercept, _, _, _ = stats.linregress(valid["tRNA_copy_number"], valid[rscu_col])
         x_line = np.linspace(valid["tRNA_copy_number"].min(), valid["tRNA_copy_number"].max(), 50)
         ax.plot(x_line, slope * x_line + intercept, "r-", linewidth=1, alpha=0.7)
-    else:
-        ax.set_xlabel("tRNA Gene Copy Number")
-        ax.set_ylabel(f"RSCU")
 
     # Plot 2: compare high vs low expression (if available)
     if len(axes) > 1 and "rscu_low_expr" in trna_corr_df.columns:
         ax = axes[1]
         df2 = trna_corr_df.dropna(subset=["tRNA_copy_number", "rscu_high_expr", "rscu_low_expr"])
         valid2 = df2[df2["tRNA_copy_number"] > 0]
-        if len(valid2) > 5:
+        if len(valid2) > 5 and valid2["tRNA_copy_number"].nunique() > 1:
             r_hi, p_hi = stats.spearmanr(valid2["tRNA_copy_number"], valid2["rscu_high_expr"])
             r_lo, p_lo = stats.spearmanr(valid2["tRNA_copy_number"], valid2["rscu_low_expr"])
             ax.scatter(valid2["tRNA_copy_number"], valid2["rscu_high_expr"],
