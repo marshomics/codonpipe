@@ -20,6 +20,7 @@ def pairwise_wilcoxon(
     group_col: str,
     value_cols: list[str],
     alpha: float = 0.01,
+    correction: str = "fdr_bh",
 ) -> pd.DataFrame:
     """Perform pairwise Wilcoxon rank-sum tests between groups for each codon.
 
@@ -28,6 +29,9 @@ def pairwise_wilcoxon(
         group_col: Column defining groups (e.g., "geo_category", "phylum").
         value_cols: RSCU column names to test.
         alpha: Significance threshold after correction.
+        correction: Multiple testing correction method.
+            'fdr_bh' (default): Benjamini-Hochberg FDR correction.
+            'bonferroni': Bonferroni correction (more conservative).
 
     Returns:
         DataFrame with columns:
@@ -43,13 +47,17 @@ def pairwise_wilcoxon(
             vals1 = df.loc[df[group_col] == g1, col].dropna()
             vals2 = df.loc[df[group_col] == g2, col].dropna()
 
-            if len(vals1) < 3 or len(vals2) < 3:
+            if len(vals1) < 5 or len(vals2) < 5:
                 continue
 
             try:
                 stat, p_val = sp_stats.mannwhitneyu(vals1, vals2, alternative="two-sided")
             except ValueError:
                 continue
+
+            if len(vals1) < 10 or len(vals2) < 10:
+                logger.debug("Small sample sizes for %s: n1=%d, n2=%d; interpret with caution",
+                            col, len(vals1), len(vals2))
 
             # Extract amino acid from column name
             aa = col.split("-")[0].rstrip("0123456789")
@@ -69,9 +77,25 @@ def pairwise_wilcoxon(
 
     result_df = pd.DataFrame(results)
 
-    # Bonferroni correction
+    # Multiple testing correction
     n_tests = len(result_df)
-    result_df["corrected_p_value"] = np.minimum(result_df["p_value"] * n_tests, 1.0)
+    if correction == "bonferroni":
+        result_df["corrected_p_value"] = np.minimum(result_df["p_value"] * n_tests, 1.0)
+    elif correction == "fdr_bh":
+        # Benjamini-Hochberg FDR
+        pvals = result_df["p_value"].values
+        sorted_idx = np.argsort(pvals)
+        ranks = np.empty_like(sorted_idx)
+        ranks[sorted_idx] = np.arange(1, n_tests + 1)
+        corrected = np.minimum(pvals * n_tests / ranks, 1.0)
+        # Enforce monotonicity
+        corrected_sorted = corrected[sorted_idx]
+        for i in range(n_tests - 2, -1, -1):
+            corrected_sorted[i] = min(corrected_sorted[i], corrected_sorted[i + 1])
+        corrected[sorted_idx] = corrected_sorted
+        result_df["corrected_p_value"] = corrected
+    else:
+        raise ValueError(f"Unknown correction method: {correction!r}. Use 'fdr_bh' or 'bonferroni'.")
     result_df["significant"] = result_df["corrected_p_value"] < alpha
 
     return result_df
@@ -103,28 +127,52 @@ def per_amino_acid_tests(
     return results
 
 
-def compute_zscore_normalization(df: pd.DataFrame, rscu_cols: list[str] | None = None) -> pd.DataFrame:
-    """Z-score normalize RSCU values (column-wise).
+def compute_zscore_normalization(
+    df: pd.DataFrame,
+    rscu_cols: list[str] | None = None,
+    method: str = "clr",
+) -> pd.DataFrame:
+    """Normalize RSCU values for downstream analysis.
 
     Args:
         df: DataFrame with RSCU columns.
         rscu_cols: Columns to normalize. Defaults to RSCU_COLUMN_NAMES.
+        method: Normalization method.
+            'clr' (default): Centered log-ratio transform, appropriate for
+                compositional data like RSCU values.
+            'zscore': Standard z-score normalization. Note: RSCU data are bounded
+                and compositional, so z-scoring may introduce artifacts. Provided
+                for backward compatibility.
 
     Returns:
-        Copy of df with Z-scored RSCU values.
+        Copy of df with normalized RSCU values.
     """
     if rscu_cols is None:
         rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
 
     result = df.copy()
-    for col in rscu_cols:
-        vals = result[col]
-        mean_val = vals.mean()
-        std_val = vals.std()
-        if std_val > 0:
-            result[col] = (vals - mean_val) / std_val
-        else:
-            result[col] = 0.0
+
+    if method == "clr":
+        # Centered log-ratio transform: log(x / geometric_mean(x)) per row
+        for idx in result.index:
+            vals = result.loc[idx, rscu_cols].values.astype(float)
+            # Add small pseudocount to handle zeros
+            vals_pseudo = vals + 1e-6
+            geo_mean = np.exp(np.mean(np.log(vals_pseudo)))
+            result.loc[idx, rscu_cols] = np.log(vals_pseudo / geo_mean)
+    elif method == "zscore":
+        for col in rscu_cols:
+            vals = result[col]
+            mean_val = vals.mean()
+            std_val = vals.std()
+            if std_val > 0:
+                result[col] = (vals - mean_val) / std_val
+            else:
+                result[col] = np.nan  # Flag zero-variance columns as NaN, not 0
+                logger.warning("Zero variance in column '%s'; set to NaN", col)
+    else:
+        raise ValueError(f"Unknown normalization method: {method!r}. Use 'clr' or 'zscore'.")
+
     return result
 
 
