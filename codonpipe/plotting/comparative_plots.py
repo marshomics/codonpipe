@@ -400,9 +400,20 @@ def plot_rscu_volcano(
                 xytext=(3, 3), textcoords="offset points",
             )
 
-        ax.axhline(-np.log10(0.05), color="blue", linestyle="--", alpha=0.5, linewidth=0.8)
-        ax.axvline(0.3, color="gray", linestyle=":", alpha=0.4)
-        ax.axvline(-0.3, color="gray", linestyle=":", alpha=0.4)
+        # Threshold lines for significance region
+        fdr_threshold = 0.05
+        fc_threshold = 0.3
+        ax.axhline(-np.log10(fdr_threshold), color="blue", linestyle="--", alpha=0.5, linewidth=0.8,
+                   label=f"FDR = {fdr_threshold}")
+        ax.axvline(fc_threshold, color="red", linestyle="--", alpha=0.5, linewidth=0.8)
+        ax.axvline(-fc_threshold, color="red", linestyle="--", alpha=0.5, linewidth=0.8,
+                   label=f"|log₂FC| = {fc_threshold}")
+
+        # Light background shading for the non-significant region
+        # Only shade the region below the FDR threshold OR within the FC threshold
+        y_max = ax.get_ylim()[1]
+        # Shade left and right non-significant regions (low fold-change)
+        ax.axvspan(-fc_threshold, fc_threshold, alpha=0.05, color="gray", zorder=0)
         ax.set_xlabel("log₂ Fold Change (RSCU)", fontsize=11)
         ax.set_ylabel("-log₁₀(FDR)", fontsize=11)
         ax.set_title(f"{g1} vs {g2}", fontsize=11)
@@ -659,6 +670,12 @@ def plot_radar_by_condition(
     ax.set_ylim(0, 1.1)
     ax.set_title("Codon Usage Profile by Condition", fontsize=12, pad=20)
     ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=9)
+
+    # Annotation noting independent normalization
+    ax.annotate("Note: Each metric is independently min-max normalized",
+                xy=(0.5, -0.05), xycoords="axes fraction", ha="center",
+                fontsize=7, fontstyle="italic", color="gray")
+
     fig.tight_layout()
     _save_fig(fig, output_path)
 
