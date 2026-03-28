@@ -240,7 +240,8 @@ def compute_relative_adaptiveness(
             col_name = f"{family_name}-{codon}"
             rscu_val = rscu_vals.get(col_name, 0.0)
             rscu_list.append(rscu_val)
-        max_rscu_per_family[family_name] = max(rscu_list) if rscu_list else 1.0
+        max_val = max(rscu_list) if rscu_list else 0.0
+        max_rscu_per_family[family_name] = max_val
 
     rows = []
     for codon in sorted(SENSE_CODONS.keys()):
@@ -249,7 +250,7 @@ def compute_relative_adaptiveness(
         family_name = col_name.split("-")[0]
         rscu_val = rscu_vals.get(col_name, 0.0)
         max_rscu = max_rscu_per_family.get(family_name, 1.0)
-        w_value = rscu_val / max_rscu if max_rscu > 0 else 0.0
+        w_value = rscu_val / max_rscu if max_rscu > 0 else np.nan
 
         rows.append({
             "codon": codon,
@@ -266,6 +267,7 @@ def compute_codon_adaptation_weights(
     ffn_all_path: Path,
     ref_gene_ids: set[str] | None = None,
     min_length: int = MIN_GENE_LENGTH,
+    pseudocount: float = 0.01,
 ) -> pd.DataFrame:
     """Compute codon adaptation weights comparing reference set to all genes.
 
@@ -277,6 +279,9 @@ def compute_codon_adaptation_weights(
         ffn_all_path: Path to all genes.
         ref_gene_ids: Optional set of gene IDs to include from reference file.
         min_length: Minimum sequence length in nucleotides to include.
+        pseudocount: Small value added to RSCU before computing log-ratio weights.
+            Prevents log(0) and affects which codons are classified as optimal.
+            Default 0.01; sensitivity to this choice should be assessed.
 
     Returns:
         DataFrame with columns: codon, amino_acid, rscu_ref, rscu_all, weight, is_optimal
@@ -311,7 +316,6 @@ def compute_codon_adaptation_weights(
 
         # Compute weight: ln(rscu_ref / rscu_all)
         # Add small pseudocount to avoid log(0)
-        pseudocount = 0.01
         weight = np.log((rscu_ref + pseudocount) / (rscu_all + pseudocount))
         is_optimal = weight > 0
 
@@ -552,8 +556,22 @@ def generate_all_codon_tables(
             logger.info("Saved adaptation weights to %s", weights_path)
 
             # Extract optimal codons (weight > 0)
+            # Sort by weight descending to deterministically select the most-preferred codon
+            optimal_sorted = (
+                weights_df[weights_df["is_optimal"]]
+                .sort_values("weight", ascending=False)
+            )
+            # Check for ties: same amino acid with identical top weight
+            for aa_name in optimal_sorted["amino_acid"].unique():
+                aa_rows = optimal_sorted[optimal_sorted["amino_acid"] == aa_name]
+                if len(aa_rows) > 1 and aa_rows.iloc[0]["weight"] == aa_rows.iloc[1]["weight"]:
+                    logger.warning(
+                        "Tied optimal codon weights for %s (weight=%.4f); "
+                        "selecting %s arbitrarily",
+                        aa_name, aa_rows.iloc[0]["weight"], aa_rows.iloc[0]["codon"],
+                    )
             optimal_codons = dict(
-                weights_df[weights_df["is_optimal"]][["amino_acid", "codon"]]
+                optimal_sorted
                 .drop_duplicates(subset=["amino_acid"])
                 .set_index("amino_acid")["codon"]
             )
