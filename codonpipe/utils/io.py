@@ -61,10 +61,14 @@ def run_cmd(
     )
     if check and result.returncode != 0:
         stderr_msg = result.stderr[:2000] if result.stderr else "(no stderr)"
-        raise RuntimeError(
-            f"Command failed (exit {result.returncode}): {' '.join(str(c) for c in cmd)}\n"
-            f"stderr: {stderr_msg}"
-        )
+        stdout_msg = result.stdout[:2000] if result.stdout else ""
+        error_parts = [
+            f"Command failed (exit {result.returncode}): {' '.join(str(c) for c in cmd)}",
+            f"stderr: {stderr_msg}",
+        ]
+        if stdout_msg:
+            error_parts.append(f"stdout: {stdout_msg}")
+        raise RuntimeError("\n".join(error_parts))
     return result
 
 
