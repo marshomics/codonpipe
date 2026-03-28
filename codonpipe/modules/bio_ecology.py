@@ -1046,6 +1046,11 @@ def run_bio_ecology_analyses(
             growth_result = predict_growth_rate(expr_df, rp_ids_file)
             if growth_result is not None:
                 outputs["growth_rate_prediction"] = growth_result
+                # Save as single-row TSV for comparative analysis reader
+                growth_df = pd.DataFrame([growth_result])
+                out_path = eco_dir / f"{sample_id}_growth_rate_prediction.tsv"
+                growth_df.to_csv(out_path, sep="\t", index=False)
+                outputs["growth_rate_prediction_path"] = out_path
                 logger.info("Growth rate prediction: %.2f h (class: %s)",
                            growth_result["predicted_doubling_time_hours"],
                            growth_result["growth_class"])
