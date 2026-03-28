@@ -26,10 +26,12 @@ from codonpipe.modules.advanced_analyses import run_advanced_analyses
 from codonpipe.modules.bio_ecology import run_bio_ecology_analyses
 from codonpipe.modules.codon_table_formats import generate_all_codon_tables
 from codonpipe.modules.statistics import run_batch_statistics
+from codonpipe.modules.comparative import run_comparative_analyses
 from codonpipe.plotting.plots import (
     generate_single_genome_plots,
     generate_batch_plots,
 )
+from codonpipe.plotting.comparative_plots import generate_comparative_plots
 from codonpipe.utils.codon_tables import RSCU_COLUMN_NAMES
 from codonpipe.utils.io import load_batch_table, write_tsv
 
@@ -415,6 +417,7 @@ def run_batch(
     cpus: int = 4,
     parallel: int = 1,
     metadata_cols: list[str] | None = None,
+    condition_col: str | None = None,
     **kwargs,
 ) -> dict[str, Path]:
     """Run the pipeline on multiple genomes from a batch table.
@@ -429,6 +432,10 @@ def run_batch(
         cpus: CPUs per sample.
         parallel: Number of samples to process in parallel.
         metadata_cols: Columns from batch table to use for comparative analyses.
+        condition_col: Column name in the batch table designating experimental
+            conditions.  When provided, condition-aware within- and between-
+            condition comparative analyses are generated in addition to the
+            standard batch analyses.
         **kwargs: Additional arguments passed to run_single_genome.
 
     Returns:
@@ -440,6 +447,16 @@ def run_batch(
     df = load_batch_table(batch_table)
     n_samples = len(df)
     logger.info("Loaded batch table with %d genomes", n_samples)
+
+    # Validate condition column
+    if condition_col and condition_col not in df.columns:
+        logger.error("Condition column '%s' not found in batch table (available: %s)",
+                      condition_col, list(df.columns))
+        raise ValueError(f"Condition column '{condition_col}' not found in batch table")
+    if condition_col:
+        n_cond = df[condition_col].nunique()
+        logger.info("Condition column '%s': %d unique conditions — %s",
+                     condition_col, n_cond, list(df[condition_col].unique()))
 
     # Check for pre-existing Prokka columns
     has_prokka_cols = "prokka_faa" in df.columns and "prokka_ffn" in df.columns
@@ -547,6 +564,7 @@ def run_batch(
     logger.info("Running batch-level comparative analyses")
     batch_outputs = _run_batch_analyses(
         df, sample_outputs, output_dir, metadata_cols,
+        condition_col=condition_col,
     )
 
     return batch_outputs
@@ -557,6 +575,7 @@ def _run_batch_analyses(
     sample_outputs: dict[str, dict[str, Path]],
     output_dir: Path,
     metadata_cols: list[str],
+    condition_col: str | None = None,
 ) -> dict[str, Path]:
     """Combine per-sample results and run comparative analyses."""
     outputs = {}
@@ -629,6 +648,66 @@ def _run_batch_analyses(
         wilcoxon_results=wilcoxon_results if wilcoxon_results else None,
     )
     outputs.update(plot_outputs)
+
+    # ── Condition-aware comparative analyses ──────────────────────────
+    if condition_col:
+        logger.info("Running condition-aware comparative analyses (condition_col='%s')", condition_col)
+        try:
+            metrics_df, comp_outputs = run_comparative_analyses(
+                sample_outputs=sample_outputs,
+                batch_df=batch_df,
+                output_dir=output_dir,
+                condition_col=condition_col,
+                metadata_cols=effective_meta,
+            )
+            outputs.update(comp_outputs)
+
+            # Load statistical results for plotting
+            between_tests_df = None
+            rscu_tests_df = None
+            rscu_disp_df = None
+            perm_result = None
+
+            if "between_condition_tests" in comp_outputs:
+                p = comp_outputs["between_condition_tests"]
+                if p.exists():
+                    between_tests_df = pd.read_csv(p, sep="\t")
+
+            if "between_condition_rscu_tests" in comp_outputs:
+                p = comp_outputs["between_condition_rscu_tests"]
+                if p.exists():
+                    rscu_tests_df = pd.read_csv(p, sep="\t")
+
+            if "within_condition_rscu_dispersion" in comp_outputs:
+                p = comp_outputs["within_condition_rscu_dispersion"]
+                if p.exists():
+                    rscu_disp_df = pd.read_csv(p, sep="\t")
+
+            if "permanova_rscu" in comp_outputs:
+                p = comp_outputs["permanova_rscu"]
+                if p.exists():
+                    perm_df = pd.read_csv(p, sep="\t")
+                    if len(perm_df):
+                        perm_result = perm_df.iloc[0].to_dict()
+
+            # Generate comparative plots
+            logger.info("Generating condition-aware comparative plots")
+            comp_plot_outputs = generate_comparative_plots(
+                metrics_df=metrics_df,
+                output_dir=output_dir,
+                condition_col=condition_col,
+                between_tests_df=between_tests_df,
+                rscu_tests_df=rscu_tests_df,
+                rscu_disp_df=rscu_disp_df,
+                perm_result=perm_result,
+            )
+            outputs.update(comp_plot_outputs)
+            logger.info("Condition-aware comparative analyses complete: %d outputs",
+                        len(comp_outputs) + len(comp_plot_outputs))
+        except Exception as e:
+            logger.warning("Condition-aware comparative analyses failed: %s. Continuing.", e)
+    else:
+        logger.info("No condition column specified; skipping condition-aware analyses")
 
     return outputs
 
