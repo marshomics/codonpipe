@@ -159,8 +159,15 @@ def detect_hgt_candidates(
     genes = rscu_gene_df["gene"].values
     n_genes, n_features = X.shape
 
-    # Handle NaN/inf
-    X = np.where(np.isnan(X) | np.isinf(X), 0, X)
+    # Remove genes with missing RSCU values rather than imputing zeros
+    valid_mask = ~(np.isnan(X) | np.isinf(X)).any(axis=1)
+    if valid_mask.sum() < 10:
+        logger.warning("Too few genes with complete RSCU data (%d) for HGT detection", valid_mask.sum())
+        return pd.DataFrame(columns=["gene", "mahalanobis_distance", "p_value", "p_adjusted",
+                                      "gc3_deviation", "is_hgt_candidate"])
+    X = X[valid_mask]
+    genes = genes[valid_mask]
+    n_genes = X.shape[0]
 
     # If fewer genes than features, use PCA reduction first
     if n_genes < n_features:
@@ -197,6 +204,9 @@ def detect_hgt_candidates(
 
     # Chi-squared p-value from Mahalanobis distance (df = n_features)
     p_values = 1 - stats.chi2.cdf(mahal_dists ** 2, df=n_features)
+    # Note: p-values are approximate because LedoitWolf shrinkage introduces bias
+    # in the covariance estimate, invalidating the exact chi-squared assumption.
+    logger.info("HGT p-values are approximate (LedoitWolf shrinkage covariance used)")
 
     # GC3 deviation from genome mean
     merged_gc3 = enc_df[["gene", "GC3"]].copy()
@@ -295,8 +305,8 @@ def predict_growth_rate(
     rp_mask = expr_df["gene"].isin(rp_genes)
     rp_cai = expr_df.loc[rp_mask, "CAI"].dropna()
 
-    if len(rp_cai) < 1:
-        logger.warning("No CAI values for ribosomal proteins")
+    if len(rp_cai) < 3:
+        logger.warning("Too few ribosomal proteins with CAI values (%d); need at least 3", len(rp_cai))
         return None
 
     mean_cai_rp = rp_cai.mean()
@@ -319,6 +329,7 @@ def predict_growth_rate(
         "predicted_doubling_time_hours": float(predicted_doubling_time),
         "n_rp_genes": int(len(rp_cai)),
         "growth_class": growth_class,
+        "caveat": "Coefficients from Vieira-Silva & Rocha (2010); validated primarily on proteobacteria. Interpret with caution for other lineages.",
     }
 
 
@@ -327,6 +338,7 @@ def quantify_translational_selection(
     enc_df: pd.DataFrame,
     expr_df: pd.DataFrame,
     ffn_path: Path,
+    optimal_percentile: float = 0.75,
 ) -> dict[str, pd.DataFrame]:
     """Quantify translational selection via optimal codon identification and Fop analysis.
 
@@ -372,7 +384,7 @@ def quantify_translational_selection(
 
     # --- A. Optimal codon identification ---
     genome_avg_rscu = merged[rscu_cols].mean()
-    high_mask = merged["CAI"] >= merged["CAI"].quantile(0.75)
+    high_mask = merged["CAI"] >= merged["CAI"].quantile(optimal_percentile)
     if high_mask.sum() < 3:
         logger.info("SKIPPED: optimal codon identification (fewer than 3 high-expression genes)")
         optimal_df = pd.DataFrame()
@@ -391,7 +403,7 @@ def quantify_translational_selection(
                 "delta_rscu": round(delta, 4),
                 "genome_avg_rscu": round(genome_avg_rscu[col], 4),
                 "high_expr_rscu": round(high_avg_rscu[col], 4),
-                "is_optimal": 1 if delta > 0 else 0,
+                "is_optimal": 1 if delta > 0.05 else 0,
             })
         optimal_df = pd.DataFrame(optimal_rows)
 
@@ -451,6 +463,37 @@ def quantify_translational_selection(
 
     fop_gradient_df = pd.DataFrame(fop_rows)
 
+    # Also compute continuous Spearman correlation (CAI vs Fop)
+    if not optimal_codons_set and not merged.empty:
+        pass  # No optimal codons identified
+    elif not merged.empty and "CAI" in merged.columns:
+        # Compute Fop for each gene directly
+        all_fop_vals = []
+        all_cai_vals = []
+        for rec in SeqIO.parse(str(ffn_path), "fasta"):
+            if rec.id not in merged["gene"].values:
+                continue
+            seq = str(rec.seq)
+            if len(seq) < 240:
+                continue
+            gene_counts = count_codons(seq)
+            n_opt = sum(gene_counts.get(c, 0) for c in optimal_codons_set if c in SENSE_CODONS)
+            n_total = sum(gene_counts.get(c, 0) for c in SENSE_CODONS)
+            if n_total > 0:
+                all_fop_vals.append(n_opt / n_total)
+                cai_val = merged.loc[merged["gene"] == rec.id, "CAI"].values
+                if len(cai_val) > 0:
+                    all_cai_vals.append(cai_val[0])
+                else:
+                    all_fop_vals.pop()
+
+        if len(all_fop_vals) >= 10:
+            from scipy.stats import spearmanr
+            spearman_rho, spearman_p = spearmanr(all_cai_vals, all_fop_vals)
+            fop_gradient_df.attrs["spearman_rho"] = round(spearman_rho, 4)
+            fop_gradient_df.attrs["spearman_p"] = spearman_p
+            logger.info("CAI-Fop Spearman correlation: rho=%.4f, p=%.2e", spearman_rho, spearman_p)
+
     # --- C. Within-gene codon position effects ---
     pos_rows = []
     for rec in SeqIO.parse(str(ffn_path), "fasta"):
@@ -462,9 +505,9 @@ def quantify_translational_selection(
         if gene_id not in merged["gene"].values:
             continue
 
-        # Split into regions (30 codons = 90 nt at start/end)
-        region_nt = 90
+        # Use 20% of gene length for terminal regions, minimum 90 nt, rounded to codon boundary
         seq_upper = seq.upper()
+        region_nt = max(90, (len(seq_upper) // 5 // 3) * 3)
 
         # 5' region
         seq_5p = seq_upper[:region_nt]
@@ -729,23 +772,30 @@ def compute_strand_asymmetry(
         ranks = np.empty_like(order)
         ranks[order] = np.arange(1, n + 1)
         fdr = np.minimum(pvals * n / ranks, 1.0)
-        # Enforce monotonicity (descending rank order)
-        for i in reversed(order[:-1]):
-            j = order[np.searchsorted(order, i) + 1] if np.searchsorted(order, i) + 1 < n else i
-            fdr[i] = min(fdr[i], fdr[j]) if i != j else fdr[i]
-        # Simpler monotonicity: walk sorted order in reverse
+        # Enforce BH monotonicity: walk sorted order in reverse
         fdr_sorted = fdr[order]
         for k in range(n - 2, -1, -1):
             fdr_sorted[k] = min(fdr_sorted[k], fdr_sorted[k + 1])
         fdr[order] = fdr_sorted
         result_df["p_adjusted"] = np.round(fdr, 6)
         result_df["significant"] = result_df["p_adjusted"] < 0.05
-        logger.info("Strand asymmetry: analyzed %d codons, %d significant (FDR < 0.05)",
-                     len(result_df), result_df["significant"].sum())
+
+        # Check for severe strand imbalance
+        n_plus = len(plus_rscu.get(rscu_cols[0], [])) if rscu_cols else 0
+        n_minus = len(minus_rscu.get(rscu_cols[0], [])) if rscu_cols else 0
+        if n_plus > 0 and n_minus > 0 and max(n_plus, n_minus) / min(n_plus, n_minus) > 3:
+            logger.warning("Severe strand imbalance: %d genes on (+) strand vs %d on (-) strand. "
+                           "Mann-Whitney results may be unreliable.", n_plus, n_minus)
+
+        logger.info("Strand asymmetry: %d codons analyzed (%d significant, FDR < 0.05), n_plus=%d, n_minus=%d",
+                    len(result_df), result_df["significant"].sum(), n_plus, n_minus)
     elif result_df is not None:
         result_df["p_adjusted"] = result_df["p_value"]
         result_df["significant"] = result_df["p_adjusted"] < 0.05
-        logger.info("Strand asymmetry: analyzed %d codons", len(result_df))
+        n_plus = len(plus_rscu.get(rscu_cols[0], [])) if rscu_cols else 0
+        n_minus = len(minus_rscu.get(rscu_cols[0], [])) if rscu_cols else 0
+        logger.info("Strand asymmetry: %d codons analyzed, n_plus=%d, n_minus=%d",
+                    len(result_df), n_plus, n_minus)
     return result_df
 
 
@@ -843,7 +893,7 @@ def compute_operon_codon_coadaptation(
     rng = np.random.RandomState(42)
     random_genes = list(rscu_map.keys())
     random_dists = []
-    n_permutations = 100
+    n_permutations = 1000
     for _ in range(n_permutations):
         rng.shuffle(random_genes)
         for i in range(min(len(random_genes) - 1, len(result_df))):
