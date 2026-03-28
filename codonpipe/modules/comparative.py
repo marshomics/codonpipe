@@ -617,7 +617,7 @@ def between_condition_tests(
         # Enforce monotonicity
         corrected_sorted = corrected[sorted_idx]
         for i in range(n_tests - 2, -1, -1):
-            corrected_sorted[i + 1] = min(corrected_sorted[i + 1], corrected_sorted[i] if i < n_tests - 1 else 1.0)
+            corrected_sorted[i] = min(corrected_sorted[i], corrected_sorted[i + 1])
         corrected[sorted_idx] = corrected_sorted
         result.loc[mask, "corrected_p"] = corrected
 
@@ -722,7 +722,8 @@ def between_condition_rscu_tests(
                 continue
 
             mean1, mean2 = vals1.mean(), vals2.mean()
-            lfc = np.log2(mean2 / mean1) if mean1 > 0 and mean2 > 0 else np.nan
+            pseudocount = 1e-4
+            lfc = np.log2((mean2 + pseudocount) / (mean1 + pseudocount))
             delta = _cliffs_delta(vals1.values, vals2.values)
 
             rows.append({
@@ -752,6 +753,11 @@ def between_condition_rscu_tests(
         ranks = np.empty_like(sorted_i)
         ranks[sorted_i] = np.arange(1, n + 1)
         corrected = np.minimum(pvals * n / ranks, 1.0)
+        # Enforce monotonicity
+        corrected_sorted = corrected[sorted_i]
+        for j in range(n - 2, -1, -1):
+            corrected_sorted[j] = min(corrected_sorted[j], corrected_sorted[j + 1])
+        corrected[sorted_i] = corrected_sorted
         result.loc[idx, "corrected_p"] = corrected
 
     result["significant"] = result["corrected_p"] < 0.05
@@ -815,7 +821,7 @@ def permanova_rscu(
         idx = np.where(conditions == g)[0]
         ng = len(idx)
         if ng > 1:
-            ss_within += dist_matrix[np.ix_(idx, idx)].sum() ** 0.5 / (2 * ng)
+            ss_within += (dist_matrix[np.ix_(idx, idx)] ** 2).sum() / (2 * ng)
     # Approximate R2
     ss_between = ss_total - ss_within if ss_within < ss_total else 0
     r2 = ss_between / ss_total if ss_total > 0 else 0
@@ -830,7 +836,7 @@ def permanova_rscu(
     }
 
 
-def _permanova_f(dist_sq: np.ndarray, groups: np.ndarray) -> float | None:
+def _permanova_f(dist_mat: np.ndarray, groups: np.ndarray) -> float | None:
     """Compute pseudo-F statistic for PERMANOVA."""
     n = len(groups)
     unique_g = np.unique(groups)
@@ -840,7 +846,7 @@ def _permanova_f(dist_sq: np.ndarray, groups: np.ndarray) -> float | None:
         return None
 
     # SS_total
-    ss_total = (dist_sq ** 2).sum() / (2 * n)
+    ss_total = (dist_mat ** 2).sum() / (2 * n)
 
     # SS_within
     ss_within = 0
@@ -848,7 +854,7 @@ def _permanova_f(dist_sq: np.ndarray, groups: np.ndarray) -> float | None:
         idx = np.where(groups == g)[0]
         ng = len(idx)
         if ng > 1:
-            ss_within += (dist_sq[np.ix_(idx, idx)] ** 2).sum() / (2 * ng)
+            ss_within += (dist_mat[np.ix_(idx, idx)] ** 2).sum() / (2 * ng)
 
     ss_between = ss_total - ss_within
     if ss_within == 0:
@@ -935,7 +941,8 @@ def between_condition_expression_class_rscu(
 
         delta = _cliffs_delta(v1.values, v2.values)
         m1, m2 = v1.mean(), v2.mean()
-        log2fc = np.log2(m1 / m2) if m2 > 0 and m1 > 0 else 0
+        pseudocount = 1e-4
+        log2fc = np.log2((m1 + pseudocount) / (m2 + pseudocount))
 
         parts = codon_name.split("-")
         aa = parts[0] if len(parts) == 2 else ""
