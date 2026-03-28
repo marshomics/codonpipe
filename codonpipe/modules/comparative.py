@@ -906,7 +906,8 @@ def between_condition_expression_class_rscu(
     """Compare expression-class-specific RSCU between conditions.
 
     Tests each codon's RSCU (ribosomal or high-expression) between conditions
-    using Mann-Whitney U with BH FDR correction.
+    using Mann-Whitney U with BH FDR correction per comparison pair.
+    For 3+ conditions, performs all pairwise comparisons using itertools.combinations.
 
     Args:
         metrics_df: Sample metrics with prefixed RSCU columns.
@@ -916,6 +917,7 @@ def between_condition_expression_class_rscu(
 
     Returns:
         DataFrame with per-codon test results sorted by adjusted p-value.
+        For 2+ conditions: includes group1, group2, mean_group1, mean_group2 columns.
     """
     conditions = metrics_df[condition_col].dropna().unique()
     if len(conditions) < 2:
@@ -930,53 +932,61 @@ def between_condition_expression_class_rscu(
     rows = []
     for col in rscu_cols:
         codon_name = col.replace(prefix, "")
-        v1 = metrics_df.loc[metrics_df[condition_col] == cond_list[0], col].dropna()
-        v2 = metrics_df.loc[metrics_df[condition_col] == cond_list[1], col].dropna()
-        if len(v1) < 3 or len(v2) < 3:
-            continue
-        try:
-            stat, p_val = sp_stats.mannwhitneyu(v1, v2, alternative="two-sided")
-        except ValueError:
-            continue
+        for g1, g2 in itertools.combinations(cond_list, 2):
+            v1 = metrics_df.loc[metrics_df[condition_col] == g1, col].dropna()
+            v2 = metrics_df.loc[metrics_df[condition_col] == g2, col].dropna()
+            if len(v1) < 3 or len(v2) < 3:
+                continue
+            try:
+                stat, p_val = sp_stats.mannwhitneyu(v1, v2, alternative="two-sided")
+            except ValueError:
+                continue
 
-        delta = _cliffs_delta(v1.values, v2.values)
-        m1, m2 = v1.mean(), v2.mean()
-        pseudocount = 1e-4
-        log2fc = np.log2((m1 + pseudocount) / (m2 + pseudocount))
+            delta = _cliffs_delta(v1.values, v2.values)
+            m1, m2 = v1.mean(), v2.mean()
+            pseudocount = 1e-4
+            log2fc = np.log2((m2 + pseudocount) / (m1 + pseudocount))
 
-        parts = codon_name.split("-")
-        aa = parts[0] if len(parts) == 2 else ""
-        codon = parts[-1]
+            parts = codon_name.split("-")
+            aa = parts[0] if len(parts) == 2 else ""
+            codon = parts[-1]
 
-        rows.append({
-            "gene_set": label,
-            "amino_acid": aa,
-            "codon": codon,
-            "codon_col": codon_name,
-            f"mean_{cond_list[0]}": round(m1, 4),
-            f"mean_{cond_list[1]}": round(m2, 4),
-            "log2_fc": round(log2fc, 4),
-            "U_statistic": round(stat, 2),
-            "p_value": p_val,
-            "cliffs_delta": round(delta, 4),
-            "effect_size": _effect_size_label(abs(delta)),
-        })
+            rows.append({
+                "gene_set": label,
+                "amino_acid": aa,
+                "codon": codon,
+                "codon_col": codon_name,
+                "group1": g1,
+                "group2": g2,
+                "mean_group1": round(m1, 4),
+                "mean_group2": round(m2, 4),
+                "log2_fc": round(log2fc, 4),
+                "U_statistic": round(stat, 2),
+                "p_value": p_val,
+                "cliffs_delta": round(delta, 4),
+                "effect_size": _effect_size_label(abs(delta)),
+            })
 
     if not rows:
         return pd.DataFrame()
 
     result = pd.DataFrame(rows)
-    # BH FDR
-    n = len(result)
-    order = np.argsort(result["p_value"].values)
-    ranks = np.empty_like(order)
-    ranks[order] = np.arange(1, n + 1)
-    fdr = np.minimum(result["p_value"].values * n / ranks, 1.0)
-    sorted_fdr = fdr[order]
-    for k in range(n - 2, -1, -1):
-        sorted_fdr[k] = min(sorted_fdr[k], sorted_fdr[k + 1])
-    fdr[order] = sorted_fdr
-    result["p_adjusted"] = np.round(fdr, 6)
+    # BH FDR per comparison pair
+    for (g1, g2), grp in result.groupby(["group1", "group2"]):
+        idx = grp.index
+        pvals = grp["p_value"].values
+        n = len(pvals)
+        sorted_i = np.argsort(pvals)
+        ranks = np.empty_like(sorted_i)
+        ranks[sorted_i] = np.arange(1, n + 1)
+        corrected = np.minimum(pvals * n / ranks, 1.0)
+        # Enforce monotonicity
+        corrected_sorted = corrected[sorted_i]
+        for j in range(n - 2, -1, -1):
+            corrected_sorted[j] = min(corrected_sorted[j], corrected_sorted[j + 1])
+        corrected[sorted_i] = corrected_sorted
+        result.loc[idx, "p_adjusted"] = corrected
+
     result["significant"] = result["p_adjusted"] < 0.05
     return result.sort_values("p_adjusted")
 
@@ -989,11 +999,13 @@ def between_condition_enrichment_comparison(
     """Compare pathway enrichment results between conditions.
 
     For each KEGG pathway, counts how many samples in each condition had it
-    significantly enriched in high-expression genes, then tests for a
-    condition effect using Fisher's exact test.
+    significantly enriched in high-expression genes.
+    For 2 conditions: Fisher's exact test.
+    For 3+ conditions: chi-squared test on full contingency table (enriched/not-enriched × conditions)
+    plus all pairwise Fisher's exact tests.
 
-    Returns a DataFrame with pathway, per-condition enrichment counts,
-    Fisher's p-value, and FDR-adjusted p-value.
+    Returns a DataFrame with pathway, test type, per-condition enrichment counts,
+    p-value, FDR-adjusted p-value, and for pairwise tests: group1, group2, odds_ratio.
     """
     conditions = metrics_df[condition_col].dropna().unique()
     if len(conditions) < 2:
@@ -1045,45 +1057,76 @@ def between_condition_enrichment_comparison(
     if not all_pathways:
         return pd.DataFrame()
 
-    # For each pathway: Fisher's exact test for enrichment frequency
     rows = []
-    for pw in sorted(all_pathways.keys()):
-        n1_enriched = cond_pathways[cond_list[0]].get(pw, 0)
-        n2_enriched = cond_pathways[cond_list[1]].get(pw, 0)
-        n1_total = cond_n_samples[cond_list[0]]
-        n2_total = cond_n_samples[cond_list[1]]
 
-        if n1_total == 0 or n2_total == 0:
-            continue
+    # Omnibus chi-squared test (if 3+ conditions)
+    if len(cond_list) >= 3:
+        for pw in sorted(all_pathways.keys()):
+            # Build contingency table: rows = [enriched, not_enriched], cols = conditions
+            contingency = []
+            for cond in cond_list:
+                n_enriched = cond_pathways[cond].get(pw, 0)
+                n_total = cond_n_samples[cond]
+                if n_total == 0:
+                    break
+                contingency.append([n_enriched, n_total - n_enriched])
+            else:
+                if len(contingency) == len(cond_list):
+                    try:
+                        chi2, p_val, dof, expected = sp_stats.chi2_contingency(np.array(contingency).T)
+                        rows.append({
+                            "pathway": pw,
+                            "pathway_name": all_pathways.get(pw, ""),
+                            "test": "chi_squared",
+                            "group1": "omnibus",
+                            "group2": "omnibus",
+                            "p_value": p_val,
+                        })
+                    except (ValueError, RuntimeError):
+                        pass
 
-        # 2x2 contingency table
-        table = np.array([
-            [n1_enriched, n1_total - n1_enriched],
-            [n2_enriched, n2_total - n2_enriched],
-        ])
-        try:
-            odds_ratio, p_val = sp_stats.fisher_exact(table, alternative="two-sided")
-        except ValueError:
-            continue
+    # Pairwise Fisher's exact test for all pairs
+    for g1, g2 in itertools.combinations(cond_list, 2):
+        for pw in sorted(all_pathways.keys()):
+            n1_enriched = cond_pathways[g1].get(pw, 0)
+            n2_enriched = cond_pathways[g2].get(pw, 0)
+            n1_total = cond_n_samples[g1]
+            n2_total = cond_n_samples[g2]
 
-        rows.append({
-            "pathway": pw,
-            "pathway_name": all_pathways.get(pw, ""),
-            f"n_enriched_{cond_list[0]}": n1_enriched,
-            f"n_samples_{cond_list[0]}": n1_total,
-            f"frac_enriched_{cond_list[0]}": round(n1_enriched / n1_total, 3),
-            f"n_enriched_{cond_list[1]}": n2_enriched,
-            f"n_samples_{cond_list[1]}": n2_total,
-            f"frac_enriched_{cond_list[1]}": round(n2_enriched / n2_total, 3),
-            "odds_ratio": round(odds_ratio, 3) if np.isfinite(odds_ratio) else np.inf,
-            "p_value": p_val,
-        })
+            if n1_total == 0 or n2_total == 0:
+                continue
+
+            # 2x2 contingency table
+            table = np.array([
+                [n1_enriched, n1_total - n1_enriched],
+                [n2_enriched, n2_total - n2_enriched],
+            ])
+            try:
+                odds_ratio, p_val = sp_stats.fisher_exact(table, alternative="two-sided")
+            except ValueError:
+                continue
+
+            rows.append({
+                "pathway": pw,
+                "pathway_name": all_pathways.get(pw, ""),
+                "test": "fisher_exact",
+                "group1": g1,
+                "group2": g2,
+                f"n_enriched_{g1}": n1_enriched,
+                f"n_samples_{g1}": n1_total,
+                f"frac_enriched_{g1}": round(n1_enriched / n1_total, 3),
+                f"n_enriched_{g2}": n2_enriched,
+                f"n_samples_{g2}": n2_total,
+                f"frac_enriched_{g2}": round(n2_enriched / n2_total, 3),
+                "odds_ratio": round(odds_ratio, 3) if np.isfinite(odds_ratio) else np.inf,
+                "p_value": p_val,
+            })
 
     if not rows:
         return pd.DataFrame()
 
     result = pd.DataFrame(rows)
-    # BH FDR
+    # BH FDR globally across all tests
     n = len(result)
     if n > 1:
         order = np.argsort(result["p_value"].values)
@@ -1115,11 +1158,12 @@ def between_condition_strand_asymmetry_patterns(
     """Compare per-codon strand asymmetry patterns between conditions.
 
     For each codon, aggregates the plus-minus RSCU difference across samples
-    within each condition, then tests for a significant difference in that
-    asymmetry between conditions using Mann-Whitney U.
+    within each condition. For 3+ conditions, performs Kruskal-Wallis omnibus test,
+    then all pairwise Mann-Whitney U tests.
 
-    Returns a DataFrame with one row per codon: mean asymmetry per condition,
-    Mann-Whitney p-value, FDR-adjusted p-value, and Cliff's delta.
+    Returns a DataFrame with one row per codon and test: mean asymmetry per condition,
+    p-value, FDR-adjusted p-value, and Cliff's delta (for Mann-Whitney).
+    Includes 'test' column ("kruskal_wallis" or "mann_whitney_u") and group1/group2 columns.
     """
     conditions = metrics_df[condition_col].dropna().unique()
     if len(conditions) < 2:
@@ -1154,54 +1198,95 @@ def between_condition_strand_asymmetry_patterns(
         codon_col = "codon_col" if "codon_col" in df.columns else "codon"
         all_codons.update(df[codon_col].values)
 
+    cond_list = sorted(conditions)
     rows = []
+
+    # Kruskal-Wallis omnibus test (if 3+ conditions)
+    if len(cond_list) >= 3:
+        for codon in sorted(all_codons):
+            cond_vals: dict[str, list] = {c: [] for c in cond_list}
+            for sid, df in per_sample.items():
+                codon_col = "codon_col" if "codon_col" in df.columns else "codon"
+                match = df.loc[df[codon_col] == codon, "asymmetry"]
+                if not match.empty:
+                    cond_vals[sid_cond[sid]].append(match.iloc[0])
+
+            # Need ≥3 samples per condition
+            groups = [np.array(cond_vals[c]) for c in cond_list]
+            groups = [g for g in groups if len(g) >= 3]
+            if len(groups) < 3:
+                continue
+
+            try:
+                stat, p_val = sp_stats.kruskal(*groups)
+                rows.append({
+                    "codon": codon,
+                    "test": "kruskal_wallis",
+                    "group1": "omnibus",
+                    "group2": "omnibus",
+                    "statistic": round(stat, 4),
+                    "p_value": p_val,
+                })
+            except ValueError:
+                continue
+
+    # Pairwise Mann-Whitney U tests
     for codon in sorted(all_codons):
-        cond_vals: dict[str, list] = {c: [] for c in conditions}
+        cond_vals: dict[str, list] = {c: [] for c in cond_list}
         for sid, df in per_sample.items():
             codon_col = "codon_col" if "codon_col" in df.columns else "codon"
             match = df.loc[df[codon_col] == codon, "asymmetry"]
             if not match.empty:
                 cond_vals[sid_cond[sid]].append(match.iloc[0])
 
-        # Need ≥3 samples per condition
-        if any(len(v) < 3 for v in cond_vals.values()):
-            continue
+        for g1, g2 in itertools.combinations(cond_list, 2):
+            v1 = np.array(cond_vals[g1])
+            v2 = np.array(cond_vals[g2])
+            if len(v1) < 3 or len(v2) < 3:
+                continue
+            try:
+                stat, p_val = sp_stats.mannwhitneyu(v1, v2, alternative="two-sided")
+            except ValueError:
+                continue
 
-        cond_list = list(conditions)
-        v1 = np.array(cond_vals[cond_list[0]])
-        v2 = np.array(cond_vals[cond_list[1]])
-        try:
-            stat, p_val = sp_stats.mannwhitneyu(v1, v2, alternative="two-sided")
-        except ValueError:
-            continue
-
-        delta = _cliffs_delta(v1, v2)
-        rows.append({
-            "codon": codon,
-            f"mean_asymmetry_{cond_list[0]}": round(np.mean(v1), 5),
-            f"mean_asymmetry_{cond_list[1]}": round(np.mean(v2), 5),
-            "diff": round(np.mean(v1) - np.mean(v2), 5),
-            "U_statistic": round(stat, 2),
-            "p_value": p_val,
-            "cliffs_delta": round(delta, 4),
-            "effect_size": _effect_size_label(abs(delta)),
-        })
+            delta = _cliffs_delta(v1, v2)
+            mean1, mean2 = np.mean(v1), np.mean(v2)
+            rows.append({
+                "codon": codon,
+                "test": "mann_whitney_u",
+                "group1": g1,
+                "group2": g2,
+                "mean_group1": round(mean1, 5),
+                "mean_group2": round(mean2, 5),
+                "diff": round(mean1 - mean2, 5),
+                "U_statistic": round(stat, 2),
+                "p_value": p_val,
+                "cliffs_delta": round(delta, 4),
+                "effect_size": _effect_size_label(abs(delta)),
+            })
 
     if not rows:
         return pd.DataFrame()
 
     result = pd.DataFrame(rows)
-    # BH FDR correction
-    n = len(result)
-    order = np.argsort(result["p_value"].values)
-    ranks = np.empty_like(order)
-    ranks[order] = np.arange(1, n + 1)
-    fdr = np.minimum(result["p_value"].values * n / ranks, 1.0)
-    sorted_fdr = fdr[order]
-    for k in range(n - 2, -1, -1):
-        sorted_fdr[k] = min(sorted_fdr[k], sorted_fdr[k + 1])
-    fdr[order] = sorted_fdr
-    result["p_adjusted"] = np.round(fdr, 6)
+    # BH FDR correction per test type
+    for test_type in result["test"].unique():
+        mask = result["test"] == test_type
+        idx = result[mask].index
+        pvals = result.loc[mask, "p_value"].values
+        n = len(pvals)
+        if n == 0:
+            continue
+        order = np.argsort(pvals)
+        ranks = np.empty_like(order)
+        ranks[order] = np.arange(1, n + 1)
+        fdr = np.minimum(pvals * n / ranks, 1.0)
+        sorted_fdr = fdr[order]
+        for k in range(n - 2, -1, -1):
+            sorted_fdr[k] = min(sorted_fdr[k], sorted_fdr[k + 1])
+        fdr[order] = sorted_fdr
+        result.loc[idx, "p_adjusted"] = np.round(fdr, 6)
+
     result["significant"] = result["p_adjusted"] < 0.05
     return result.sort_values("p_adjusted")
 
@@ -1214,11 +1299,12 @@ def between_condition_optimal_codons(
     """Compare optimal codon identity between conditions.
 
     Pools optimal codon tables across samples within each condition,
-    computing mean delta-RSCU per codon per condition. Flags codons that
-    are optimal in one condition but not the other.
+    computing mean delta-RSCU per codon for ALL conditions. For exactly 2 conditions,
+    output is identical to before (backward compatible).
 
-    Returns a DataFrame with codon, amino_acid, mean delta-RSCU per condition,
-    and an agreement flag.
+    Returns a DataFrame with codon, amino_acid, mean delta-RSCU for each condition,
+    optimal_in_{condition} for each condition, n_conditions_optimal (count),
+    unanimous (True if all or none are optimal), and delta_difference (max - min).
     """
     conditions = metrics_df[condition_col].dropna().unique()
     if len(conditions) < 2:
@@ -1242,12 +1328,12 @@ def between_condition_optimal_codons(
                     pass
                 break
 
-    cond_list = list(conditions)
-    if not cond_deltas[cond_list[0]] or not cond_deltas[cond_list[1]]:
+    cond_list = sorted(conditions)
+    # Check all conditions have data
+    if any(not cond_deltas.get(c, []) for c in cond_list):
         return pd.DataFrame()
 
     # Average delta-RSCU per codon within each condition
-    rows = []
     combined = {}
     for cond in cond_list:
         all_df = pd.concat(cond_deltas[cond], ignore_index=True)
@@ -1255,18 +1341,25 @@ def between_condition_optimal_codons(
         agg.rename(columns={"delta_rscu": f"mean_delta_rscu_{cond}"}, inplace=True)
         combined[cond] = agg
 
-    merged = combined[cond_list[0]].merge(
-        combined[cond_list[1]], on=["amino_acid", "codon"], how="outer"
-    ).fillna(0)
+    # Merge all conditions
+    merged = combined[cond_list[0]].copy()
+    for cond in cond_list[1:]:
+        merged = merged.merge(combined[cond], on=["amino_acid", "codon"], how="outer")
+    merged = merged.fillna(0)
 
     # Determine optimal status per condition (delta > 0 = enriched in high-expr genes)
-    merged[f"optimal_in_{cond_list[0]}"] = merged[f"mean_delta_rscu_{cond_list[0]}"] > 0
-    merged[f"optimal_in_{cond_list[1]}"] = merged[f"mean_delta_rscu_{cond_list[1]}"] > 0
-    merged["agreement"] = (
-        merged[f"optimal_in_{cond_list[0]}"] == merged[f"optimal_in_{cond_list[1]}"]
-    )
+    for cond in cond_list:
+        merged[f"optimal_in_{cond}"] = merged[f"mean_delta_rscu_{cond}"] > 0
+
+    # Count how many conditions consider this codon optimal
+    optimal_cols = [f"optimal_in_{c}" for c in cond_list]
+    merged["n_conditions_optimal"] = merged[optimal_cols].sum(axis=1).astype(int)
+    merged["unanimous"] = (merged["n_conditions_optimal"] == len(cond_list)) | (merged["n_conditions_optimal"] == 0)
+
+    # Delta difference: max - min across conditions
+    delta_cols = [f"mean_delta_rscu_{c}" for c in cond_list]
     merged["delta_difference"] = (
-        merged[f"mean_delta_rscu_{cond_list[0]}"] - merged[f"mean_delta_rscu_{cond_list[1]}"]
+        merged[delta_cols].max(axis=1) - merged[delta_cols].min(axis=1)
     ).round(4)
 
     return merged.sort_values("delta_difference", key=abs, ascending=False)
@@ -1279,17 +1372,21 @@ def between_condition_hgt_burden(
 ) -> dict:
     """Compare HGT burden distributions between conditions.
 
-    Computes per-sample summary of Mahalanobis distances and tests whether
-    the distribution of distances differs between conditions.
+    Computes per-sample summary of Mahalanobis distances and HGT fractions.
+    For 3+ conditions: Kruskal-Wallis omnibus test plus all pairwise Mann-Whitney U.
+    For exactly 2 conditions: backward-compatible behavior (single Mann-Whitney per metric).
 
-    Returns a dict with per-condition summary stats and test results.
+    Returns a dict with keys like:
+    - For 2 conditions (backward compat): "mahalanobis", "hgt_fraction" with single test result
+    - For 3+ conditions: "mahalanobis_omnibus", "mahalanobis_g1_vs_g2", "hgt_fraction_omnibus", etc.
+    Each value is a dict with per-condition summary stats and test results.
     """
     conditions = metrics_df[condition_col].dropna().unique()
     if len(conditions) < 2:
         return {}
 
     sid_cond = dict(zip(metrics_df["sample_id"], metrics_df[condition_col]))
-    cond_list = list(conditions)
+    cond_list = sorted(conditions)
 
     # Collect per-sample Mahalanobis distance distributions
     cond_medians: dict[str, list[float]] = {c: [] for c in conditions}
@@ -1311,41 +1408,92 @@ def between_condition_hgt_burden(
                 break
 
     result: dict = {}
-    # Test median Mahalanobis distance between conditions
-    v1 = np.array(cond_medians.get(cond_list[0], []))
-    v2 = np.array(cond_medians.get(cond_list[1], []))
-    if len(v1) >= 3 and len(v2) >= 3:
-        stat, p_val = sp_stats.mannwhitneyu(v1, v2, alternative="two-sided")
-        delta = _cliffs_delta(v1, v2)
-        result["mahalanobis"] = {
-            "conditions": cond_list,
-            f"median_{cond_list[0]}": round(float(np.median(v1)), 4),
-            f"median_{cond_list[1]}": round(float(np.median(v2)), 4),
-            "U_statistic": round(float(stat), 2),
-            "p_value": round(p_val, 6),
-            "cliffs_delta": round(delta, 4),
-            "effect_size": _effect_size_label(abs(delta)),
-            f"values_{cond_list[0]}": v1.tolist(),
-            f"values_{cond_list[1]}": v2.tolist(),
-        }
 
-    # Test HGT fraction between conditions
-    f1 = np.array(cond_hgt_fracs.get(cond_list[0], []))
-    f2 = np.array(cond_hgt_fracs.get(cond_list[1], []))
-    if len(f1) >= 3 and len(f2) >= 3:
-        stat, p_val = sp_stats.mannwhitneyu(f1, f2, alternative="two-sided")
-        delta = _cliffs_delta(f1, f2)
-        result["hgt_fraction"] = {
-            "conditions": cond_list,
-            f"median_{cond_list[0]}": round(float(np.median(f1)), 4),
-            f"median_{cond_list[1]}": round(float(np.median(f2)), 4),
-            "U_statistic": round(float(stat), 2),
-            "p_value": round(p_val, 6),
-            "cliffs_delta": round(delta, 4),
-            "effect_size": _effect_size_label(abs(delta)),
-            f"values_{cond_list[0]}": f1.tolist(),
-            f"values_{cond_list[1]}": f2.tolist(),
-        }
+    # Kruskal-Wallis omnibus tests (if 3+ conditions)
+    if len(cond_list) >= 3:
+        # Mahalanobis omnibus
+        groups = [np.array(cond_medians.get(c, [])) for c in cond_list]
+        groups = [g for g in groups if len(g) >= 3]
+        if len(groups) >= 3:
+            try:
+                stat, p_val = sp_stats.kruskal(*groups)
+                result["mahalanobis_omnibus"] = {
+                    "test": "kruskal_wallis",
+                    "conditions": cond_list,
+                    "H_statistic": round(stat, 4),
+                    "p_value": round(p_val, 6),
+                }
+            except ValueError:
+                pass
+
+        # HGT fraction omnibus
+        groups = [np.array(cond_hgt_fracs.get(c, [])) for c in cond_list]
+        groups = [g for g in groups if len(g) >= 3]
+        if len(groups) >= 3:
+            try:
+                stat, p_val = sp_stats.kruskal(*groups)
+                result["hgt_fraction_omnibus"] = {
+                    "test": "kruskal_wallis",
+                    "conditions": cond_list,
+                    "H_statistic": round(stat, 4),
+                    "p_value": round(p_val, 6),
+                }
+            except ValueError:
+                pass
+
+    # Pairwise Mann-Whitney U tests for all pairs
+    for g1, g2 in itertools.combinations(cond_list, 2):
+        # Mahalanobis
+        v1 = np.array(cond_medians.get(g1, []))
+        v2 = np.array(cond_medians.get(g2, []))
+        if len(v1) >= 3 and len(v2) >= 3:
+            try:
+                stat, p_val = sp_stats.mannwhitneyu(v1, v2, alternative="two-sided")
+                delta = _cliffs_delta(v1, v2)
+                key = f"mahalanobis_{g1}_vs_{g2}"
+                result[key] = {
+                    "test": "mann_whitney_u",
+                    "conditions": [g1, g2],
+                    f"median_{g1}": round(float(np.median(v1)), 4),
+                    f"median_{g2}": round(float(np.median(v2)), 4),
+                    "U_statistic": round(float(stat), 2),
+                    "p_value": round(p_val, 6),
+                    "cliffs_delta": round(delta, 4),
+                    "effect_size": _effect_size_label(abs(delta)),
+                    f"values_{g1}": v1.tolist(),
+                    f"values_{g2}": v2.tolist(),
+                }
+                # For backward compatibility with 2 conditions: also set "mahalanobis" key
+                if len(cond_list) == 2:
+                    result["mahalanobis"] = result[key]
+            except ValueError:
+                pass
+
+        # HGT fraction
+        f1 = np.array(cond_hgt_fracs.get(g1, []))
+        f2 = np.array(cond_hgt_fracs.get(g2, []))
+        if len(f1) >= 3 and len(f2) >= 3:
+            try:
+                stat, p_val = sp_stats.mannwhitneyu(f1, f2, alternative="two-sided")
+                delta = _cliffs_delta(f1, f2)
+                key = f"hgt_fraction_{g1}_vs_{g2}"
+                result[key] = {
+                    "test": "mann_whitney_u",
+                    "conditions": [g1, g2],
+                    f"median_{g1}": round(float(np.median(f1)), 4),
+                    f"median_{g2}": round(float(np.median(f2)), 4),
+                    "U_statistic": round(float(stat), 2),
+                    "p_value": round(p_val, 6),
+                    "cliffs_delta": round(delta, 4),
+                    "effect_size": _effect_size_label(abs(delta)),
+                    f"values_{g1}": f1.tolist(),
+                    f"values_{g2}": f2.tolist(),
+                }
+                # For backward compatibility with 2 conditions: also set "hgt_fraction" key
+                if len(cond_list) == 2:
+                    result["hgt_fraction"] = result[key]
+            except ValueError:
+                pass
 
     return result
 
