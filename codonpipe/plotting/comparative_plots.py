@@ -1680,10 +1680,6 @@ def plot_expression_class_rscu_volcano(
     # Check for new format (group1/group2 columns for pairwise results)
     if "group1" in df.columns and "group2" in df.columns:
         # Multi-pair format: group by pair
-        pairs = df.groupby(["group1", "group2"]).size().reset_index(drop=True)[["group1", "group2"]].drop_duplicates()
-        n_pairs = len(pairs.groupby(["group1", "group2"]).ngroups)
-
-        # Handle the unique pairs
         pair_list = []
         for (g1, g2), group_data in df.groupby(["group1", "group2"], sort=False):
             pair_list.append((g1, g2, group_data))
@@ -1810,7 +1806,7 @@ def plot_expression_class_rscu_heatmap(
         for df, gene_set_label in zip(dfs, labels):
             codon_col = "codon_col" if "codon_col" in df.columns else "codon"
             # Get unique pairs from this dataframe
-            pairs = df.groupby(["group1", "group2"]).size().reset_index(drop=True)[["group1", "group2"]].drop_duplicates()
+            pairs = df[["group1", "group2"]].drop_duplicates()
             for _, row in pairs.iterrows():
                 g1, g2 = row["group1"], row["group2"]
                 pair_data = df[(df["group1"] == g1) & (df["group2"] == g2)]
