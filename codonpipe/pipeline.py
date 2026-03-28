@@ -202,6 +202,8 @@ def run_single_genome(
     freq_df = compute_codon_frequency_table(ffn_path)
     rscu_all = compute_rscu_genome_summary(ffn_path)
     rscu_rp = compute_concatenated_rscu(rp_ffn, min_length=0) if rp_ffn and rp_ffn.exists() else None
+    if rscu_rp is None:
+        logger.info("SKIPPED: ribosomal RSCU computation (no ribosomal protein sequences)")
     rscu_gene_df = compute_rscu_per_gene(ffn_path)
     enc_df = compute_enc(ffn_path)
 
@@ -211,6 +213,8 @@ def run_single_genome(
         ann_path = output_dir / "rscu" / f"{sample_id}_rscu_annotated.tsv"
         annotated.to_csv(ann_path, sep="\t", index=False)
         all_outputs["rscu_annotated"] = ann_path
+    else:
+        logger.info("SKIPPED: RSCU KofamScan annotation (no KofamScan data)")
 
     # ── Step 5: CU bias statistics (ENCprime, MILC) ────────────────────
     encprime_df = None
@@ -317,6 +321,9 @@ def run_single_genome(
     except Exception as e:
         logger.warning("Advanced analyses failed: %s. Continuing.", e)
 
+    if not advanced_results:
+        logger.info("SKIPPED: advanced analyses produced no results")
+
     # ── Step 9: Biological/ecological analyses ──────────────────────────
     logger.info("[Step 9/11] Running biological and ecological analyses")
     bio_ecology_results = {}
@@ -333,15 +340,33 @@ def run_single_genome(
             kofam_df=kofam_df,
             gff_path=resolved_gff,
         )
+        # Normalize keys and flatten nested dicts for plotting compatibility
+        _bio_key_map = {
+            "hgt_candidates": "hgt",
+            "growth_rate_prediction": "growth_rate",
+            "phage_mobile_elements": "phage_mobile",
+        }
         for key, val in bio_outputs.items():
             if isinstance(val, Path):
                 all_outputs[f"bio_{key}"] = val
+            elif key == "translational_selection" and isinstance(val, dict):
+                # Flatten nested translational_selection outputs
+                for sub_key, sub_val in val.items():
+                    if isinstance(sub_val, pd.DataFrame):
+                        bio_ecology_results[sub_key] = sub_val
+                    elif isinstance(sub_val, Path):
+                        all_outputs[f"bio_trans_sel_{sub_key}"] = sub_val
             elif isinstance(val, pd.DataFrame):
-                bio_ecology_results[key] = val
+                norm_key = _bio_key_map.get(key, key)
+                bio_ecology_results[norm_key] = val
             elif isinstance(val, dict):
-                bio_ecology_results[key] = val
+                norm_key = _bio_key_map.get(key, key)
+                bio_ecology_results[norm_key] = val
     except Exception as e:
         logger.warning("Biological/ecological analyses failed: %s. Continuing.", e)
+
+    if not bio_ecology_results:
+        logger.info("SKIPPED: bio/ecology analyses produced no results")
 
     # ── Step 10: Codon usage tables ──────────────────────────────────────
     logger.info("[Step 10/11] Generating codon usage tables in all standard formats")
