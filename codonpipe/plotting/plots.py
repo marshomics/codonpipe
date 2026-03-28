@@ -308,6 +308,9 @@ def plot_rscu_heatmap_single(rscu_df: pd.DataFrame, output_path: Path, sample_id
         return
 
     data = rscu_df[rscu_cols].values
+    # NaN in RSCU means unobserved amino-acid family — treat as zero usage
+    # for distance computation so hierarchical clustering doesn't crash.
+    data = np.nan_to_num(data, nan=0.0)
     # Cap at 500 genes for readability (deterministic for reproducibility)
     if len(data) > 500:
         rng = np.random.RandomState(42)
@@ -348,7 +351,8 @@ def plot_pca(
 ):
     """PCA scatter plot of genome-level RSCU values, optionally colored by metadata."""
     _apply_style()
-    data = df[rscu_cols].dropna()
+    # fillna(0.0): NaN RSCU = unobserved family → zero for dimensionality reduction
+    data = df[rscu_cols].fillna(0.0)
     if len(data) < 3:
         logger.warning("Too few samples (%d) for PCA", len(data))
         return
@@ -399,7 +403,8 @@ def plot_umap(
         return
 
     _apply_style()
-    data = df[rscu_cols].dropna()
+    # fillna(0.0): NaN RSCU = unobserved family → zero for dimensionality reduction
+    data = df[rscu_cols].fillna(0.0)
     if len(data) < 10:
         logger.warning("Too few samples (%d) for UMAP", len(data))
         return
@@ -502,7 +507,8 @@ def plot_heatmap_clustered(
 ):
     """Hierarchical clustering heatmap of genome-level RSCU values."""
     _apply_style()
-    data = df[rscu_cols].dropna()
+    # fillna(0.0): NaN RSCU = unobserved family → zero usage for clustering
+    data = df[rscu_cols].fillna(0.0)
     if len(data) < 3:
         return
 
