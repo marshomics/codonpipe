@@ -62,13 +62,15 @@ def compute_coa_on_rscu(
     X = rscu_gene_df[rscu_cols].values.copy()
     genes = rscu_gene_df["gene"].values
 
-    # Replace zeros/NaN with small positive value for COA
-    X = np.where(np.isnan(X) | (X == 0), 1e-6, X)
+    # Replace NaN with 0 (genuine absence); zeros are meaningful RSCU values
+    X = np.where(np.isnan(X), 0.0, X)
+    # For chi-squared standardization, add small constant to avoid zero row/column sums
+    epsilon = 1e-8
 
     # Correspondence analysis via SVD on standardized residuals
-    row_sums = X.sum(axis=1, keepdims=True)
-    col_sums = X.sum(axis=0, keepdims=True)
-    grand_total = X.sum()
+    row_sums = X.sum(axis=1, keepdims=True) + epsilon
+    col_sums = X.sum(axis=0, keepdims=True) + epsilon
+    grand_total = X.sum() + epsilon
 
     # Expected frequencies
     E = (row_sums @ col_sums) / grand_total
@@ -86,13 +88,15 @@ def compute_coa_on_rscu(
         return {}
 
     U, sigma, Vt = np.linalg.svd(S, full_matrices=False)
+    # Save all singular values before truncation
+    all_sigma = sigma.copy()
     # Keep top axes
     U = U[:, :n_axes]
     sigma = sigma[:n_axes]
     V = Vt[:n_axes, :].T
 
     eigenvalues = sigma ** 2
-    total_inertia = np.sum(np.linalg.svd(S, compute_uv=False) ** 2)
+    total_inertia = np.sum(all_sigma ** 2)
     pct_inertia = eigenvalues / total_inertia * 100 if total_inertia > 0 else np.zeros(n_axes)
 
     # Row (gene) coordinates: scale by sqrt(row_masses)
@@ -665,7 +669,7 @@ def compute_cog_enrichment(
             if a + c == 0:
                 continue
 
-            odds_ratio, pval = stats.fisher_exact([[a, b], [c, d]], alternative="greater")
+            odds_ratio, pval = stats.fisher_exact([[a, b], [c, d]], alternative="two-sided")
 
             rows.append({
                 "COG_category": cat,
