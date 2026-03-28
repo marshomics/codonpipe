@@ -5,7 +5,6 @@ channels:
 dependencies:
   # Python
   - python>=3.9
-  - pip
 
   # Bioinformatics tools
   - prokka>=1.14
@@ -25,16 +24,12 @@ dependencies:
   - tqdm>=4.65
   - click>=8.1
 
-  # R and coRdon
+  # R and Bioconductor packages
   - r-base>=4.2
   - bioconductor-cordon>=1.16
   - bioconductor-biostrings>=2.66
   - bioconductor-iranges>=2.32
-  - r-data.table>=1.14
 
   # Development (optional)
   - pytest>=7.0
   - ruff>=0.1
-
-  - pip:
-    - codonpipe
