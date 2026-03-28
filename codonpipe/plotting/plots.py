@@ -403,8 +403,10 @@ def plot_umap(
 
     scaler = StandardScaler()
     scaled = scaler.fit_transform(data)
-    reducer = umap.UMAP(n_neighbors=n_neighbors, n_components=2, random_state=42)
-    coords = reducer.fit_transform(scaled)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="n_jobs value")
+        reducer = umap.UMAP(n_neighbors=n_neighbors, n_components=2, random_state=42)
+        coords = reducer.fit_transform(scaled)
 
     fig, ax = plt.subplots(figsize=(8, 7))
     if color_col and color_col in df.columns:
@@ -514,7 +516,7 @@ def plot_heatmap_clustered(
             cmap="RdYlGn_r",
             center=1.0,
             method="complete",
-            metric="manhattan",
+            metric="cityblock",
             row_cluster=True,
             col_cluster=True,
             xticklabels=col_labels,
