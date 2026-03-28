@@ -26,6 +26,7 @@ from Bio import SeqIO
 
 from codonpipe.utils.codon_tables import (
     AA_CODON_GROUPS,
+    AA_CODON_GROUPS_RSCU,
     CODON_TABLE_11,
     SENSE_CODONS,
     dna_to_rna,
@@ -231,22 +232,23 @@ def compute_relative_adaptiveness(
 
     rscu_vals = compute_rscu_from_counts(total_counts)
 
-    # Compute maximum RSCU per amino acid
-    max_rscu_per_aa = {}
-    for aa, codons in AA_CODON_GROUPS.items():
+    # Compute maximum RSCU per synonymous family (using split families)
+    max_rscu_per_family = {}
+    for family_name, codons in AA_CODON_GROUPS_RSCU.items():
         rscu_list = []
         for codon in codons:
-            col_name = _codon_to_col_name(codon, aa)
+            col_name = f"{family_name}-{codon}"
             rscu_val = rscu_vals.get(col_name, 0.0)
             rscu_list.append(rscu_val)
-        max_rscu_per_aa[aa] = max(rscu_list) if rscu_list else 1.0
+        max_rscu_per_family[family_name] = max(rscu_list) if rscu_list else 1.0
 
     rows = []
     for codon in sorted(SENSE_CODONS.keys()):
         aa = CODON_TABLE_11[codon]
         col_name = _codon_to_col_name(codon, aa)
+        family_name = col_name.split("-")[0]
         rscu_val = rscu_vals.get(col_name, 0.0)
-        max_rscu = max_rscu_per_aa[aa]
+        max_rscu = max_rscu_per_family.get(family_name, 1.0)
         w_value = rscu_val / max_rscu if max_rscu > 0 else 0.0
 
         rows.append({
@@ -334,67 +336,64 @@ def compute_cbi(
     """Compute Codon Bias Index (CBI) per gene.
 
     CBI = (N_opt - N_rand) / (N_total - N_rand)
-    where:
-        N_opt = count of optimal codons
-        N_rand = expected count under equal usage
-        N_total = total synonymous codons
+    where for each amino acid family:
+        N_opt  = count of the optimal codon
+        N_rand = n_aa / k  (expected optimal count under equal usage)
+        N_total = total synonymous codons for that family
+    Sums are taken over all amino acid families with an optimal codon.
 
     Reference: Bennetzen & Hall (1982)
 
     Args:
         ffn_path: Path to nucleotide CDS FASTA file.
-        optimal_codons: Dict mapping amino acid -> optimal codon (from compute_codon_adaptation_weights).
+        optimal_codons: Dict mapping amino acid -> optimal codon (RNA triplet).
         gene_ids: Optional set of gene IDs to include.
         min_length: Minimum sequence length in nucleotides to include.
 
     Returns:
-        DataFrame with columns: gene, cbi, n_optimal, n_total, length
+        DataFrame with columns: gene, cbi, n_optimal, n_total, n_random, length
     """
     rows = []
 
     for rec in SeqIO.parse(str(ffn_path), "fasta"):
         seq = str(rec.seq)
 
-        # Filter by gene IDs if specified
         if gene_ids is not None and rec.id not in gene_ids:
             continue
-
-        # Filter by minimum length
         if len(seq) < min_length:
             continue
 
         gene_counts = count_codons(seq)
 
-        # Count optimal codons and compute CBI per amino acid
         n_opt_total = 0
+        n_rand_total = 0.0
         n_total = 0
-        n_aa_total = 0
 
         for aa, codons in AA_CODON_GROUPS.items():
+            k = len(codons)
+            if k < 2:
+                continue  # Skip Met/Trp — no synonymous choice
             n_aa = sum(gene_counts.get(c, 0) for c in codons)
             if n_aa == 0:
                 continue
 
-            n_aa_total += 1
             optimal_codon = optimal_codons.get(aa)
+            if optimal_codon is None:
+                continue
 
-            # Count optimal codons
-            n_opt = gene_counts.get(optimal_codon, 0) if optimal_codon else 0
+            n_opt = gene_counts.get(optimal_codon, 0)
+            n_expected = n_aa / k  # Expected optimal count under equal usage
 
-            # Expected count under equal usage
-            n_expected = n_aa / len(codons)
+            n_opt_total += n_opt
+            n_rand_total += n_expected
+            n_total += n_aa
 
-            # Per-amino-acid contribution
-            if n_aa > n_expected:
-                n_opt_total += n_opt
-                n_total += n_aa
-
-        # Compute CBI
-        if n_total > 0:
-            n_expected_total = n_total / 20  # Average if equal usage
-            cbi = (n_opt_total - n_expected_total) / (n_total - n_expected_total) if (
-                n_total - n_expected_total
-            ) != 0 else 0.0
+        # CBI = (N_opt - N_rand) / (N_total - N_rand)
+        denom = n_total - n_rand_total
+        if denom > 0:
+            cbi = (n_opt_total - n_rand_total) / denom
+        elif n_total > 0:
+            cbi = 0.0  # All expected == total → no information
         else:
             cbi = np.nan
 
@@ -403,11 +402,12 @@ def compute_cbi(
             "cbi": round(cbi, 4) if not np.isnan(cbi) else np.nan,
             "n_optimal": n_opt_total,
             "n_total": n_total,
+            "n_random": round(n_rand_total, 2),
             "length": len(seq),
         })
 
     return pd.DataFrame(rows) if rows else pd.DataFrame(
-        columns=["gene", "cbi", "n_optimal", "n_total", "length"]
+        columns=["gene", "cbi", "n_optimal", "n_total", "n_random", "length"]
     )
 
 
