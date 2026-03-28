@@ -212,11 +212,9 @@ def hypergeometric_enrichment(
     if not pathways_to_test:
         return pd.DataFrame()
 
-    # Background size: all annotated genes (with any pathway hit)
-    annotated_bg = {ko for ko in background_kos if ko_pathway_map.get(ko)}
-    annotated_test = {ko for ko in test_kos if ko_pathway_map.get(ko)}
-    M = len(annotated_bg)
-    N = len(annotated_test)
+    # Population sizes: use all genes, not just those with pathway annotations
+    M = len(background_kos)
+    N = len(test_kos)
 
     if M == 0 or N == 0:
         return pd.DataFrame()
@@ -224,6 +222,8 @@ def hypergeometric_enrichment(
     rows = []
     for pw in pathways_to_test:
         n = len(bg_pathway_kos[pw])  # pathway size in background
+        if n < 3:
+            continue  # Skip pathways with fewer than 3 genes to avoid spurious enrichment
         k = len(test_pathway_kos[pw])  # hits in test set
 
         # Hypergeometric survival function: P(X >= k)
