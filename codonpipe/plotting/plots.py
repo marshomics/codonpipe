@@ -1236,6 +1236,802 @@ def plot_gene_length_vs_bias(
     _save_fig(fig, output_path)
 
 
+# ─── KO Enrichment Plots ─────────────────────────────────────────────────────
+
+
+def plot_enrichment_dotplot(
+    enrichment_df: pd.DataFrame,
+    output_path: Path,
+    title: str = "KO Enrichment Dotplot",
+    max_pathways: int = 20,
+    sample_id: str = "",
+):
+    """Dotplot of KO enrichment results.
+
+    Classic enrichment dot plot with x = gene ratio (k/K), y = pathway name.
+    Dot size = gene count (k), color = -log10(fdr).
+
+    Args:
+        enrichment_df: DataFrame from enrichment analysis with columns:
+            pathway, pathway_name, k (overlap count), K (pathway size),
+            fdr, significant.
+        output_path: Base path for saving.
+        title: Plot title.
+        max_pathways: Maximum number of pathways to show.
+        sample_id: Sample identifier for title.
+    """
+    _apply_style()
+    if enrichment_df.empty or "fdr" not in enrichment_df.columns:
+        return
+
+    # Filter to significant or top results
+    sig = enrichment_df[enrichment_df.get("significant", False) == True].copy()
+    if sig.empty:
+        sig = enrichment_df.nlargest(max_pathways, "fdr").copy()
+    else:
+        sig = sig.nlargest(max_pathways, "fdr")
+
+    if sig.empty:
+        logger.warning("No pathways to plot in enrichment dotplot")
+        return
+
+    # Calculate gene ratio (k/K)
+    sig["gene_ratio"] = sig["k"] / sig["K"]
+    sig["neg_log_fdr"] = -np.log10(sig["fdr"].clip(lower=1e-300))
+
+    # Sort by gene ratio for better visualization
+    sig = sig.sort_values("gene_ratio", ascending=True)
+
+    fig, ax = plt.subplots(figsize=(8, max(5, len(sig) * 0.35)))
+
+    # Scatter plot: x = gene_ratio, y = pathway, size = k, color = -log10(fdr)
+    scatter = ax.scatter(
+        sig["gene_ratio"],
+        range(len(sig)),
+        s=sig["k"] * 20,  # Scale size by gene count
+        c=sig["neg_log_fdr"],
+        cmap="viridis",
+        alpha=0.7,
+        edgecolors="black",
+        linewidth=0.5,
+    )
+
+    # Labels and formatting
+    ax.set_yticks(range(len(sig)))
+    pathway_labels = sig.apply(
+        lambda r: r.get("pathway_name", r.get("pathway", ""))[:40],
+        axis=1,
+    ).values
+    ax.set_yticklabels(pathway_labels, fontsize=8)
+    ax.set_xlabel("Gene Ratio (k/K)", fontsize=11)
+    ax.set_ylabel("Pathway", fontsize=11)
+
+    title_str = title
+    if sample_id:
+        title_str += f" — {sample_id}"
+    ax.set_title(title_str, fontsize=12)
+
+    # Colorbar for -log10(FDR)
+    cbar = plt.colorbar(scatter, ax=ax)
+    cbar.set_label("-log10(FDR)", fontsize=10)
+
+    # Size legend
+    for size_val in [5, 10, 20]:
+        ax.scatter([], [], s=size_val * 20, c="gray", alpha=0.6, edgecolors="black", linewidth=0.5)
+    ax.legend(
+        [plt.scatter([], [], s=s * 20, c="gray", alpha=0.6, edgecolors="black", linewidth=0.5) for s in [5, 10, 20]],
+        ["5 genes", "10 genes", "20 genes"],
+        scatterpoints=1,
+        loc="lower right",
+        fontsize=8,
+        framealpha=0.9,
+    )
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_enrichment_heatmap(
+    enrichment_results: dict[str, pd.DataFrame],
+    output_path: Path,
+    sample_id: str = "",
+    max_pathways: int = 15,
+):
+    """Heatmap of KO enrichment across multiple comparisons.
+
+    Rows = top pathways (union of significant across all comparisons),
+    columns = metric_tier (e.g., "CAI_high", "MELP_low").
+    Cell value = -log10(fdr), with significance markers.
+
+    Args:
+        enrichment_results: Dict keyed like "enrichment_CAI_high" mapping
+            to enrichment DataFrames.
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+        max_pathways: Maximum number of pathways to include.
+    """
+    _apply_style()
+    if not enrichment_results:
+        return
+
+    # Extract metric_tier from keys and prepare data
+    comparisons = []
+    all_pathways = set()
+
+    for key, edf in enrichment_results.items():
+        if edf.empty:
+            continue
+        # Extract metric_tier from key like "enrichment_CAI_high"
+        metric_tier = key.replace("enrichment_", "")
+        comparisons.append((metric_tier, edf))
+
+        # Collect significant pathways
+        sig = edf[edf.get("significant", False) == True]
+        all_pathways.update(sig.get("pathway", []))
+
+    if not comparisons or not all_pathways:
+        logger.warning("No significant pathways for enrichment heatmap")
+        return
+
+    # Limit to top pathways
+    top_n = min(len(all_pathways), max_pathways)
+    all_pathways = list(all_pathways)[:top_n]
+
+    # Build matrix: rows = pathways, columns = comparisons
+    matrix = []
+    pathway_names = []
+
+    for pathway in all_pathways:
+        row = []
+        for metric_tier, edf in comparisons:
+            match = edf[edf.get("pathway", None) == pathway]
+            if not match.empty:
+                fdr = match.iloc[0].get("fdr", 1.0)
+                neg_log_fdr = -np.log10(max(fdr, 1e-300))
+                row.append(neg_log_fdr)
+            else:
+                row.append(np.nan)  # White for untested
+        matrix.append(row)
+        pathway_name = pathway[:30] if isinstance(pathway, str) else str(pathway)
+        pathway_names.append(pathway_name)
+
+    if not matrix:
+        logger.warning("No data for enrichment heatmap")
+        return
+
+    df_heatmap = pd.DataFrame(
+        matrix,
+        index=pathway_names,
+        columns=[m for m, _ in comparisons],
+    )
+
+    fig, ax = plt.subplots(figsize=(6 + len(comparisons) * 0.5, max(6, len(pathway_names) * 0.3)))
+
+    # Plot heatmap with annotations
+    sns.heatmap(
+        df_heatmap,
+        annot=True,
+        fmt=".1f",
+        cmap="RdYlBu_r",
+        cbar_kws={"label": "-log10(FDR)"},
+        linewidths=0.5,
+        linecolor="gray",
+        ax=ax,
+        vmin=0,
+        vmax=df_heatmap.max().max() if not df_heatmap.empty else 1,
+    )
+
+    title_str = "KO Enrichment Heatmap"
+    if sample_id:
+        title_str += f" — {sample_id}"
+    ax.set_title(title_str, fontsize=12)
+    ax.set_xlabel("Comparison", fontsize=11)
+    ax.set_ylabel("Pathway", fontsize=11)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_enrichment_summary_bar(
+    enrichment_results: dict[str, pd.DataFrame],
+    output_path: Path,
+    sample_id: str = "",
+    max_pathways: int = 20,
+):
+    """Grouped horizontal bar chart of top KO enrichment pathways.
+
+    Shows top enriched pathways across all comparisons, with bars grouped
+    by metric_tier and colored by metric.
+
+    Args:
+        enrichment_results: Dict keyed like "enrichment_CAI_high".
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+        max_pathways: Maximum pathways per comparison.
+    """
+    _apply_style()
+    if not enrichment_results:
+        return
+
+    # Collect top pathways from each comparison
+    data = []
+    colors_map = {}
+
+    metric_colors = sns.color_palette("husl", len(enrichment_results))
+
+    for (key, edf), color in zip(enrichment_results.items(), metric_colors):
+        if edf.empty:
+            continue
+
+        metric_tier = key.replace("enrichment_", "")
+        metric = metric_tier.split("_")[0]
+
+        # Get top pathways by significance
+        sig = edf[edf.get("significant", False) == True]
+        if sig.empty:
+            sig = edf.nlargest(max_pathways, "fdr")
+        else:
+            sig = sig.head(max_pathways)
+
+        for _, row in sig.iterrows():
+            pathway = row.get("pathway", "")
+            pathway_name = row.get("pathway_name", pathway)[:35]
+            fdr = row.get("fdr", 1.0)
+            neg_log_fdr = -np.log10(max(fdr, 1e-300))
+
+            data.append({
+                "pathway": pathway_name,
+                "metric_tier": metric_tier,
+                "neg_log_fdr": neg_log_fdr,
+                "color": color,
+            })
+            colors_map[metric_tier] = color
+
+    if not data:
+        logger.warning("No pathways for enrichment summary bar")
+        return
+
+    df_plot = pd.DataFrame(data)
+    unique_pathways = df_plot["pathway"].unique()
+
+    # Create grouped bar plot
+    fig, ax = plt.subplots(figsize=(10, max(6, len(unique_pathways) * 0.35)))
+
+    y_pos = np.arange(len(unique_pathways))
+    bar_height = 0.15
+    tiers = df_plot["metric_tier"].unique()
+
+    for i, tier in enumerate(sorted(tiers)):
+        tier_data = df_plot[df_plot["metric_tier"] == tier]
+        tier_dict = dict(zip(tier_data["pathway"], tier_data["neg_log_fdr"]))
+
+        values = [tier_dict.get(p, 0) for p in unique_pathways]
+        color = colors_map.get(tier, "gray")
+
+        ax.barh(
+            y_pos + i * bar_height,
+            values,
+            bar_height,
+            label=tier,
+            color=color,
+            alpha=0.8,
+            edgecolor="black",
+            linewidth=0.5,
+        )
+
+    # FDR threshold line
+    fdr_line = -np.log10(0.05)
+    ax.axvline(fdr_line, color="red", linestyle="--", linewidth=1, alpha=0.7, label="FDR = 0.05")
+
+    ax.set_yticks(y_pos + bar_height * (len(tiers) - 1) / 2)
+    ax.set_yticklabels(unique_pathways, fontsize=8)
+    ax.set_xlabel("-log10(FDR)", fontsize=11)
+    ax.set_ylabel("Pathway", fontsize=11)
+
+    title_str = "KO Enrichment Summary"
+    if sample_id:
+        title_str += f" — {sample_id}"
+    ax.set_title(title_str, fontsize=12)
+
+    ax.legend(fontsize=8, loc="lower right")
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+# ─── Bio/Ecology Plots ──────────────────────────────────────────────────────
+
+
+def plot_hgt_scatter(
+    hgt_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+):
+    """Scatter plot of HGT candidate detection.
+
+    x = GC3 deviation from genome mean, y = Mahalanobis distance.
+    Color by hgt_flag (True=red, False=gray).
+    Markers by expression class if available.
+
+    Args:
+        hgt_df: DataFrame with gc3, mahal_dist, hgt_flag, optional expression_class.
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+    """
+    _apply_style()
+    if hgt_df.empty or "mahal_dist" not in hgt_df.columns:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    # Marker mapping
+    marker_map = {"high": "^", "medium": "o", "low": "v"}
+    size_map = {"high": 50, "medium": 30, "low": 50}
+
+    has_expr = "expression_class" in hgt_df.columns
+
+    # Plot non-HGT candidates
+    non_hgt = hgt_df[hgt_df.get("hgt_flag", False) == False]
+    if not non_hgt.empty:
+        ax.scatter(
+            non_hgt.get("gc3_deviation", 0),
+            non_hgt["mahal_dist"],
+            s=30,
+            c="lightgray",
+            alpha=0.5,
+            marker="o",
+            label="Non-HGT",
+            edgecolors="none",
+        )
+
+    # Plot HGT candidates
+    hgt = hgt_df[hgt_df.get("hgt_flag", False) == True]
+    if not hgt.empty:
+        if has_expr:
+            for expr_class in ["high", "medium", "low"]:
+                subset = hgt[hgt.get("expression_class", "") == expr_class]
+                if not subset.empty:
+                    ax.scatter(
+                        subset.get("gc3_deviation", 0),
+                        subset["mahal_dist"],
+                        s=size_map.get(expr_class, 30),
+                        c="red",
+                        alpha=0.7,
+                        marker=marker_map.get(expr_class, "o"),
+                        label=f"HGT ({expr_class})",
+                        edgecolors="darkred",
+                        linewidth=0.5,
+                    )
+        else:
+            ax.scatter(
+                hgt.get("gc3_deviation", 0),
+                hgt["mahal_dist"],
+                s=50,
+                c="red",
+                alpha=0.7,
+                marker="o",
+                label="HGT candidates",
+                edgecolors="darkred",
+                linewidth=0.5,
+            )
+
+    # Mahalanobis distance threshold (chi2 p=0.001)
+    # For 1 DOF: chi2(0.001) ≈ 10.83
+    threshold = np.sqrt(10.83)
+    ax.axhline(threshold, color="blue", linestyle="--", linewidth=1.5, alpha=0.7, label=f"Mahal threshold (p=0.001)")
+
+    ax.set_xlabel("GC3 Deviation from Genome Mean", fontsize=11)
+    ax.set_ylabel("Mahalanobis Distance", fontsize=11)
+
+    title_str = "HGT Candidate Detection"
+    if sample_id:
+        title_str += f" — {sample_id}"
+    ax.set_title(title_str, fontsize=12)
+
+    ax.legend(fontsize=9, loc="best")
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_fop_gradient(
+    fop_gradient_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+):
+    """Bar chart of mean Fop across expression quintiles.
+
+    Shows expected increase in Fop with expression level if translational
+    selection is operating.
+
+    Args:
+        fop_gradient_df: DataFrame with expr_quintile, mean_fop, std_fop.
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+    """
+    _apply_style()
+    if fop_gradient_df.empty or "mean_fop" not in fop_gradient_df.columns:
+        return
+
+    df = fop_gradient_df.sort_values("expr_quintile").copy()
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    # Color gradient: blue (low) to red (high)
+    colors = plt.cm.coolwarm(np.linspace(0, 1, len(df)))
+
+    x_pos = df.get("expr_quintile", range(len(df)))
+    y = df["mean_fop"]
+    yerr = df.get("std_fop", None)
+
+    bars = ax.bar(
+        x_pos,
+        y,
+        color=colors,
+        alpha=0.7,
+        edgecolor="black",
+        linewidth=1,
+        yerr=yerr,
+        capsize=5,
+        error_kw={"elinewidth": 1, "ecolor": "black"},
+    )
+
+    # Add trend line
+    z = np.polyfit(x_pos, y, 1)
+    p = np.poly1d(z)
+    x_line = np.linspace(x_pos.min(), x_pos.max(), 100)
+    ax.plot(x_line, p(x_line), "k--", linewidth=2, alpha=0.7, label="Trend")
+
+    # Spearman correlation
+    if len(df) > 2:
+        r_sp, p_val = stats.spearmanr(x_pos, y)
+        ax.text(
+            0.05, 0.95, f"Spearman r = {r_sp:.3f}\np = {p_val:.3e}",
+            transform=ax.transAxes,
+            fontsize=9,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
+
+    ax.set_xlabel("Expression Quintile", fontsize=11)
+    ax.set_ylabel("Mean Fop", fontsize=11)
+    ax.set_xticks(x_pos)
+
+    title_str = "Fop Gradient Across Expression Levels"
+    if sample_id:
+        title_str += f" — {sample_id}"
+    ax.set_title(title_str, fontsize=12)
+
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3, axis="y")
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_position_effects(
+    position_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+):
+    """Three-panel boxplot of Fop at 5', middle, 3' gene regions.
+
+    Args:
+        position_df: DataFrame with position (5prime/middle/3prime), fop,
+            optional expression_class.
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+    """
+    _apply_style()
+    if position_df.empty or "fop" not in position_df.columns:
+        return
+
+    has_expr = "expression_class" in position_df.columns
+
+    if has_expr:
+        expr_classes = sorted(position_df["expression_class"].unique())
+        n_panels = len(expr_classes)
+        fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 6))
+        if n_panels == 1:
+            axes = [axes]
+    else:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        axes = [ax]
+
+    positions = ["5prime", "middle", "3prime"]
+    position_labels = ["5'", "Middle", "3'"]
+
+    for panel_idx, axis in enumerate(axes):
+        if has_expr:
+            expr_class = expr_classes[panel_idx]
+            data = position_df[position_df["expression_class"] == expr_class]
+            axis.set_title(f"{expr_class.capitalize()} expression", fontsize=11)
+        else:
+            data = position_df
+            axis.set_title("Gene position effects on Fop", fontsize=11)
+
+        # Create boxplot data
+        bp_data = [data[data.get("position", "") == pos]["fop"].dropna() for pos in positions]
+
+        bp = axis.boxplot(
+            bp_data,
+            labels=position_labels,
+            patch_artist=True,
+            widths=0.6,
+        )
+
+        # Color boxes
+        for patch, color in zip(bp["boxes"], ["lightblue", "lightgreen", "lightcoral"]):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+
+        # Wilcoxon signed-rank test: 5' vs others
+        for pos2, label2 in zip(["middle", "3prime"], ["5' vs Middle", "5' vs 3'"]):
+            data5 = data[data.get("position", "") == "5prime"]["fop"].dropna()
+            data2 = data[data.get("position", "") == pos2]["fop"].dropna()
+
+            if len(data5) > 0 and len(data2) > 0:
+                try:
+                    stat, pval = stats.wilcoxon(data5, data2)
+                    sig_str = f"p={pval:.3e}"
+                    axis.text(0.5, 0.95 - (0.1 if label2 == "5' vs 3'" else 0.05), sig_str,
+                             transform=axis.transAxes, fontsize=8, ha="center",
+                             bbox=dict(boxstyle="round", facecolor="yellow", alpha=0.3))
+                except:
+                    pass
+
+        axis.set_ylabel("Fop", fontsize=10)
+        axis.grid(True, alpha=0.3, axis="y")
+
+    if has_expr:
+        fig.suptitle(f"Position Effects on Fop — {sample_id}" if sample_id else "Position Effects on Fop",
+                    fontsize=12)
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_strand_asymmetry(
+    strand_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+):
+    """Bar chart of RSCU asymmetry between + and - strands.
+
+    Groups codons by amino acid and shows mean RSCU on + strand vs - strand.
+    Highlights codons with significant asymmetry (p < 0.05 after BH correction).
+
+    Args:
+        strand_df: DataFrame with codon, amino_acid, rscu_plus, rscu_minus, p_value.
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+    """
+    _apply_style()
+    if strand_df.empty or "rscu_plus" not in strand_df.columns:
+        return
+
+    # BH correction for multiple testing
+    from scipy.stats import rankdata
+
+    if "p_value" in strand_df.columns:
+        n_tests = len(strand_df)
+        ranks = rankdata(strand_df["p_value"])
+        strand_df = strand_df.copy()
+        strand_df["bh_threshold"] = (ranks / n_tests) * 0.05
+        strand_df["significant"] = strand_df["p_value"] <= strand_df["bh_threshold"]
+    else:
+        strand_df = strand_df.copy()
+        strand_df["significant"] = False
+
+    # Group by amino acid
+    aa_groups = strand_df.groupby("amino_acid", observed=True)
+
+    n_aa = len(aa_groups)
+    fig, axes = plt.subplots((n_aa + 1) // 2, 2 if n_aa > 1 else 1, figsize=(12, max(6, n_aa * 1.5)))
+
+    if n_aa == 1:
+        axes = [[axes]]
+    elif n_aa == 2:
+        axes = [[axes[0], axes[1]]]
+    else:
+        axes = axes.reshape(-1, 2)
+
+    axes = axes.flatten()
+
+    for panel_idx, (aa, aa_data) in enumerate(aa_groups):
+        ax = axes[panel_idx]
+
+        aa_data = aa_data.sort_values("codon")
+        x_pos = np.arange(len(aa_data))
+        width = 0.35
+
+        plus = aa_data["rscu_plus"].values
+        minus = aa_data["rscu_minus"].values
+        colors_plus = ["red" if s else "steelblue" for s in aa_data["significant"]]
+        colors_minus = ["darkred" if s else "darksteelblue" for s in aa_data["significant"]]
+
+        bars1 = ax.bar(x_pos - width / 2, plus, width, label="+", color=colors_plus, alpha=0.7, edgecolor="black", linewidth=0.5)
+        bars2 = ax.bar(x_pos + width / 2, minus, width, label="-", color=colors_minus, alpha=0.7, edgecolor="black", linewidth=0.5)
+
+        ax.set_ylabel("Mean RSCU", fontsize=10)
+        ax.set_title(f"{aa}", fontsize=11)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(aa_data["codon"].values, fontsize=8)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3, axis="y")
+
+    # Hide extra subplots
+    for panel_idx in range(n_aa, len(axes)):
+        axes[panel_idx].set_visible(False)
+
+    title_str = "Strand Asymmetry in Codon Usage"
+    if sample_id:
+        title_str += f" — {sample_id}"
+    fig.suptitle(title_str, fontsize=12)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_operon_coadaptation(
+    operon_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+):
+    """Histogram of RSCU distances between adjacent genes.
+
+    Shows distribution of RSCU distances for same-strand adjacent genes
+    with overlay of median shuffled distance.
+
+    Args:
+        operon_df: DataFrame with rscu_distance, intergenic_distance, same_operon_prediction.
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+    """
+    _apply_style()
+    if operon_df.empty or "rscu_distance" not in operon_df.columns:
+        return
+
+    # Determine if we have the additional scatter plot data
+    has_intergenic = "intergenic_distance" in operon_df.columns
+
+    if has_intergenic:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    else:
+        fig, ax1 = plt.subplots(figsize=(9, 6))
+
+    # Histogram
+    rscu_dist = operon_df["rscu_distance"].dropna()
+    if len(rscu_dist) > 0:
+        ax1.hist(rscu_dist, bins=30, color="steelblue", alpha=0.7, edgecolor="black", linewidth=0.8)
+
+        # Median shuffled distance (if available)
+        if "median_shuffled_distance" in operon_df.columns:
+            median_shuffled = operon_df["median_shuffled_distance"].iloc[0] if not operon_df.empty else None
+            if median_shuffled is not None:
+                ax1.axvline(median_shuffled, color="red", linestyle="--", linewidth=2, label=f"Median shuffled: {median_shuffled:.3f}")
+                ax1.legend(fontsize=9)
+
+        ax1.set_xlabel("RSCU Distance", fontsize=11)
+        ax1.set_ylabel("Frequency", fontsize=11)
+        ax1.set_title("RSCU Distances Between Adjacent Genes", fontsize=11)
+        ax1.grid(True, alpha=0.3)
+
+    # Scatter plot if intergenic data available
+    if has_intergenic:
+        intergenic = operon_df["intergenic_distance"].dropna()
+        has_prediction = "same_operon_prediction" in operon_df.columns
+
+        if len(intergenic) > 0:
+            if has_prediction:
+                prediction = operon_df.loc[intergenic.index, "same_operon_prediction"]
+                for pred_val, color, label in [(True, "red", "Predicted same operon"), (False, "blue", "Predicted different")]:
+                    mask = prediction == pred_val
+                    if mask.any():
+                        ax2.scatter(
+                            intergenic[mask],
+                            rscu_dist[mask],
+                            alpha=0.5,
+                            s=20,
+                            color=color,
+                            label=label,
+                        )
+                ax2.legend(fontsize=9)
+            else:
+                ax2.scatter(intergenic, rscu_dist, alpha=0.5, s=20, color="steelblue")
+
+            ax2.set_xlabel("Intergenic Distance (bp)", fontsize=11)
+            ax2.set_ylabel("RSCU Distance", fontsize=11)
+            ax2.set_title("Intergenic Distance vs RSCU Distance", fontsize=11)
+            ax2.grid(True, alpha=0.3)
+
+    title_str = "Operon Co-adaptation Analysis"
+    if sample_id:
+        title_str += f" — {sample_id}"
+    fig.suptitle(title_str, fontsize=12)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_growth_rate_gauge(
+    growth_dict: dict,
+    output_path: Path,
+    sample_id: str = "",
+):
+    """Gauge/infographic plot showing growth rate and associated metrics.
+
+    Displays predicted doubling time, mean CAI of RP genes, and growth class
+    with color-coded zones: green (<2h fast), yellow (2-8h moderate), red (>8h slow).
+
+    Args:
+        growth_dict: Dict with keys doubling_time, mean_cai_rp, growth_class.
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+    """
+    _apply_style()
+    if not growth_dict:
+        return
+
+    doubling_time = growth_dict.get("doubling_time", 0)
+    mean_cai = growth_dict.get("mean_cai_rp", 0)
+    growth_class = growth_dict.get("growth_class", "unknown")
+
+    fig = plt.figure(figsize=(10, 6))
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.3)
+
+    # Main gauge: doubling time
+    ax_gauge = fig.add_subplot(gs[0, :])
+
+    # Color zones
+    if doubling_time < 2:
+        zone_color = "green"
+        zone_label = "FAST"
+    elif doubling_time < 8:
+        zone_color = "yellow"
+        zone_label = "MODERATE"
+    else:
+        zone_color = "red"
+        zone_label = "SLOW"
+
+    # Horizontal bar
+    ax_gauge.barh([0], [doubling_time], height=0.3, color=zone_color, alpha=0.7, edgecolor="black", linewidth=2)
+    ax_gauge.set_xlim(0, 20)
+    ax_gauge.text(doubling_time + 0.3, 0, f"{doubling_time:.2f} hours", va="center", fontsize=11, weight="bold")
+
+    # Zone boundaries
+    ax_gauge.axvline(2, color="green", linestyle="--", alpha=0.5, linewidth=1)
+    ax_gauge.axvline(8, color="orange", linestyle="--", alpha=0.5, linewidth=1)
+
+    ax_gauge.text(1, -0.5, "FAST\n(<2h)", ha="center", fontsize=9, color="green", weight="bold")
+    ax_gauge.text(5, -0.5, "MODERATE\n(2-8h)", ha="center", fontsize=9, color="orange", weight="bold")
+    ax_gauge.text(14, -0.5, "SLOW\n(>8h)", ha="center", fontsize=9, color="red", weight="bold")
+
+    ax_gauge.set_xlabel("Predicted Doubling Time (hours)", fontsize=11)
+    ax_gauge.set_yticks([])
+    ax_gauge.set_title(f"Growth Rate Gauge — {zone_label}", fontsize=12, weight="bold", color=zone_color)
+    ax_gauge.grid(True, alpha=0.3, axis="x")
+
+    # CAI panel
+    ax_cai = fig.add_subplot(gs[1, 0])
+    ax_cai.text(0.5, 0.6, f"{mean_cai:.3f}", ha="center", va="center", fontsize=20, weight="bold", transform=ax_cai.transAxes)
+    ax_cai.text(0.5, 0.2, "Mean CAI\n(Ribosomal Proteins)", ha="center", va="center", fontsize=10, transform=ax_cai.transAxes)
+    ax_cai.axis("off")
+
+    # Growth class panel
+    ax_class = fig.add_subplot(gs[1, 1])
+    ax_class.text(0.5, 0.6, growth_class.upper(), ha="center", va="center", fontsize=16, weight="bold", transform=ax_class.transAxes)
+    ax_class.text(0.5, 0.2, "Growth\nClass", ha="center", va="center", fontsize=10, transform=ax_class.transAxes)
+    ax_class.axis("off")
+
+    title_str = "Growth Rate Prediction"
+    if sample_id:
+        title_str += f" — {sample_id}"
+    fig.suptitle(title_str, fontsize=13, weight="bold")
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
 # ─── Master plot runner ──────────────────────────────────────────────────────
 
 
@@ -1252,6 +2048,7 @@ def generate_single_genome_plots(
     milc_df: pd.DataFrame | None = None,
     enrichment_results: dict[str, pd.DataFrame] | None = None,
     advanced_results: dict[str, pd.DataFrame] | None = None,
+    bio_ecology_results: dict[str, pd.DataFrame | dict] | None = None,
 ) -> dict[str, Path]:
     """Generate all single-genome plots.
 
@@ -1308,8 +2105,9 @@ def generate_single_genome_plots(
             plot_expression_tier_summary(expr_df, p, sample_id)
             outputs["expression_tiers"] = p.with_suffix(".png")
 
-    # Enrichment bar plots
+    # Enrichment plots
     if enrichment_results:
+        # Per-comparison bar plots
         for key, edf in enrichment_results.items():
             if edf.empty:
                 continue
@@ -1321,11 +2119,41 @@ def generate_single_genome_plots(
             plot_enrichment_bar(edf, p, title=f"{metric} {tier}-expression pathway enrichment — {sample_id}")
             outputs[f"plot_{key}"] = p.with_suffix(".png")
 
+        # Additional enrichment summary plots
+        # Dotplot
+        if any(not edf.empty for edf in enrichment_results.values()):
+            # Use the first non-empty DataFrame for dotplot
+            for key, edf in enrichment_results.items():
+                if not edf.empty:
+                    p = plot_dir / f"{sample_id}_enrichment_dotplot"
+                    plot_enrichment_dotplot(edf, p, sample_id=sample_id)
+                    outputs["enrichment_dotplot"] = p.with_suffix(".png")
+                    break
+
+        # Heatmap (multi-comparison)
+        non_empty = {k: v for k, v in enrichment_results.items() if not v.empty}
+        if len(non_empty) > 1:
+            p = plot_dir / f"{sample_id}_enrichment_heatmap"
+            plot_enrichment_heatmap(non_empty, p, sample_id=sample_id)
+            outputs["enrichment_heatmap"] = p.with_suffix(".png")
+
+        # Summary bar chart
+        if non_empty:
+            p = plot_dir / f"{sample_id}_enrichment_summary"
+            plot_enrichment_summary_bar(non_empty, p, sample_id=sample_id)
+            outputs["enrichment_summary"] = p.with_suffix(".png")
+
     # ── Advanced analysis plots ──────────────────────────────────────────
     if advanced_results:
         _generate_advanced_plots(
             advanced_results, plot_dir, sample_id, outputs,
             expr_df=expr_df,
+        )
+
+    # ── Bio/Ecology plots ────────────────────────────────────────────────
+    if bio_ecology_results:
+        _generate_bio_ecology_plots(
+            bio_ecology_results, plot_dir, sample_id, outputs,
         )
 
     return outputs
@@ -1408,6 +2236,67 @@ def _generate_advanced_plots(
         p = plot_dir / f"{sample_id}_gene_length_bias"
         plot_gene_length_vs_bias(adv["gene_length_bias"], p, sample_id)
         outputs["gene_length_bias"] = p.with_suffix(".png")
+
+
+def _generate_bio_ecology_plots(
+    bio: dict[str, pd.DataFrame | dict],
+    plot_dir: Path,
+    sample_id: str,
+    outputs: dict[str, Path],
+):
+    """Generate bio/ecology analysis plots from pre-computed data.
+
+    Expected keys: hgt, growth_rate, optimal_codons, fop_gradient,
+    position_effects, phage_mobile, strand_asymmetry, operon_coadaptation.
+    """
+
+    # HGT scatter
+    if "hgt" in bio:
+        data = bio["hgt"]
+        if isinstance(data, pd.DataFrame) and not data.empty:
+            p = plot_dir / f"{sample_id}_hgt_scatter"
+            plot_hgt_scatter(data, p, sample_id)
+            outputs["hgt_scatter"] = p.with_suffix(".png")
+
+    # Fop gradient
+    if "fop_gradient" in bio:
+        data = bio["fop_gradient"]
+        if isinstance(data, pd.DataFrame) and not data.empty:
+            p = plot_dir / f"{sample_id}_fop_gradient"
+            plot_fop_gradient(data, p, sample_id)
+            outputs["fop_gradient"] = p.with_suffix(".png")
+
+    # Position effects
+    if "position_effects" in bio:
+        data = bio["position_effects"]
+        if isinstance(data, pd.DataFrame) and not data.empty:
+            p = plot_dir / f"{sample_id}_position_effects"
+            plot_position_effects(data, p, sample_id)
+            outputs["position_effects"] = p.with_suffix(".png")
+
+    # Strand asymmetry
+    if "strand_asymmetry" in bio:
+        data = bio["strand_asymmetry"]
+        if isinstance(data, pd.DataFrame) and not data.empty:
+            p = plot_dir / f"{sample_id}_strand_asymmetry"
+            plot_strand_asymmetry(data, p, sample_id)
+            outputs["strand_asymmetry"] = p.with_suffix(".png")
+
+    # Operon co-adaptation
+    if "operon_coadaptation" in bio:
+        data = bio["operon_coadaptation"]
+        if isinstance(data, pd.DataFrame) and not data.empty:
+            p = plot_dir / f"{sample_id}_operon_coadaptation"
+            plot_operon_coadaptation(data, p, sample_id)
+            outputs["operon_coadaptation"] = p.with_suffix(".png")
+
+    # Growth rate gauge
+    if "growth_rate" in bio:
+        data = bio["growth_rate"]
+        if isinstance(data, dict) and data:
+            p = plot_dir / f"{sample_id}_growth_rate_gauge"
+            plot_growth_rate_gauge(data, p, sample_id)
+            outputs["growth_rate_gauge"] = p.with_suffix(".png")
 
 
 def generate_batch_plots(
