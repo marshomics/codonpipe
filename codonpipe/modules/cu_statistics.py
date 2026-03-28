@@ -28,6 +28,7 @@ library(IRanges)
 args <- commandArgs(trailingOnly = TRUE)
 fasta_file <- args[1]
 output_file <- args[2]
+min_len <- as.integer(args[3])
 
 tryCatch({{
     fasta <- readSet(file = fasta_file)
@@ -43,7 +44,7 @@ tryCatch({{
     width_df <- data.frame(width = width(fasta))
 
     result <- cbind(enc_prime_df, names_df, width_df)
-    result <- subset(result, width > 240)
+    result <- subset(result, width > min_len)
 
     write.table(result, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
     cat("ENCprime analysis complete:", nrow(result), "genes\n")
@@ -61,6 +62,7 @@ library(IRanges)
 args <- commandArgs(trailingOnly = TRUE)
 fasta_file <- args[1]
 output_file <- args[2]
+min_len <- as.integer(args[3])
 
 tryCatch({{
     fasta <- readSet(file = fasta_file)
@@ -76,7 +78,7 @@ tryCatch({{
     width_df <- data.frame(width = width(fasta))
 
     result <- cbind(milc_df, names_df, width_df)
-    result <- subset(result, width > 240)
+    result <- subset(result, width > min_len)
 
     write.table(result, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
     cat("MILC analysis complete:", nrow(result), "genes\n")
@@ -94,6 +96,7 @@ def run_cu_statistics(
     output_dir: Path,
     sample_id: str,
     force: bool = False,
+    min_length: int = 240,
 ) -> dict[str, Path]:
     """Compute R-based codon usage bias statistics (ENCprime, MILC).
 
@@ -106,6 +109,7 @@ def run_cu_statistics(
         output_dir: Base output directory for this sample.
         sample_id: Sample identifier.
         force: Rerun even if output exists.
+        min_length: Minimum gene length in nucleotides to include (default 240).
 
     Returns:
         Dict of output file paths keyed by statistic name.
@@ -121,6 +125,7 @@ def run_cu_statistics(
         logger.info("Computing ENCprime (GC-corrected ENC) for %s", sample_id)
         _run_r_statistic(
             _ENCPRIME_R_SCRIPT, ffn_path, encprime_out, "ENCprime", sample_id,
+            min_length=min_length,
         )
     outputs["encprime"] = encprime_out
 
@@ -130,6 +135,7 @@ def run_cu_statistics(
         logger.info("Computing MILC for %s", sample_id)
         _run_r_statistic(
             _MILC_R_SCRIPT, ffn_path, milc_out, "MILC", sample_id,
+            min_length=min_length,
         )
     outputs["milc"] = milc_out
 
@@ -142,6 +148,7 @@ def _run_r_statistic(
     output_file: Path,
     method_name: str,
     sample_id: str,
+    min_length: int = 240,
 ) -> None:
     """Execute an R CU statistics script (no reference set needed)."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".R", delete=False) as tmp:
@@ -150,7 +157,7 @@ def _run_r_statistic(
 
     try:
         result = run_cmd(
-            ["Rscript", str(r_script_path), str(ffn_path), str(output_file)],
+            ["Rscript", str(r_script_path), str(ffn_path), str(output_file), str(min_length)],
             description=f"Running {method_name} for {sample_id}",
             capture=True,
             timeout=3600,
