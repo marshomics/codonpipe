@@ -1667,14 +1667,20 @@ def plot_fop_gradient(
     if fop_gradient_df.empty or "mean_fop" not in fop_gradient_df.columns:
         return
 
-    df = fop_gradient_df.sort_values("expr_quintile").copy()
+    # Column may be named "quintile" (bio_ecology module) or "expr_quintile"
+    quintile_col = "expr_quintile" if "expr_quintile" in fop_gradient_df.columns else "quintile"
+    if quintile_col not in fop_gradient_df.columns:
+        logger.warning("SKIPPED: FOP gradient plot (no quintile column)")
+        return
+
+    df = fop_gradient_df.sort_values(quintile_col).copy()
 
     fig, ax = plt.subplots(figsize=(9, 6))
 
     # Color gradient: blue (low) to red (high)
     colors = plt.cm.coolwarm(np.linspace(0, 1, len(df)))
 
-    x_pos = df.get("expr_quintile", range(len(df)))
+    x_pos = df[quintile_col]
     y = df["mean_fop"]
     yerr = df.get("std_fop", None)
 
@@ -1737,7 +1743,23 @@ def plot_position_effects(
         sample_id: Sample identifier.
     """
     _apply_style()
-    if position_df.empty or "fop" not in position_df.columns:
+    if position_df.empty:
+        return
+
+    # bio_ecology produces wide format (fop_5prime, fop_middle, fop_3prime);
+    # convert to long format (position, fop) if needed
+    if "fop" not in position_df.columns and "fop_5prime" in position_df.columns:
+        id_vars = [c for c in position_df.columns if not c.startswith("fop_")]
+        melted = position_df.melt(
+            id_vars=id_vars,
+            value_vars=[c for c in ("fop_5prime", "fop_middle", "fop_3prime") if c in position_df.columns],
+            var_name="position",
+            value_name="fop",
+        )
+        melted["position"] = melted["position"].str.replace("fop_", "")
+        position_df = melted
+
+    if "fop" not in position_df.columns:
         return
 
     has_expr = "expression_class" in position_df.columns
@@ -1765,7 +1787,10 @@ def plot_position_effects(
             axis.set_title("Gene position effects on Fop", fontsize=11)
 
         # Create boxplot data
-        bp_data = [data[data.get("position", "") == pos]["fop"].dropna() for pos in positions]
+        if "position" not in data.columns:
+            bp_data = [pd.Series(dtype=float) for _ in positions]
+        else:
+            bp_data = [data[data["position"] == pos]["fop"].dropna() for pos in positions]
 
         bp = axis.boxplot(
             bp_data,
@@ -1780,9 +1805,11 @@ def plot_position_effects(
             patch.set_alpha(0.7)
 
         # Wilcoxon signed-rank test: 5' vs others
+        if "position" not in data.columns:
+            continue
         for pos2, label2 in zip(["middle", "3prime"], ["5' vs Middle", "5' vs 3'"]):
-            data5 = data[data.get("position", "") == "5prime"]["fop"].dropna()
-            data2 = data[data.get("position", "") == pos2]["fop"].dropna()
+            data5 = data[data["position"] == "5prime"]["fop"].dropna()
+            data2 = data[data["position"] == pos2]["fop"].dropna()
 
             if len(data5) > 0 and len(data2) > 0:
                 try:
@@ -1820,6 +1847,10 @@ def plot_strand_asymmetry(
         sample_id: Sample identifier.
     """
     _apply_style()
+    # bio_ecology uses "mean_rscu_plus/minus"; normalize to "rscu_plus/minus"
+    strand_df = strand_df.copy()
+    if "mean_rscu_plus" in strand_df.columns and "rscu_plus" not in strand_df.columns:
+        strand_df.rename(columns={"mean_rscu_plus": "rscu_plus", "mean_rscu_minus": "rscu_minus"}, inplace=True)
     if strand_df.empty or "rscu_plus" not in strand_df.columns:
         return
 
@@ -1902,6 +1933,10 @@ def plot_operon_coadaptation(
         sample_id: Sample identifier.
     """
     _apply_style()
+    # bio_ecology uses "intergenic_bp"; normalize to "intergenic_distance"
+    operon_df = operon_df.copy()
+    if "intergenic_bp" in operon_df.columns and "intergenic_distance" not in operon_df.columns:
+        operon_df.rename(columns={"intergenic_bp": "intergenic_distance"}, inplace=True)
     if operon_df.empty or "rscu_distance" not in operon_df.columns:
         return
 
@@ -1986,7 +2021,8 @@ def plot_growth_rate_gauge(
     if not growth_dict:
         return
 
-    doubling_time = growth_dict.get("doubling_time", 0)
+    doubling_time = growth_dict.get("predicted_doubling_time_hours",
+                                     growth_dict.get("doubling_time", 0))
     mean_cai = growth_dict.get("mean_cai_rp", 0)
     growth_class = growth_dict.get("growth_class", "unknown")
 
