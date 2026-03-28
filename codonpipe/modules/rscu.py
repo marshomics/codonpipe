@@ -61,7 +61,7 @@ def compute_rscu_from_counts(codon_counts: Counter) -> dict[str, float]:
             if total > 0:
                 rscu_val = (count * n_syn) / total
             else:
-                rscu_val = 0.0
+                rscu_val = np.nan  # Family unobserved; NaN distinguishes from low usage
 
             # Build the column name matching our convention
             col_name = f"{family_name}-{codon}"
@@ -112,15 +112,25 @@ def compute_rscu_genome_summary(
         min_length: Minimum gene length.
 
     Returns:
-        Dict of median RSCU values per codon.
+        Dict of median RSCU values per codon. Also includes IQR (interquartile
+        range) for each codon as '{codon}_iqr' keys.
     """
     gene_df = compute_rscu_per_gene(ffn_path, min_length)
     if gene_df.empty:
-        return {col: np.nan for col in RSCU_COLUMN_NAMES}
+        result = {}
+        for col in RSCU_COLUMN_NAMES:
+            result[col] = np.nan
+            result[f"{col}_iqr"] = np.nan
+        return result
 
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in gene_df.columns]
-    medians = gene_df[rscu_cols].median().to_dict()
-    return medians
+    result = {}
+    for col in rscu_cols:
+        result[col] = gene_df[col].median()
+        q75 = gene_df[col].quantile(0.75)
+        q25 = gene_df[col].quantile(0.25)
+        result[f"{col}_iqr"] = q75 - q25
+    return result
 
 
 def compute_codon_frequency_table(ffn_path: Path, min_length: int = MIN_GENE_LENGTH) -> pd.DataFrame:
@@ -249,8 +259,12 @@ def _calculate_enc(codon_counts: Counter) -> float:
                 enc += n_families[k] * k
         else:
             # No amino acids observed for this degeneracy class.
-            # Assume no bias: F = 1/k → contribution = n_families * k
+            # Standard assumption (codonW convention): assume uniform usage (F = 1/k),
+            # which contributes n_families * k. This may overestimate ENC for genes
+            # with severely incomplete amino acid representation.
             enc += n_families[k] * k
+            logger.debug("ENC: no observed amino acids for %d-fold degenerate class; "
+                        "assuming no bias (F=1/%d)", k, k)
 
     return min(enc, 61.0)
 
