@@ -46,7 +46,7 @@ tryCatch({{
     write.table(result, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
     cat("ENCprime analysis complete:", nrow(result), "genes\n")
 }}, error = function(e) {{
-    cat("ERROR:", e$message, "\n")
+    message("ERROR: ", e$message)
     quit(status = 1)
 }})
 """
@@ -77,7 +77,7 @@ tryCatch({{
     write.table(result, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
     cat("MILC analysis complete:", nrow(result), "genes\n")
 }}, error = function(e) {{
-    cat("ERROR:", e$message, "\n")
+    message("ERROR: ", e$message)
     quit(status = 1)
 }})
 """
