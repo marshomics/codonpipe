@@ -1704,7 +1704,7 @@ def run_comparative_analyses(
                 p = comp_dir / "between_condition_optimal_codons.tsv"
                 opt_codons.to_csv(p, sep="\t", index=False)
                 outputs["between_condition_optimal_codons"] = p
-                n_disagree = (~opt_codons["agreement"]).sum()
+                n_disagree = (~opt_codons["unanimous"]).sum()
                 logger.info("Optimal codons: %d codons compared, %d differ between conditions",
                             len(opt_codons), n_disagree)
 
