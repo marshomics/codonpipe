@@ -1593,12 +1593,12 @@ def plot_hgt_scatter(
     Markers by expression class if available.
 
     Args:
-        hgt_df: DataFrame with gc3, mahal_dist, hgt_flag, optional expression_class.
+        hgt_df: DataFrame with gc3, mahalanobis_dist, hgt_flag, optional expression_class.
         output_path: Base path for saving.
         sample_id: Sample identifier.
     """
     _apply_style()
-    if hgt_df.empty or "mahal_dist" not in hgt_df.columns:
+    if hgt_df.empty or "mahalanobis_dist" not in hgt_df.columns:
         return
 
     fig, ax = plt.subplots(figsize=(10, 7))
@@ -1614,7 +1614,7 @@ def plot_hgt_scatter(
     if not non_hgt.empty:
         ax.scatter(
             non_hgt.get("gc3_deviation", 0),
-            non_hgt["mahal_dist"],
+            non_hgt["mahalanobis_dist"],
             s=30,
             c="lightgray",
             alpha=0.5,
@@ -1632,7 +1632,7 @@ def plot_hgt_scatter(
                 if not subset.empty:
                     ax.scatter(
                         subset.get("gc3_deviation", 0),
-                        subset["mahal_dist"],
+                        subset["mahalanobis_dist"],
                         s=size_map.get(expr_class, 30),
                         c="red",
                         alpha=0.7,
@@ -1644,7 +1644,7 @@ def plot_hgt_scatter(
         else:
             ax.scatter(
                 hgt.get("gc3_deviation", 0),
-                hgt["mahal_dist"],
+                hgt["mahalanobis_dist"],
                 s=50,
                 c="red",
                 alpha=0.7,
