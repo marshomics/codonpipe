@@ -136,6 +136,9 @@ def run(
               help="CPU threads per sample.")
 @click.option("-p", "--parallel", default=1, type=int, show_default=True,
               help="Number of samples to process in parallel.")
+@click.option("--condition-col", default=None,
+              help="Column in the batch table designating experimental conditions. "
+                   "Enables within- and between-condition comparative analyses.")
 @click.option("--metadata-cols", multiple=True, default=None,
               help="Metadata columns from batch table for comparative analyses (repeatable).")
 @click.option("--kingdom", default="Bacteria", show_default=True,
@@ -161,6 +164,7 @@ def batch(
     output_dir: Path,
     threads: int,
     parallel: int,
+    condition_col: str | None,
     metadata_cols: tuple[str, ...],
     kingdom: str,
     metagenome: bool,
@@ -213,6 +217,7 @@ def batch(
             cpus=threads,
             parallel=parallel,
             metadata_cols=meta_cols,
+            condition_col=condition_col,
             kingdom=kingdom,
             metagenome=metagenome,
             cogs_file=cogs_file,
