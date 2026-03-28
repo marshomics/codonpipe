@@ -690,6 +690,57 @@ def _run_batch_analyses(
                     if len(perm_df):
                         perm_result = perm_df.iloc[0].to_dict()
 
+            # Load bio/ecology comparison data for plotting
+            hgt_burden = None
+            strand_asym_patterns_df = None
+            optimal_codons_df = None
+            gc3_gc12_df = None
+
+            if "between_condition_hgt_burden" in comp_outputs:
+                # Re-derive from comparative module (dict not serialisable to TSV)
+                from codonpipe.modules.comparative import between_condition_hgt_burden
+                try:
+                    hgt_burden = between_condition_hgt_burden(
+                        sample_outputs, metrics_df, condition_col,
+                    )
+                except Exception:
+                    pass
+
+            if "between_condition_strand_asymmetry_patterns" in comp_outputs:
+                p = comp_outputs["between_condition_strand_asymmetry_patterns"]
+                if p.exists():
+                    strand_asym_patterns_df = pd.read_csv(p, sep="\t")
+
+            if "between_condition_optimal_codons" in comp_outputs:
+                p = comp_outputs["between_condition_optimal_codons"]
+                if p.exists():
+                    optimal_codons_df = pd.read_csv(p, sep="\t")
+
+            if "between_condition_gc3_gc12" in comp_outputs:
+                p = comp_outputs["between_condition_gc3_gc12"]
+                if p.exists():
+                    gc3_gc12_df = pd.read_csv(p, sep="\t")
+
+            # Load expression-class RSCU test results
+            rp_rscu_tests_df = None
+            he_rscu_tests_df = None
+            enrichment_comp_df = None
+
+            if "between_condition_ribosomal_rscu" in comp_outputs:
+                p = comp_outputs["between_condition_ribosomal_rscu"]
+                if p.exists():
+                    rp_rscu_tests_df = pd.read_csv(p, sep="\t")
+
+            if "between_condition_high_expression_rscu" in comp_outputs:
+                p = comp_outputs["between_condition_high_expression_rscu"]
+                if p.exists():
+                    he_rscu_tests_df = pd.read_csv(p, sep="\t")
+
+            if "between_condition_enrichment_comparison" in comp_outputs:
+                p = comp_outputs["between_condition_enrichment_comparison"]
+                if p.exists():
+                    enrichment_comp_df = pd.read_csv(p, sep="\t")
+
             # Generate comparative plots
             logger.info("Generating condition-aware comparative plots")
             comp_plot_outputs = generate_comparative_plots(
@@ -700,6 +751,13 @@ def _run_batch_analyses(
                 rscu_tests_df=rscu_tests_df,
                 rscu_disp_df=rscu_disp_df,
                 perm_result=perm_result,
+                hgt_burden=hgt_burden,
+                strand_asym_patterns_df=strand_asym_patterns_df,
+                optimal_codons_df=optimal_codons_df,
+                gc3_gc12_df=gc3_gc12_df,
+                rp_rscu_tests_df=rp_rscu_tests_df,
+                he_rscu_tests_df=he_rscu_tests_df,
+                enrichment_comp_df=enrichment_comp_df,
             )
             outputs.update(comp_plot_outputs)
             logger.info("Condition-aware comparative analyses complete: %d outputs",
