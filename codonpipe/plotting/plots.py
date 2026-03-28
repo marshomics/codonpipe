@@ -374,9 +374,12 @@ def plot_pca(
     else:
         ax.scatter(coords[:, 0], coords[:, 1], s=15, alpha=0.5, c="steelblue", edgecolors="none")
 
-    ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)")
-    ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)")
-    ax.set_title(title)
+    pct1 = pca.explained_variance_ratio_[0] * 100
+    pct2 = pca.explained_variance_ratio_[1] * 100
+    cumulative = pct1 + pct2
+    ax.set_xlabel(f"PC1 ({pct1:.1f}%)")
+    ax.set_ylabel(f"PC2 ({pct2:.1f}%)")
+    ax.set_title(f"{title} (PC1+PC2 = {cumulative:.1f}% of variance)")
     _save_fig(fig, output_path)
 
 
@@ -403,9 +406,10 @@ def plot_umap(
 
     scaler = StandardScaler()
     scaled = scaler.fit_transform(data)
+    min_dist = 0.1  # default UMAP parameter
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="n_jobs value")
-        reducer = umap.UMAP(n_neighbors=n_neighbors, n_components=2, random_state=42)
+        reducer = umap.UMAP(n_neighbors=n_neighbors, n_components=2, min_dist=min_dist, random_state=42)
         coords = reducer.fit_transform(scaled)
 
     fig, ax = plt.subplots(figsize=(8, 7))
@@ -428,6 +432,12 @@ def plot_umap(
     ax.set_xlabel("UMAP 1")
     ax.set_ylabel("UMAP 2")
     ax.set_title(title)
+
+    # Annotation with UMAP parameters
+    ax.annotate(f"n_neighbors={n_neighbors}, min_dist={min_dist}",
+                xy=(0.02, 0.02), xycoords="axes fraction",
+                fontsize=7, color="gray", fontstyle="italic")
+
     _save_fig(fig, output_path)
 
 
