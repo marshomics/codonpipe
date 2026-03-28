@@ -84,6 +84,18 @@ def collect_sample_metrics(
         # --- S-value (adaptation to ribosomal reference) ---
         _read_s_value(paths, row)
 
+        # --- Translational selection ---
+        _read_translational_selection(paths, row)
+
+        # --- ENCprime ---
+        _read_enc_prime(paths, row)
+
+        # --- MILC ---
+        _read_milc(paths, row)
+
+        # --- CBI ---
+        _read_cbi(paths, row)
+
         rows.append(row)
 
     return pd.DataFrame(rows)
@@ -234,6 +246,81 @@ def _read_s_value(paths: dict, row: dict) -> None:
                 row["median_S_value"] = df[s_col].median()
         except Exception:
             pass
+
+
+def _read_translational_selection(paths: dict, row: dict) -> None:
+    """Read translational selection metrics from fop_gradient and position_effects."""
+    # Read fop_gradient (quintile analysis)
+    p_grad = paths.get("bio_trans_sel_fop_gradient")
+    if p_grad and Path(p_grad).exists():
+        try:
+            df = pd.read_csv(p_grad, sep="\t")
+            if "quintile" in df.columns and "fop_mean" in df.columns:
+                # Linear regression of fop_mean vs quintile number
+                x = df["quintile"].dropna().values
+                y = df["fop_mean"].dropna().values
+                common = len(x)
+                if common > 2:
+                    slope, _, _, _, _ = sp_stats.linregress(x, y)
+                    row["fop_gradient_slope"] = slope
+        except Exception:
+            pass
+
+    # Read position_effects (5prime, middle, 3prime)
+    p_pos = paths.get("bio_trans_sel_position_effects")
+    if p_pos and Path(p_pos).exists():
+        try:
+            df = pd.read_csv(p_pos, sep="\t")
+            for pos in ("fop_5prime", "fop_middle", "fop_3prime"):
+                if pos in df.columns:
+                    row[f"mean_{pos}"] = df[pos].mean()
+        except Exception:
+            pass
+
+
+def _read_enc_prime(paths: dict, row: dict) -> None:
+    """Read ENCprime and compute median ENC-ENCprime difference."""
+    p = paths.get("encprime")
+    if p and Path(p).exists():
+        try:
+            df = pd.read_csv(p, sep="\t")
+            encprime_col = next((c for c in ("ENCprime", "encprime") if c in df.columns), None)
+            if encprime_col:
+                row["median_ENCprime"] = df[encprime_col].median()
+                # Compute ENC-ENCprime difference if ENC is available
+                if "median_ENC" in row and not np.isnan(row["median_ENC"]):
+                    row["median_ENC_diff"] = row["median_ENC"] - row["median_ENCprime"]
+        except Exception:
+            pass
+
+
+def _read_milc(paths: dict, row: dict) -> None:
+    """Read MILC metric."""
+    p = paths.get("milc")
+    if p and Path(p).exists():
+        try:
+            df = pd.read_csv(p, sep="\t")
+            milc_col = next((c for c in ("MILC", "milc") if c in df.columns), None)
+            if milc_col:
+                row["median_MILC"] = df[milc_col].median()
+        except Exception:
+            pass
+
+
+def _read_cbi(paths: dict, row: dict) -> None:
+    """Read CBI (Codon Bias Index) metric."""
+    # Try direct CBI output first
+    for key in ("cbi", "codon_bias_index"):
+        p = paths.get(key)
+        if p and Path(p).exists():
+            try:
+                df = pd.read_csv(p, sep="\t")
+                cbi_col = next((c for c in ("CBI", "cbi") if c in df.columns), None)
+                if cbi_col:
+                    row["mean_CBI"] = df[cbi_col].mean()
+                    return
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +510,72 @@ def between_condition_tests(
 
     result["significant"] = result["corrected_p"] < 0.05
     return result
+
+
+def between_condition_effect_summary(
+    between_tests: pd.DataFrame,
+    metrics_df: pd.DataFrame,
+    condition_col: str = "condition",
+) -> pd.DataFrame:
+    """Summarize between-condition tests by effect size.
+
+    Filters to Mann-Whitney U results only and produces a summary table sorted by
+    absolute effect size, with columns: metric, group1, group2, mean_g1, mean_g2,
+    percent_diff, effect_size, effect_label, corrected_p, significant.
+
+    Args:
+        between_tests: Output from between_condition_tests().
+        metrics_df: Original metrics DataFrame.
+        condition_col: Name of condition column in metrics_df.
+
+    Returns:
+        Filtered and annotated DataFrame sorted by absolute effect size.
+    """
+    if between_tests.empty:
+        return pd.DataFrame()
+
+    # Keep only Mann-Whitney U results
+    mw_tests = between_tests[between_tests["test"] == "mann_whitney_u"].copy()
+    if mw_tests.empty:
+        return pd.DataFrame()
+
+    # Add mean values from metrics_df
+    summary_rows = []
+    for _, row in mw_tests.iterrows():
+        metric = row["metric"]
+        g1, g2 = row["group1"], row["group2"]
+
+        # Get means from metrics_df
+        vals_g1 = metrics_df.loc[metrics_df[condition_col] == g1, metric].dropna()
+        vals_g2 = metrics_df.loc[metrics_df[condition_col] == g2, metric].dropna()
+
+        mean_g1 = vals_g1.mean() if len(vals_g1) > 0 else np.nan
+        mean_g2 = vals_g2.mean() if len(vals_g2) > 0 else np.nan
+
+        # Compute percent difference
+        if not np.isnan(mean_g1) and mean_g1 != 0:
+            percent_diff = 100 * (mean_g2 - mean_g1) / mean_g1
+        else:
+            percent_diff = np.nan
+
+        summary_rows.append({
+            "metric": metric,
+            "group1": g1,
+            "group2": g2,
+            "mean_g1": round(mean_g1, 6),
+            "mean_g2": round(mean_g2, 6),
+            "percent_diff": round(percent_diff, 2) if not np.isnan(percent_diff) else np.nan,
+            "effect_size": row["effect_size"],
+            "effect_label": row["effect_label"],
+            "corrected_p": round(row["corrected_p"], 4),
+            "significant": row["significant"],
+        })
+
+    result = pd.DataFrame(summary_rows)
+    # Sort by absolute effect size (descending)
+    result["abs_effect"] = result["effect_size"].abs()
+    result = result.sort_values("abs_effect", ascending=False).drop(columns=["abs_effect"])
+    return result.reset_index(drop=True)
 
 
 def between_condition_rscu_tests(
@@ -711,6 +864,18 @@ def run_comparative_analyses(
                     perm_result["F_statistic"],
                     perm_result["p_value"],
                     perm_result["R2"],
+                )
+
+            # Between-condition effect summary
+            logger.info("Generating between-condition effect summary")
+            effect_summary = between_condition_effect_summary(between_tests, metrics_df, condition_col)
+            if not effect_summary.empty:
+                p = comp_dir / "between_condition_effect_summary.tsv"
+                effect_summary.to_csv(p, sep="\t", index=False)
+                outputs["between_condition_effect_summary"] = p
+                logger.info(
+                    "Effect summary: %d Mann-Whitney U results sorted by effect size",
+                    len(effect_summary),
                 )
     else:
         logger.info("No condition column specified; skipping condition-aware analyses")
