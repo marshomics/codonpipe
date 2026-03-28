@@ -25,6 +25,13 @@ from codonpipe.utils.codon_tables import AMINO_ACID_FAMILIES, RSCU_COLUMN_NAMES
 
 logger = logging.getLogger("codonpipe")
 
+
+def _safe_label(value, fallback: str = "", maxlen: int = 50) -> str:
+    """Return a truncated string label, safely handling NaN/None."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return str(fallback)[:maxlen] if fallback else ""
+    return str(value)[:maxlen]
+
 # Publication style defaults
 STYLE_PARAMS = {
     "font.family": "sans-serif",
@@ -580,7 +587,7 @@ def plot_enrichment_bar(
 
     sig["neg_log_fdr"] = -np.log10(sig["fdr"].clip(lower=1e-300))
     sig["label"] = sig.apply(
-        lambda r: r["pathway_name"][:50] if r["pathway_name"] else r["pathway"],
+        lambda r: _safe_label(r.get("pathway_name"), fallback=r.get("pathway", ""), maxlen=50),
         axis=1,
     )
     sig = sig.sort_values("neg_log_fdr")
@@ -1144,7 +1151,9 @@ def plot_cog_enrichment(
 
     # Make labels
     show["label"] = show.apply(
-        lambda r: f"{r['COG_category']} — {r['description'][:40]}" if r["description"] else r["COG_category"],
+        lambda r: f"{r['COG_category']} — {_safe_label(r.get('description'), maxlen=40)}"
+        if pd.notna(r.get("description")) and r.get("description")
+        else str(r.get("COG_category", "")),
         axis=1,
     )
 
@@ -1299,7 +1308,7 @@ def plot_enrichment_dotplot(
     # Labels and formatting
     ax.set_yticks(range(len(sig)))
     pathway_labels = sig.apply(
-        lambda r: str(r.get("pathway_name") or r.get("pathway") or "")[:40],
+        lambda r: _safe_label(r.get("pathway_name"), fallback=r.get("pathway", ""), maxlen=40),
         axis=1,
     ).values
     ax.set_yticklabels(pathway_labels, fontsize=8)
@@ -1393,7 +1402,7 @@ def plot_enrichment_heatmap(
             else:
                 row.append(np.nan)  # White for untested
         matrix.append(row)
-        pathway_name = str(pathway)[:30] if pathway is not None else ""
+        pathway_name = _safe_label(pathway, maxlen=30)
         pathway_names.append(pathway_name)
 
     if not matrix:
@@ -1475,8 +1484,8 @@ def plot_enrichment_summary_bar(
             sig = sig.head(max_pathways)
 
         for _, row in sig.iterrows():
-            pathway = str(row.get("pathway") or "")
-            pathway_name = str(row.get("pathway_name") or pathway)[:35]
+            pathway = _safe_label(row.get("pathway"), maxlen=35)
+            pathway_name = _safe_label(row.get("pathway_name"), fallback=pathway, maxlen=35)
             fdr = row.get("fdr", 1.0)
             neg_log_fdr = -np.log10(max(fdr, 1e-300))
 
