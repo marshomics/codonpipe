@@ -1997,18 +1997,21 @@ def plot_operon_coadaptation(
 
     # Scatter plot if intergenic data available
     if has_intergenic:
-        intergenic = operon_df["intergenic_distance"].dropna()
-        has_prediction = "same_operon_prediction" in operon_df.columns
+        # Joint dropna to keep x and y aligned
+        scatter_df = operon_df.dropna(subset=["intergenic_distance", "rscu_distance"])
+        intergenic = scatter_df["intergenic_distance"]
+        rscu_dist_scatter = scatter_df["rscu_distance"]
+        has_prediction = "same_operon_prediction" in scatter_df.columns
 
         if len(intergenic) > 0:
             if has_prediction:
-                prediction = operon_df.loc[intergenic.index, "same_operon_prediction"]
+                prediction = scatter_df["same_operon_prediction"]
                 for pred_val, color, label in [(True, "red", "Predicted same operon"), (False, "blue", "Predicted different")]:
                     mask = prediction == pred_val
                     if mask.any():
                         ax2.scatter(
                             intergenic[mask],
-                            rscu_dist[mask],
+                            rscu_dist_scatter[mask],
                             alpha=0.5,
                             s=20,
                             color=color,
@@ -2016,7 +2019,7 @@ def plot_operon_coadaptation(
                         )
                 ax2.legend(fontsize=9)
             else:
-                ax2.scatter(intergenic, rscu_dist, alpha=0.5, s=20, color="steelblue")
+                ax2.scatter(intergenic, rscu_dist_scatter, alpha=0.5, s=20, color="steelblue")
 
             ax2.set_xlabel("Intergenic Distance (bp)", fontsize=11)
             ax2.set_ylabel("RSCU Distance", fontsize=11)
@@ -2141,66 +2144,93 @@ def generate_single_genome_plots(
     plot_dir.mkdir(parents=True, exist_ok=True)
     outputs = {}
 
+    # Each plot is wrapped in try/except so one failure doesn't crash
+    # the entire genome pipeline — analytical data is already saved to disk.
+
     if freq_df is not None and not freq_df.empty:
-        p = plot_dir / f"{sample_id}_codon_frequency"
-        plot_codon_frequency_bar(freq_df, p, sample_id)
-        outputs["codon_frequency_bar"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_codon_frequency"
+            plot_codon_frequency_bar(freq_df, p, sample_id)
+            outputs["codon_frequency_bar"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Codon frequency bar plot failed: %s", e)
     else:
         logger.info("SKIPPED: codon frequency bar plot (no frequency data)")
 
     if rscu_all is not None:
-        p = plot_dir / f"{sample_id}_rscu_all"
-        plot_rscu_bar(rscu_all, p, sample_id, "All CDS")
-        outputs["rscu_bar_all"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_rscu_all"
+            plot_rscu_bar(rscu_all, p, sample_id, "All CDS")
+            outputs["rscu_bar_all"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("RSCU bar plot (all CDS) failed: %s", e)
     else:
         logger.info("SKIPPED: RSCU bar plot — all CDS (no RSCU data)")
 
     if rscu_rp is not None:
-        p = plot_dir / f"{sample_id}_rscu_ribosomal"
-        plot_rscu_bar(rscu_rp, p, sample_id, "Ribosomal Proteins")
-        outputs["rscu_bar_rp"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_rscu_ribosomal"
+            plot_rscu_bar(rscu_rp, p, sample_id, "Ribosomal Proteins")
+            outputs["rscu_bar_rp"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("RSCU bar plot (ribosomal) failed: %s", e)
     else:
         logger.info("SKIPPED: RSCU bar plot — ribosomal proteins (no ribosomal RSCU data)")
 
     if rscu_gene_df is not None and not rscu_gene_df.empty:
-        p = plot_dir / f"{sample_id}_rscu_heatmap"
-        plot_rscu_heatmap_single(rscu_gene_df, p, sample_id)
-        outputs["rscu_heatmap"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_rscu_heatmap"
+            plot_rscu_heatmap_single(rscu_gene_df, p, sample_id)
+            outputs["rscu_heatmap"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("RSCU heatmap plot failed: %s", e)
     else:
         logger.info("SKIPPED: RSCU heatmap (no per-gene RSCU data)")
 
     if enc_df is not None and not enc_df.empty:
-        p = plot_dir / f"{sample_id}_enc_gc3"
-        plot_enc_gc3(enc_df, p, sample_id)
-        outputs["enc_gc3"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_enc_gc3"
+            plot_enc_gc3(enc_df, p, sample_id)
+            outputs["enc_gc3"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("ENC-GC3 plot failed: %s", e)
     else:
         logger.info("SKIPPED: ENC vs GC3 plot (no ENC data)")
 
     if encprime_df is not None and not encprime_df.empty and enc_df is not None and not enc_df.empty:
-        p = plot_dir / f"{sample_id}_encprime_gc3"
-        plot_encprime_gc3(encprime_df, enc_df, p, sample_id)
-        outputs["encprime_gc3"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_encprime_gc3"
+            plot_encprime_gc3(encprime_df, enc_df, p, sample_id)
+            outputs["encprime_gc3"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("ENCprime-GC3 plot failed: %s", e)
     else:
         logger.info("SKIPPED: ENCprime vs GC3 plot (no ENCprime or ENC data)")
 
     if milc_df is not None and not milc_df.empty:
-        p = plot_dir / f"{sample_id}_milc_dist"
-        plot_milc_distribution(milc_df, p, sample_id)
-        outputs["milc_dist"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_milc_dist"
+            plot_milc_distribution(milc_df, p, sample_id)
+            outputs["milc_dist"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("MILC distribution plot failed: %s", e)
     else:
         logger.info("SKIPPED: MILC distribution plot (no MILC data)")
 
     if expr_df is not None and not expr_df.empty:
-        p = plot_dir / f"{sample_id}_expression_dist"
-        plot_expression_distribution(expr_df, p, sample_id)
-        outputs["expression_dist"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_expression_dist"
+            plot_expression_distribution(expr_df, p, sample_id)
+            outputs["expression_dist"] = p.with_suffix(".png")
 
-        # Expression tier summary (stacked bars per metric)
-        class_cols = [c for c in expr_df.columns if c.endswith("_class") and c != "expression_class"]
-        if class_cols:
-            p = plot_dir / f"{sample_id}_expression_tiers"
-            plot_expression_tier_summary(expr_df, p, sample_id)
-            outputs["expression_tiers"] = p.with_suffix(".png")
+            # Expression tier summary (stacked bars per metric)
+            class_cols = [c for c in expr_df.columns if c.endswith("_class") and c != "expression_class"]
+            if class_cols:
+                p = plot_dir / f"{sample_id}_expression_tiers"
+                plot_expression_tier_summary(expr_df, p, sample_id)
+                outputs["expression_tiers"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Expression distribution/tier plot failed: %s", e)
     else:
         logger.info("SKIPPED: expression distribution and tier plots (no expression data)")
 
@@ -2273,60 +2303,80 @@ def _generate_advanced_plots(
     outputs: dict[str, Path],
     expr_df: pd.DataFrame | None = None,
 ):
-    """Generate all advanced analysis plots from pre-computed data."""
+    """Generate all advanced analysis plots from pre-computed data.
+
+    Each plot is wrapped in try/except so one failure doesn't crash the
+    entire genome pipeline — analytical data is already saved to disk.
+    """
 
     # COA on RSCU
     if "coa_coords" in adv and "coa_inertia" in adv:
-        coa_coords = adv["coa_coords"]
-        coa_inertia = adv["coa_inertia"]
-
-        # Colored by CAI_class if available
-        color_col = "CAI_class" if "CAI_class" in coa_coords.columns else None
-        p = plot_dir / f"{sample_id}_coa"
-        plot_coa(coa_coords, coa_inertia, p, sample_id, color_col=color_col)
-        outputs["coa"] = p.with_suffix(".png")
+        try:
+            coa_coords = adv["coa_coords"]
+            coa_inertia = adv["coa_inertia"]
+            color_col = "CAI_class" if "CAI_class" in coa_coords.columns else None
+            p = plot_dir / f"{sample_id}_coa"
+            plot_coa(coa_coords, coa_inertia, p, sample_id, color_col=color_col)
+            outputs["coa"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("COA plot failed: %s", e)
     else:
         logger.info("SKIPPED: COA plot (no COA data)")
 
     if "coa_codon_coords" in adv:
-        p = plot_dir / f"{sample_id}_coa_codons"
-        plot_coa_codons(adv["coa_codon_coords"], p, sample_id)
-        outputs["coa_codons"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_coa_codons"
+            plot_coa_codons(adv["coa_codon_coords"], p, sample_id)
+            outputs["coa_codons"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("COA codon plot failed: %s", e)
     else:
         logger.info("SKIPPED: COA codon plot (no COA codon coordinates)")
 
     # S-value scatter
     if "s_value" in adv and expr_df is not None:
-        for metric in ["CAI", "MELP", "Fop"]:
-            if metric in expr_df.columns:
-                p = plot_dir / f"{sample_id}_s_value_vs_{metric.lower()}"
-                plot_s_value_scatter(adv["s_value"], expr_df, p, sample_id, metric)
-                outputs[f"s_value_vs_{metric.lower()}"] = p.with_suffix(".png")
-                break  # One S-value plot is enough
+        try:
+            for metric in ["CAI", "MELP", "Fop"]:
+                if metric in expr_df.columns:
+                    p = plot_dir / f"{sample_id}_s_value_vs_{metric.lower()}"
+                    plot_s_value_scatter(adv["s_value"], expr_df, p, sample_id, metric)
+                    outputs[f"s_value_vs_{metric.lower()}"] = p.with_suffix(".png")
+                    break  # One S-value plot is enough
+        except Exception as e:
+            logger.warning("S-value scatter plot failed: %s", e)
     else:
         logger.info("SKIPPED: S-value scatter plot (no S-value or expression data)")
 
     # ENC - ENC' difference
     if "enc_diff" in adv:
-        p = plot_dir / f"{sample_id}_enc_diff"
-        plot_enc_diff(adv["enc_diff"], p, sample_id, expr_df=expr_df)
-        outputs["enc_diff"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_enc_diff"
+            plot_enc_diff(adv["enc_diff"], p, sample_id, expr_df=expr_df)
+            outputs["enc_diff"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("ENC diff plot failed: %s", e)
     else:
         logger.info("SKIPPED: ENC-ENCprime difference plot (no ENC difference data)")
 
     # Neutrality plot
     if "gc12_gc3" in adv:
-        p = plot_dir / f"{sample_id}_neutrality"
-        plot_neutrality(adv["gc12_gc3"], p, sample_id)
-        outputs["neutrality"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_neutrality"
+            plot_neutrality(adv["gc12_gc3"], p, sample_id)
+            outputs["neutrality"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Neutrality plot failed: %s", e)
     else:
         logger.info("SKIPPED: neutrality plot (no GC12/GC3 data)")
 
     # PR2 plot
     if "pr2" in adv:
-        p = plot_dir / f"{sample_id}_pr2"
-        plot_pr2(adv["pr2"], p, sample_id, expr_df=expr_df)
-        outputs["pr2"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_pr2"
+            plot_pr2(adv["pr2"], p, sample_id, expr_df=expr_df)
+            outputs["pr2"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("PR2 plot failed: %s", e)
     else:
         logger.info("SKIPPED: PR2 plot (no PR2 data)")
 
@@ -2334,31 +2384,43 @@ def _generate_advanced_plots(
     for metric in ["CAI", "MELP", "Fop"]:
         key = f"delta_rscu_{metric}"
         if key in adv:
-            p = plot_dir / f"{sample_id}_delta_rscu_{metric.lower()}"
-            plot_delta_rscu_heatmap(adv[key], p, sample_id, metric)
-            outputs[f"delta_rscu_{metric.lower()}"] = p.with_suffix(".png")
+            try:
+                p = plot_dir / f"{sample_id}_delta_rscu_{metric.lower()}"
+                plot_delta_rscu_heatmap(adv[key], p, sample_id, metric)
+                outputs[f"delta_rscu_{metric.lower()}"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Delta RSCU %s plot failed: %s", metric, e)
 
     # tRNA-codon correlation
     if "trna_codon_correlation" in adv:
-        p = plot_dir / f"{sample_id}_trna_codon"
-        plot_trna_codon_correlation(adv["trna_codon_correlation"], p, sample_id)
-        outputs["trna_codon"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_trna_codon"
+            plot_trna_codon_correlation(adv["trna_codon_correlation"], p, sample_id)
+            outputs["trna_codon"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("tRNA-codon correlation plot failed: %s", e)
     else:
         logger.info("SKIPPED: tRNA-codon correlation plot (no tRNA data)")
 
     # COG enrichment
     if "cog_enrichment" in adv:
-        p = plot_dir / f"{sample_id}_cog_enrichment"
-        plot_cog_enrichment(adv["cog_enrichment"], p, sample_id)
-        outputs["cog_enrichment"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_cog_enrichment"
+            plot_cog_enrichment(adv["cog_enrichment"], p, sample_id)
+            outputs["cog_enrichment"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("COG enrichment plot failed: %s", e)
     else:
         logger.info("SKIPPED: COG enrichment plot (no COG enrichment data)")
 
     # Gene length vs bias
     if "gene_length_bias" in adv:
-        p = plot_dir / f"{sample_id}_gene_length_bias"
-        plot_gene_length_vs_bias(adv["gene_length_bias"], p, sample_id)
-        outputs["gene_length_bias"] = p.with_suffix(".png")
+        try:
+            p = plot_dir / f"{sample_id}_gene_length_bias"
+            plot_gene_length_vs_bias(adv["gene_length_bias"], p, sample_id)
+            outputs["gene_length_bias"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Gene length bias plot failed: %s", e)
     else:
         logger.info("SKIPPED: gene length vs bias plot (no gene length bias data)")
 
@@ -2375,57 +2437,78 @@ def _generate_bio_ecology_plots(
     position_effects, phage_mobile, strand_asymmetry, operon_coadaptation.
     """
 
+    # Each plot is wrapped in try/except so one failure doesn't crash
+    # the entire genome pipeline — analytical data is already saved to disk.
+
     # HGT scatter
     if "hgt" in bio and isinstance(bio["hgt"], pd.DataFrame) and not bio["hgt"].empty:
-        data = bio["hgt"]
-        p = plot_dir / f"{sample_id}_hgt_scatter"
-        plot_hgt_scatter(data, p, sample_id)
-        outputs["hgt_scatter"] = p.with_suffix(".png")
+        try:
+            data = bio["hgt"]
+            p = plot_dir / f"{sample_id}_hgt_scatter"
+            plot_hgt_scatter(data, p, sample_id)
+            outputs["hgt_scatter"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("HGT scatter plot failed: %s", e)
     else:
         logger.info("SKIPPED: HGT scatter plot (no HGT data)")
 
     # Fop gradient
     if "fop_gradient" in bio and isinstance(bio["fop_gradient"], pd.DataFrame) and not bio["fop_gradient"].empty:
-        data = bio["fop_gradient"]
-        p = plot_dir / f"{sample_id}_fop_gradient"
-        plot_fop_gradient(data, p, sample_id)
-        outputs["fop_gradient"] = p.with_suffix(".png")
+        try:
+            data = bio["fop_gradient"]
+            p = plot_dir / f"{sample_id}_fop_gradient"
+            plot_fop_gradient(data, p, sample_id)
+            outputs["fop_gradient"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Fop gradient plot failed: %s", e)
     else:
         logger.info("SKIPPED: Fop gradient plot (no Fop gradient data)")
 
     # Position effects
     if "position_effects" in bio and isinstance(bio["position_effects"], pd.DataFrame) and not bio["position_effects"].empty:
-        data = bio["position_effects"]
-        p = plot_dir / f"{sample_id}_position_effects"
-        plot_position_effects(data, p, sample_id)
-        outputs["position_effects"] = p.with_suffix(".png")
+        try:
+            data = bio["position_effects"]
+            p = plot_dir / f"{sample_id}_position_effects"
+            plot_position_effects(data, p, sample_id)
+            outputs["position_effects"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Position effects plot failed: %s", e)
     else:
         logger.info("SKIPPED: codon position effects plot (no position effects data)")
 
     # Strand asymmetry
     if "strand_asymmetry" in bio and isinstance(bio["strand_asymmetry"], pd.DataFrame) and not bio["strand_asymmetry"].empty:
-        data = bio["strand_asymmetry"]
-        p = plot_dir / f"{sample_id}_strand_asymmetry"
-        plot_strand_asymmetry(data, p, sample_id)
-        outputs["strand_asymmetry"] = p.with_suffix(".png")
+        try:
+            data = bio["strand_asymmetry"]
+            p = plot_dir / f"{sample_id}_strand_asymmetry"
+            plot_strand_asymmetry(data, p, sample_id)
+            outputs["strand_asymmetry"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Strand asymmetry plot failed: %s", e)
     else:
         logger.info("SKIPPED: strand asymmetry plot (no strand asymmetry data)")
 
     # Operon co-adaptation
     if "operon_coadaptation" in bio and isinstance(bio["operon_coadaptation"], pd.DataFrame) and not bio["operon_coadaptation"].empty:
-        data = bio["operon_coadaptation"]
-        p = plot_dir / f"{sample_id}_operon_coadaptation"
-        plot_operon_coadaptation(data, p, sample_id)
-        outputs["operon_coadaptation"] = p.with_suffix(".png")
+        try:
+            data = bio["operon_coadaptation"]
+            p = plot_dir / f"{sample_id}_operon_coadaptation"
+            plot_operon_coadaptation(data, p, sample_id)
+            outputs["operon_coadaptation"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Operon coadaptation plot failed: %s", e)
     else:
         logger.info("SKIPPED: operon coadaptation plot (no operon coadaptation data)")
 
     # Growth rate gauge
     if "growth_rate" in bio and isinstance(bio["growth_rate"], dict) and bio["growth_rate"]:
-        data = bio["growth_rate"]
-        p = plot_dir / f"{sample_id}_growth_rate_gauge"
-        plot_growth_rate_gauge(data, p, sample_id)
-        outputs["growth_rate_gauge"] = p.with_suffix(".png")
+        try:
+            data = bio["growth_rate"]
+            p = plot_dir / f"{sample_id}_growth_rate_gauge"
+            plot_growth_rate_gauge(data, p, sample_id)
+            outputs["growth_rate_gauge"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Growth rate gauge plot failed: %s", e)
     else:
         logger.info("SKIPPED: growth rate gauge plot (no growth rate data)")
 
