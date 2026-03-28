@@ -1265,7 +1265,7 @@ def plot_enrichment_dotplot(
         return
 
     # Filter to significant or top results
-    sig = enrichment_df[enrichment_df.get("significant", False) == True].copy()
+    sig = enrichment_df[enrichment_df["significant"]] if "significant" in enrichment_df.columns else enrichment_df.iloc[0:0].copy()
     if sig.empty:
         sig = enrichment_df.nlargest(max_pathways, "fdr").copy()
     else:
@@ -1299,7 +1299,7 @@ def plot_enrichment_dotplot(
     # Labels and formatting
     ax.set_yticks(range(len(sig)))
     pathway_labels = sig.apply(
-        lambda r: r.get("pathway_name", r.get("pathway", ""))[:40],
+        lambda r: str(r.get("pathway_name") or r.get("pathway") or "")[:40],
         axis=1,
     ).values
     ax.set_yticklabels(pathway_labels, fontsize=8)
@@ -1366,8 +1366,9 @@ def plot_enrichment_heatmap(
         comparisons.append((metric_tier, edf))
 
         # Collect significant pathways
-        sig = edf[edf.get("significant", False) == True]
-        all_pathways.update(sig.get("pathway", []))
+        sig = edf[edf["significant"]] if "significant" in edf.columns else edf.iloc[0:0]
+        if "pathway" in sig.columns:
+            all_pathways.update(sig["pathway"].dropna())
 
     if not comparisons or not all_pathways:
         logger.warning("No significant pathways for enrichment heatmap")
@@ -1384,7 +1385,7 @@ def plot_enrichment_heatmap(
     for pathway in all_pathways:
         row = []
         for metric_tier, edf in comparisons:
-            match = edf[edf.get("pathway", None) == pathway]
+            match = edf[edf["pathway"] == pathway] if "pathway" in edf.columns else edf.iloc[0:0]
             if not match.empty:
                 fdr = match.iloc[0].get("fdr", 1.0)
                 neg_log_fdr = -np.log10(max(fdr, 1e-300))
@@ -1392,7 +1393,7 @@ def plot_enrichment_heatmap(
             else:
                 row.append(np.nan)  # White for untested
         matrix.append(row)
-        pathway_name = pathway[:30] if isinstance(pathway, str) else str(pathway)
+        pathway_name = str(pathway)[:30] if pathway is not None else ""
         pathway_names.append(pathway_name)
 
     if not matrix:
@@ -1467,15 +1468,15 @@ def plot_enrichment_summary_bar(
         metric = metric_tier.split("_")[0]
 
         # Get top pathways by significance
-        sig = edf[edf.get("significant", False) == True]
+        sig = edf[edf["significant"]] if "significant" in edf.columns else edf.iloc[0:0]
         if sig.empty:
             sig = edf.nlargest(max_pathways, "fdr")
         else:
             sig = sig.head(max_pathways)
 
         for _, row in sig.iterrows():
-            pathway = row.get("pathway", "")
-            pathway_name = row.get("pathway_name", pathway)[:35]
+            pathway = str(row.get("pathway") or "")
+            pathway_name = str(row.get("pathway_name") or pathway)[:35]
             fdr = row.get("fdr", 1.0)
             neg_log_fdr = -np.log10(max(fdr, 1e-300))
 
@@ -2062,36 +2063,50 @@ def generate_single_genome_plots(
         p = plot_dir / f"{sample_id}_codon_frequency"
         plot_codon_frequency_bar(freq_df, p, sample_id)
         outputs["codon_frequency_bar"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: codon frequency bar plot (no frequency data)")
 
     if rscu_all is not None:
         p = plot_dir / f"{sample_id}_rscu_all"
         plot_rscu_bar(rscu_all, p, sample_id, "All CDS")
         outputs["rscu_bar_all"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: RSCU bar plot — all CDS (no RSCU data)")
 
     if rscu_rp is not None:
         p = plot_dir / f"{sample_id}_rscu_ribosomal"
         plot_rscu_bar(rscu_rp, p, sample_id, "Ribosomal Proteins")
         outputs["rscu_bar_rp"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: RSCU bar plot — ribosomal proteins (no ribosomal RSCU data)")
 
     if rscu_gene_df is not None and not rscu_gene_df.empty:
         p = plot_dir / f"{sample_id}_rscu_heatmap"
         plot_rscu_heatmap_single(rscu_gene_df, p, sample_id)
         outputs["rscu_heatmap"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: RSCU heatmap (no per-gene RSCU data)")
 
     if enc_df is not None and not enc_df.empty:
         p = plot_dir / f"{sample_id}_enc_gc3"
         plot_enc_gc3(enc_df, p, sample_id)
         outputs["enc_gc3"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: ENC vs GC3 plot (no ENC data)")
 
     if encprime_df is not None and not encprime_df.empty and enc_df is not None and not enc_df.empty:
         p = plot_dir / f"{sample_id}_encprime_gc3"
         plot_encprime_gc3(encprime_df, enc_df, p, sample_id)
         outputs["encprime_gc3"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: ENCprime vs GC3 plot (no ENCprime or ENC data)")
 
     if milc_df is not None and not milc_df.empty:
         p = plot_dir / f"{sample_id}_milc_dist"
         plot_milc_distribution(milc_df, p, sample_id)
         outputs["milc_dist"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: MILC distribution plot (no MILC data)")
 
     if expr_df is not None and not expr_df.empty:
         p = plot_dir / f"{sample_id}_expression_dist"
@@ -2104,6 +2119,8 @@ def generate_single_genome_plots(
             p = plot_dir / f"{sample_id}_expression_tiers"
             plot_expression_tier_summary(expr_df, p, sample_id)
             outputs["expression_tiers"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: expression distribution and tier plots (no expression data)")
 
     # Enrichment plots
     if enrichment_results:
@@ -2136,12 +2153,16 @@ def generate_single_genome_plots(
             p = plot_dir / f"{sample_id}_enrichment_heatmap"
             plot_enrichment_heatmap(non_empty, p, sample_id=sample_id)
             outputs["enrichment_heatmap"] = p.with_suffix(".png")
+        else:
+            logger.info("SKIPPED: enrichment heatmap (fewer than 2 non-empty comparisons)")
 
         # Summary bar chart
         if non_empty:
             p = plot_dir / f"{sample_id}_enrichment_summary"
             plot_enrichment_summary_bar(non_empty, p, sample_id=sample_id)
             outputs["enrichment_summary"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: enrichment plots (no enrichment results)")
 
     # ── Advanced analysis plots ──────────────────────────────────────────
     if advanced_results:
@@ -2149,12 +2170,16 @@ def generate_single_genome_plots(
             advanced_results, plot_dir, sample_id, outputs,
             expr_df=expr_df,
         )
+    else:
+        logger.info("SKIPPED: advanced analysis plots (no advanced analysis data)")
 
     # ── Bio/Ecology plots ────────────────────────────────────────────────
     if bio_ecology_results:
         _generate_bio_ecology_plots(
             bio_ecology_results, plot_dir, sample_id, outputs,
         )
+    else:
+        logger.info("SKIPPED: bio/ecology plots (no bio/ecology analysis data)")
 
     return outputs
 
@@ -2178,11 +2203,15 @@ def _generate_advanced_plots(
         p = plot_dir / f"{sample_id}_coa"
         plot_coa(coa_coords, coa_inertia, p, sample_id, color_col=color_col)
         outputs["coa"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: COA plot (no COA data)")
 
     if "coa_codon_coords" in adv:
         p = plot_dir / f"{sample_id}_coa_codons"
         plot_coa_codons(adv["coa_codon_coords"], p, sample_id)
         outputs["coa_codons"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: COA codon plot (no COA codon coordinates)")
 
     # S-value scatter
     if "s_value" in adv and expr_df is not None:
@@ -2192,24 +2221,32 @@ def _generate_advanced_plots(
                 plot_s_value_scatter(adv["s_value"], expr_df, p, sample_id, metric)
                 outputs[f"s_value_vs_{metric.lower()}"] = p.with_suffix(".png")
                 break  # One S-value plot is enough
+    else:
+        logger.info("SKIPPED: S-value scatter plot (no S-value or expression data)")
 
     # ENC - ENC' difference
     if "enc_diff" in adv:
         p = plot_dir / f"{sample_id}_enc_diff"
         plot_enc_diff(adv["enc_diff"], p, sample_id, expr_df=expr_df)
         outputs["enc_diff"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: ENC-ENCprime difference plot (no ENC difference data)")
 
     # Neutrality plot
     if "gc12_gc3" in adv:
         p = plot_dir / f"{sample_id}_neutrality"
         plot_neutrality(adv["gc12_gc3"], p, sample_id)
         outputs["neutrality"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: neutrality plot (no GC12/GC3 data)")
 
     # PR2 plot
     if "pr2" in adv:
         p = plot_dir / f"{sample_id}_pr2"
         plot_pr2(adv["pr2"], p, sample_id, expr_df=expr_df)
         outputs["pr2"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: PR2 plot (no PR2 data)")
 
     # Delta RSCU heatmaps
     for metric in ["CAI", "MELP", "Fop"]:
@@ -2224,18 +2261,24 @@ def _generate_advanced_plots(
         p = plot_dir / f"{sample_id}_trna_codon"
         plot_trna_codon_correlation(adv["trna_codon_correlation"], p, sample_id)
         outputs["trna_codon"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: tRNA-codon correlation plot (no tRNA data)")
 
     # COG enrichment
     if "cog_enrichment" in adv:
         p = plot_dir / f"{sample_id}_cog_enrichment"
         plot_cog_enrichment(adv["cog_enrichment"], p, sample_id)
         outputs["cog_enrichment"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: COG enrichment plot (no COG enrichment data)")
 
     # Gene length vs bias
     if "gene_length_bias" in adv:
         p = plot_dir / f"{sample_id}_gene_length_bias"
         plot_gene_length_vs_bias(adv["gene_length_bias"], p, sample_id)
         outputs["gene_length_bias"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: gene length vs bias plot (no gene length bias data)")
 
 
 def _generate_bio_ecology_plots(
@@ -2251,52 +2294,58 @@ def _generate_bio_ecology_plots(
     """
 
     # HGT scatter
-    if "hgt" in bio:
+    if "hgt" in bio and isinstance(bio["hgt"], pd.DataFrame) and not bio["hgt"].empty:
         data = bio["hgt"]
-        if isinstance(data, pd.DataFrame) and not data.empty:
-            p = plot_dir / f"{sample_id}_hgt_scatter"
-            plot_hgt_scatter(data, p, sample_id)
-            outputs["hgt_scatter"] = p.with_suffix(".png")
+        p = plot_dir / f"{sample_id}_hgt_scatter"
+        plot_hgt_scatter(data, p, sample_id)
+        outputs["hgt_scatter"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: HGT scatter plot (no HGT data)")
 
     # Fop gradient
-    if "fop_gradient" in bio:
+    if "fop_gradient" in bio and isinstance(bio["fop_gradient"], pd.DataFrame) and not bio["fop_gradient"].empty:
         data = bio["fop_gradient"]
-        if isinstance(data, pd.DataFrame) and not data.empty:
-            p = plot_dir / f"{sample_id}_fop_gradient"
-            plot_fop_gradient(data, p, sample_id)
-            outputs["fop_gradient"] = p.with_suffix(".png")
+        p = plot_dir / f"{sample_id}_fop_gradient"
+        plot_fop_gradient(data, p, sample_id)
+        outputs["fop_gradient"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: Fop gradient plot (no Fop gradient data)")
 
     # Position effects
-    if "position_effects" in bio:
+    if "position_effects" in bio and isinstance(bio["position_effects"], pd.DataFrame) and not bio["position_effects"].empty:
         data = bio["position_effects"]
-        if isinstance(data, pd.DataFrame) and not data.empty:
-            p = plot_dir / f"{sample_id}_position_effects"
-            plot_position_effects(data, p, sample_id)
-            outputs["position_effects"] = p.with_suffix(".png")
+        p = plot_dir / f"{sample_id}_position_effects"
+        plot_position_effects(data, p, sample_id)
+        outputs["position_effects"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: codon position effects plot (no position effects data)")
 
     # Strand asymmetry
-    if "strand_asymmetry" in bio:
+    if "strand_asymmetry" in bio and isinstance(bio["strand_asymmetry"], pd.DataFrame) and not bio["strand_asymmetry"].empty:
         data = bio["strand_asymmetry"]
-        if isinstance(data, pd.DataFrame) and not data.empty:
-            p = plot_dir / f"{sample_id}_strand_asymmetry"
-            plot_strand_asymmetry(data, p, sample_id)
-            outputs["strand_asymmetry"] = p.with_suffix(".png")
+        p = plot_dir / f"{sample_id}_strand_asymmetry"
+        plot_strand_asymmetry(data, p, sample_id)
+        outputs["strand_asymmetry"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: strand asymmetry plot (no strand asymmetry data)")
 
     # Operon co-adaptation
-    if "operon_coadaptation" in bio:
+    if "operon_coadaptation" in bio and isinstance(bio["operon_coadaptation"], pd.DataFrame) and not bio["operon_coadaptation"].empty:
         data = bio["operon_coadaptation"]
-        if isinstance(data, pd.DataFrame) and not data.empty:
-            p = plot_dir / f"{sample_id}_operon_coadaptation"
-            plot_operon_coadaptation(data, p, sample_id)
-            outputs["operon_coadaptation"] = p.with_suffix(".png")
+        p = plot_dir / f"{sample_id}_operon_coadaptation"
+        plot_operon_coadaptation(data, p, sample_id)
+        outputs["operon_coadaptation"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: operon coadaptation plot (no operon coadaptation data)")
 
     # Growth rate gauge
-    if "growth_rate" in bio:
+    if "growth_rate" in bio and isinstance(bio["growth_rate"], dict) and bio["growth_rate"]:
         data = bio["growth_rate"]
-        if isinstance(data, dict) and data:
-            p = plot_dir / f"{sample_id}_growth_rate_gauge"
-            plot_growth_rate_gauge(data, p, sample_id)
-            outputs["growth_rate_gauge"] = p.with_suffix(".png")
+        p = plot_dir / f"{sample_id}_growth_rate_gauge"
+        plot_growth_rate_gauge(data, p, sample_id)
+        outputs["growth_rate_gauge"] = p.with_suffix(".png")
+    else:
+        logger.info("SKIPPED: growth rate gauge plot (no growth rate data)")
 
 
 def generate_batch_plots(
