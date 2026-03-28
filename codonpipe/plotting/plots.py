@@ -1284,8 +1284,12 @@ def plot_enrichment_dotplot(
         logger.warning("No pathways to plot in enrichment dotplot")
         return
 
-    # Calculate gene ratio (k/K)
-    sig["gene_ratio"] = sig["k"] / sig["K"]
+    # Calculate gene ratio (k/N): hits in test set / total annotated in test set
+    # Enrichment module uses: k=hits, n=pathway size, N=test set size, M=background size
+    if "k" not in sig.columns or "N" not in sig.columns:
+        logger.warning("SKIPPED: enrichment dotplot (missing k or N columns)")
+        return
+    sig["gene_ratio"] = sig["k"] / sig["N"].replace(0, np.nan)
     sig["neg_log_fdr"] = -np.log10(sig["fdr"].clip(lower=1e-300))
 
     # Sort by gene ratio for better visualization
