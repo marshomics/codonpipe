@@ -55,7 +55,7 @@ def collect_sample_metrics(
         if condition_col and condition_col in batch_df.columns:
             match = batch_df.loc[batch_df["sample_id"] == sid, condition_col]
             if not match.empty:
-                row["condition"] = match.iloc[0]
+                row[condition_col] = match.iloc[0]
 
         # --- RSCU median (genome-level) ---
         _read_rscu_median(paths, row)
