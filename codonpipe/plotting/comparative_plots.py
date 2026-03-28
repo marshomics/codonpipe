@@ -212,7 +212,8 @@ def plot_within_pca(
     if not rscu_cols or condition_col not in metrics_df.columns:
         return
 
-    df = metrics_df.dropna(subset=rscu_cols + [condition_col])
+    df = metrics_df.dropna(subset=[condition_col]).copy()
+    df[rscu_cols] = df[rscu_cols].fillna(0.0)
     if len(df) < 4:
         return
 
@@ -890,7 +891,8 @@ def plot_condition_summary_dashboard(
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in metrics_df.columns]
     ax_pca = fig.add_subplot(gs[0, 0])
     if rscu_cols:
-        df = metrics_df.dropna(subset=rscu_cols + [condition_col])
+        df = metrics_df.dropna(subset=[condition_col]).copy()
+        df[rscu_cols] = df[rscu_cols].fillna(0.0)
         if len(df) >= 4:
             X = StandardScaler().fit_transform(df[rscu_cols].values)
             pca = PCA(n_components=2)
