@@ -240,23 +240,44 @@ def _classify_by_percentile(
     low_pctl: float = 5.0,
     high_pctl: float = 95.0,
 ) -> pd.Series:
-    """Classify a numeric series into high/medium/low by percentile thresholds.
+    """Classify a numeric series into high/medium/low using mean ± 1 SD.
+
+    Uses a distribution-aware approach (mean ± 1 standard deviation) so
+    that metrics with different shapes (normal, skewed, bimodal) produce
+    different tier sizes.  Falls back to fixed percentile thresholds when
+    the SD-based cutoffs would leave a tier empty.
 
     Args:
         series: Score values (NaN-safe).
-        low_pctl: Percentile below which genes are 'low'.
-        high_pctl: Percentile above which genes are 'high'.
+        low_pctl: Fallback percentile for the low threshold.
+        high_pctl: Fallback percentile for the high threshold.
 
     Returns:
         Series of 'high', 'medium', 'low', or 'unknown' labels.
     """
     if series.notna().sum() == 0:
         return pd.Series("unknown", index=series.index)
-    p_lo = np.nanpercentile(series, low_pctl)
-    p_hi = np.nanpercentile(series, high_pctl)
+
+    vals = series.dropna()
+    mu = vals.mean()
+    sd = vals.std()
+
+    # Primary: mean ± 1 SD
+    hi_thresh = mu + sd
+    lo_thresh = mu - sd
+
+    # Per-side fallback: if the SD-based threshold on one side produces
+    # an empty tier, use a percentile cutoff for that side only.  This
+    # keeps the other side distribution-aware while preventing degenerate
+    # tiers on skewed metrics.
+    if (vals >= hi_thresh).sum() == 0:
+        hi_thresh = np.nanpercentile(vals, high_pctl)
+    if (vals <= lo_thresh).sum() == 0:
+        lo_thresh = np.nanpercentile(vals, low_pctl)
+
     return pd.Series(
-        np.where(series >= p_hi, "high",
-                 np.where(series <= p_lo, "low", "medium")),
+        np.where(series >= hi_thresh, "high",
+                 np.where(series <= lo_thresh, "low", "medium")),
         index=series.index,
     )
 
