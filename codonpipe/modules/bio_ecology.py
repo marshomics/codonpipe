@@ -262,6 +262,7 @@ def quantify_translational_selection(
     # Merge RSCU with expression
     merged = rscu_gene_df.merge(expr_df[["gene", "CAI"]], on="gene", how="inner")
     if merged.empty:
+        logger.info("SKIPPED: translational selection (no overlap between RSCU and expression genes)")
         return {
             "optimal_codons": pd.DataFrame(),
             "fop_gradient": pd.DataFrame(),
@@ -272,6 +273,7 @@ def quantify_translational_selection(
     genome_avg_rscu = merged[rscu_cols].mean()
     high_mask = merged["CAI"] >= merged["CAI"].quantile(0.75)
     if high_mask.sum() < 3:
+        logger.info("SKIPPED: optimal codon identification (fewer than 3 high-expression genes)")
         optimal_df = pd.DataFrame()
     else:
         high_avg_rscu = merged.loc[high_mask, rscu_cols].mean()
@@ -432,6 +434,7 @@ def detect_phage_mobile_elements(
         cog_category, cog_description, is_mobilome, is_phage_related, (ko if kofam_df given).
     """
     if hgt_df.empty:
+        logger.info("SKIPPED: phage/mobile element detection (no HGT candidates)")
         return pd.DataFrame()
 
     result = hgt_df[["gene", "mahalanobis_dist", "gc3_deviation", "hgt_flag"]].copy()
@@ -632,10 +635,12 @@ def compute_operon_codon_coadaptation(
         return None
 
     if rscu_gene_df.empty:
+        logger.info("SKIPPED: operon coadaptation (empty RSCU data)")
         return None
 
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
     if not rscu_cols:
+        logger.info("SKIPPED: operon coadaptation (no RSCU columns)")
         return None
 
     # Build RSCU lookup
@@ -726,6 +731,122 @@ def compute_operon_codon_coadaptation(
     return result_df
 
 
+def _build_gene_annotation_map(
+    kofam_df: pd.DataFrame | None = None,
+    cog_result_tsv: Path | str | None = None,
+) -> dict[str, dict[str, str]]:
+    """Build a gene -> annotation dict from KOfam and COG data.
+
+    Returns:
+        Dict mapping gene ID to {"KO": ..., "KO_definition": ...,
+        "COG_ID": ..., "COG_category": ...}. Missing fields are "".
+    """
+    ann: dict[str, dict[str, str]] = {}
+
+    # KOfam annotations
+    if kofam_df is not None and not kofam_df.empty:
+        gene_col = next(
+            (c for c in ("gene_name", "gene", "gene_id") if c in kofam_df.columns),
+            None,
+        )
+        if gene_col and "KO" in kofam_df.columns:
+            ko_def_col = "KO_definition" if "KO_definition" in kofam_df.columns else None
+            for _, row in kofam_df.iterrows():
+                gene = str(row[gene_col])
+                if gene not in ann:
+                    ann[gene] = {"KO": "", "KO_definition": "", "COG_ID": "", "COG_category": ""}
+                ann[gene]["KO"] = str(row["KO"]) if pd.notna(row["KO"]) else ""
+                if ko_def_col and pd.notna(row.get(ko_def_col)):
+                    ann[gene]["KO_definition"] = str(row[ko_def_col])
+
+    # COG annotations
+    if cog_result_tsv is not None:
+        cog_path = Path(cog_result_tsv)
+        if cog_path.exists():
+            try:
+                cog_df = pd.read_csv(cog_path, sep="\t")
+
+                # Find query column
+                query_col = None
+                for candidate in ["QUERY_ID", "query_id", "Query", "query",
+                                   "gene_id", "protein_id"]:
+                    if candidate in cog_df.columns:
+                        query_col = candidate
+                        break
+                if query_col is None:
+                    query_col = cog_df.columns[0]
+
+                # Find COG ID column
+                cog_id_col = None
+                for candidate in ["COG_ID", "COG", "cog_id", "COG_id", "best_hit_cog"]:
+                    if candidate in cog_df.columns:
+                        cog_id_col = candidate
+                        break
+                if cog_id_col is None:
+                    for col in cog_df.columns:
+                        vals = cog_df[col].dropna().astype(str).head(20)
+                        if vals.str.match(r"^COG\d+$").any():
+                            cog_id_col = col
+                            break
+
+                # Find functional category column
+                func_col = None
+                for candidate in ["FUNCTIONAL_CATEGORY", "functional_category",
+                                   "COG_category", "cog_category", "LETTER", "letter"]:
+                    if candidate in cog_df.columns:
+                        func_col = candidate
+                        break
+                if func_col is None:
+                    for col in cog_df.columns:
+                        vals = cog_df[col].dropna().astype(str)
+                        if vals.str.match(r"^[A-Z]$").mean() > 0.5:
+                            func_col = col
+                            break
+
+                for _, row in cog_df.iterrows():
+                    gene = str(row[query_col])
+                    if gene not in ann:
+                        ann[gene] = {"KO": "", "KO_definition": "", "COG_ID": "", "COG_category": ""}
+                    if cog_id_col and pd.notna(row.get(cog_id_col)):
+                        ann[gene]["COG_ID"] = str(row[cog_id_col])
+                    if func_col and pd.notna(row.get(func_col)):
+                        ann[gene]["COG_category"] = str(row[func_col])
+            except Exception as e:
+                logger.warning("Error building COG annotation map: %s", e)
+
+    return ann
+
+
+def _annotate_df(
+    df: pd.DataFrame,
+    ann_map: dict[str, dict[str, str]],
+    gene_col: str = "gene",
+) -> pd.DataFrame:
+    """Merge KO/COG annotations into a DataFrame by gene column.
+
+    Adds columns: KO, KO_definition, COG_ID, COG_category.
+    For operon tables with gene1/gene2, call once per gene column.
+    """
+    if df.empty or not ann_map or gene_col not in df.columns:
+        return df
+
+    ann_cols = ["KO", "KO_definition", "COG_ID", "COG_category"]
+
+    # If annotating gene1/gene2 (operon table), prefix columns
+    suffix = ""
+    if gene_col != "gene":
+        suffix = f"_{gene_col}"  # e.g., _gene1, _gene2
+
+    for col_name in ann_cols:
+        out_col = f"{col_name}{suffix}"
+        if out_col not in df.columns:
+            df[out_col] = df[gene_col].map(
+                lambda g, cn=col_name: ann_map.get(str(g), {}).get(cn, "")
+            )
+
+    return df
+
+
 def run_bio_ecology_analyses(
     ffn_path: Path,
     output_dir: Path,
@@ -763,11 +884,19 @@ def run_bio_ecology_analyses(
     eco_dir.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, pd.DataFrame | Path | dict] = {}
 
+    # Build gene annotation lookup (KO + COG) for annotating output tables
+    ann_map = _build_gene_annotation_map(kofam_df, cog_result_tsv)
+    if ann_map:
+        logger.info("Built annotation map with %d genes (KO + COG)", len(ann_map))
+    else:
+        logger.info("SKIPPED: gene annotation map (no KOfam or COG data available)")
+
     # 1. HGT detection
     logger.info("Detecting HGT candidates for %s", sample_id)
     try:
         hgt_df = detect_hgt_candidates(rscu_gene_df, enc_df, expr_df)
         if not hgt_df.empty:
+            hgt_df = _annotate_df(hgt_df, ann_map, "gene")
             out_path = eco_dir / f"{sample_id}_hgt_candidates.tsv"
             hgt_df.to_csv(out_path, sep="\t", index=False)
             outputs["hgt_candidates"] = hgt_df
@@ -786,6 +915,10 @@ def run_bio_ecology_analyses(
                 logger.info("Growth rate prediction: %.2f h (class: %s)",
                            growth_result["predicted_doubling_time_hours"],
                            growth_result["growth_class"])
+            else:
+                logger.info("SKIPPED: growth rate prediction (no CAI data or ribosomal protein genes)")
+        else:
+            logger.info("SKIPPED: growth rate prediction (no expression data)")
     except Exception as e:
         logger.warning("Growth rate prediction failed: %s", e)
 
@@ -799,6 +932,9 @@ def run_bio_ecology_analyses(
             trans_sel_outputs = {}
             for key, df in trans_sel.items():
                 if not df.empty:
+                    # Annotate gene-level tables with KO/COG
+                    if "gene" in df.columns:
+                        df = _annotate_df(df, ann_map, "gene")
                     out_path = eco_dir / f"{sample_id}_translational_selection_{key}.tsv"
                     df.to_csv(out_path, sep="\t", index=False)
                     trans_sel_outputs[key] = df
@@ -806,23 +942,36 @@ def run_bio_ecology_analyses(
             if trans_sel_outputs:
                 outputs["translational_selection"] = trans_sel_outputs
                 logger.info("Translational selection complete")
+            else:
+                logger.info("SKIPPED: translational selection analysis (all sub-analyses returned empty)")
+        else:
+            logger.info("SKIPPED: translational selection analysis (no expression data)")
     except Exception as e:
         logger.warning("Translational selection analysis failed: %s", e)
 
     # 4. Phage/mobile element detection
     logger.info("Detecting phage/mobile elements for %s", sample_id)
     try:
-        if not outputs.get("hgt_candidates_path"):
+        if "hgt_candidates" in outputs:
+            hgt_df = outputs["hgt_candidates"]
+        else:
             # Need HGT results first
             hgt_df = detect_hgt_candidates(rscu_gene_df, enc_df, expr_df)
-        phage_df = detect_phage_mobile_elements(hgt_df, cog_result_tsv, kofam_df)
-        if not phage_df.empty:
-            out_path = eco_dir / f"{sample_id}_phage_mobile_elements.tsv"
-            phage_df.to_csv(out_path, sep="\t", index=False)
-            outputs["phage_mobile_elements"] = phage_df
-            outputs["phage_mobile_elements_path"] = out_path
-            logger.info("Phage/mobile detection complete: %d mobilome, %d phage-related",
-                       phage_df["is_mobilome"].sum(), phage_df["is_phage_related"].sum())
+
+        if not hgt_df.empty:
+            phage_df = detect_phage_mobile_elements(hgt_df, cog_result_tsv, kofam_df)
+            if not phage_df.empty:
+                phage_df = _annotate_df(phage_df, ann_map, "gene")
+                out_path = eco_dir / f"{sample_id}_phage_mobile_elements.tsv"
+                phage_df.to_csv(out_path, sep="\t", index=False)
+                outputs["phage_mobile_elements"] = phage_df
+                outputs["phage_mobile_elements_path"] = out_path
+                logger.info("Phage/mobile detection complete: %d mobilome, %d phage-related",
+                           phage_df["is_mobilome"].sum(), phage_df["is_phage_related"].sum())
+            else:
+                logger.info("SKIPPED: phage/mobile element detection (no mobilome or phage genes found)")
+        else:
+            logger.info("SKIPPED: phage/mobile element detection (no HGT candidates)")
     except Exception as e:
         logger.warning("Phage/mobile element detection failed: %s", e)
 
@@ -836,6 +985,10 @@ def run_bio_ecology_analyses(
             outputs["strand_asymmetry"] = strand_df
             outputs["strand_asymmetry_path"] = out_path
             logger.info("Strand asymmetry complete: %d codons analyzed", len(strand_df))
+        elif strand_df is None:
+            logger.info("SKIPPED: strand asymmetry analysis (no GFF or no strand data)")
+        else:
+            logger.info("SKIPPED: strand asymmetry analysis (no significant strand differences found)")
     except Exception as e:
         logger.warning("Strand asymmetry analysis failed: %s", e)
 
@@ -844,11 +997,17 @@ def run_bio_ecology_analyses(
     try:
         operon_df = compute_operon_codon_coadaptation(rscu_gene_df, gff_path)
         if operon_df is not None and not operon_df.empty:
+            operon_df = _annotate_df(operon_df, ann_map, "gene1")
+            operon_df = _annotate_df(operon_df, ann_map, "gene2")
             out_path = eco_dir / f"{sample_id}_operon_coadaptation.tsv"
             operon_df.to_csv(out_path, sep="\t", index=False)
             outputs["operon_coadaptation"] = operon_df
             outputs["operon_coadaptation_path"] = out_path
             logger.info("Operon coadaptation complete: %d gene pairs", len(operon_df))
+        elif operon_df is None:
+            logger.info("SKIPPED: operon coadaptation analysis (no GFF or insufficient data)")
+        else:
+            logger.info("SKIPPED: operon coadaptation analysis (no adjacent gene pairs found)")
     except Exception as e:
         logger.warning("Operon coadaptation analysis failed: %s", e)
 
