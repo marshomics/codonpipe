@@ -398,30 +398,40 @@ def quantify_translational_selection(
         quintiles.append((q + 1, set(q_genes)))
 
     fop_rows = []
-    for q_num, q_genes in quintiles:
-        q_mask = merged["gene"].isin(q_genes)
-        q_rscu = merged.loc[q_mask, rscu_cols]
+    # Build set of optimal codons (RNA triplets)
+    if not optimal_df.empty:
+        optimal_codons_set = set(
+            optimal_df.loc[optimal_df["is_optimal"] > 0, "codon"]
+        )
+    else:
+        optimal_codons_set = set()
 
-        if not q_rscu.empty and not optimal_df.empty:
-            optimal_codons = set(optimal_df.loc[optimal_df["is_optimal"] > 0, "codon"])
-            # Approximate Fop: fraction of optimal codons' RSCU
-            fop_vals = []
-            for _, row in q_rscu.iterrows():
-                total_rscu = row.sum()
-                opt_rscu = 0
-                for col in rscu_cols:
-                    codon = RSCU_COL_TO_CODON[col]
-                    if codon in optimal_codons:
-                        opt_rscu += row[col]
-                if total_rscu > 0:
-                    fop_vals.append(opt_rscu / total_rscu)
-            if fop_vals:
-                fop_rows.append({
-                    "quintile": q_num,
-                    "mean_fop": round(np.mean(fop_vals), 4),
-                    "std_fop": round(np.std(fop_vals), 4),
-                    "n_genes": len(fop_vals),
-                })
+    for q_num, q_genes in quintiles:
+        if not optimal_codons_set:
+            break
+
+        # Compute true Fop per gene from actual codon counts
+        fop_vals = []
+        for rec in SeqIO.parse(str(ffn_path), "fasta"):
+            if rec.id not in q_genes:
+                continue
+            seq = str(rec.seq)
+            if len(seq) < 240:
+                continue
+            gene_counts = count_codons(seq)
+            n_opt = sum(gene_counts.get(c, 0) for c in optimal_codons_set
+                        if c in SENSE_CODONS)
+            n_total = sum(gene_counts.get(c, 0) for c in SENSE_CODONS)
+            if n_total > 0:
+                fop_vals.append(n_opt / n_total)
+
+        if fop_vals:
+            fop_rows.append({
+                "quintile": q_num,
+                "mean_fop": round(np.mean(fop_vals), 4),
+                "std_fop": round(np.std(fop_vals), 4),
+                "n_genes": len(fop_vals),
+            })
 
     fop_gradient_df = pd.DataFrame(fop_rows)
 
@@ -679,7 +689,9 @@ def compute_strand_asymmetry(
         minus_vals = [v for v in minus_rscu[col] if not np.isnan(v)]
 
         if len(plus_vals) > 1 and len(minus_vals) > 1:
-            u_stat, p_val = stats.mannwhitneyu(plus_vals, minus_vals)
+            u_stat, p_val = stats.mannwhitneyu(
+                plus_vals, minus_vals, alternative="two-sided"
+            )
             codon = RSCU_COL_TO_CODON[col]
             aa = col.split("-")[0]
             rows.append({
@@ -787,19 +799,27 @@ def compute_operon_codon_coadaptation(
 
     result_df = pd.DataFrame(rows)
 
-    # Random baseline: shuffle gene order and recompute distances
-    random_dists = []
+    # Permutation baseline: shuffle gene order many times and collect
+    # pairwise distances to build a null distribution for comparison.
+    rng = np.random.RandomState(42)
     random_genes = list(rscu_map.keys())
-    np.random.shuffle(random_genes)
-    for i in range(min(100, len(random_genes) - 1)):
-        g1, g2 = random_genes[i], random_genes[i + 1]
-        rscu_dist = euclidean(rscu_map[g1], rscu_map[g2])
-        random_dists.append(rscu_dist)
+    random_dists = []
+    n_permutations = 100
+    for _ in range(n_permutations):
+        rng.shuffle(random_genes)
+        for i in range(min(len(random_genes) - 1, len(result_df))):
+            g1, g2 = random_genes[i], random_genes[i + 1]
+            random_dists.append(euclidean(rscu_map[g1], rscu_map[g2]))
 
-    median_random = np.median(random_dists) if random_dists else np.inf
-    result_df["same_operon_prediction"] = (
-        result_df["rscu_distance"] < median_random
-    )
+    if random_dists:
+        median_random = np.median(random_dists)
+        result_df["same_operon_prediction"] = (
+            result_df["rscu_distance"] < median_random
+        )
+        result_df["random_baseline_median"] = median_random
+    else:
+        result_df["same_operon_prediction"] = False
+        result_df["random_baseline_median"] = np.nan
 
     logger.info("Operon coadaptation: analyzed %d gene pairs", len(result_df))
 
