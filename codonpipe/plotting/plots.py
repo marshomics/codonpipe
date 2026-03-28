@@ -1,12 +1,14 @@
 """Publication-ready plotting module for codon usage analysis.
 
-Generates figures at 300 DPI in PNG and optionally EPS format.
+Generates figures at 300 DPI in PNG and SVG 1.1 format.
+SVG output uses embedded fonts for full editability in Adobe Illustrator.
 All plots use a consistent style suitable for journal submission.
 """
 
 from __future__ import annotations
 
 import logging
+import warnings
 from pathlib import Path
 
 import matplotlib
@@ -46,10 +48,13 @@ STYLE_PARAMS = {
     "savefig.dpi": 300,
     "savefig.bbox": "tight",
     "savefig.pad_inches": 0.1,
+    # SVG settings: embed fonts so glyphs render correctly in Illustrator
+    # without requiring the font to be installed on the editing machine.
+    "svg.fonttype": "none",  # output text as <text> elements (editable in AI)
 }
 
 DPI = 300
-FORMATS = ["png", "eps"]
+FORMATS = ["png", "svg"]
 
 
 def _apply_style():
@@ -303,26 +308,29 @@ def plot_rscu_heatmap_single(rscu_df: pd.DataFrame, output_path: Path, sample_id
         return
 
     data = rscu_df[rscu_cols].values
-    # Cap at 500 genes for readability
+    # Cap at 500 genes for readability (deterministic for reproducibility)
     if len(data) > 500:
-        idx = np.random.choice(len(data), 500, replace=False)
+        rng = np.random.RandomState(42)
+        idx = rng.choice(len(data), 500, replace=False)
         data = data[idx]
 
     fig = plt.figure(figsize=(14, min(10, max(5, len(data) // 30))))
-    g = sns.clustermap(
-        pd.DataFrame(data, columns=[c.split("-")[-1] for c in rscu_cols]),
-        cmap="RdYlBu_r",
-        center=1.0,
-        row_cluster=True,
-        col_cluster=True,
-        method="average",
-        metric="euclidean",
-        linewidths=0,
-        xticklabels=True,
-        yticklabels=False,
-        figsize=(14, min(10, max(5, len(data) // 30))),
-        cbar_kws={"label": "RSCU"},
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Clustering large matrix")
+        g = sns.clustermap(
+            pd.DataFrame(data, columns=[c.split("-")[-1] for c in rscu_cols]),
+            cmap="RdYlBu_r",
+            center=1.0,
+            row_cluster=True,
+            col_cluster=True,
+            method="average",
+            metric="euclidean",
+            linewidths=0,
+            xticklabels=True,
+            yticklabels=False,
+            figsize=(14, min(10, max(5, len(data) // 30))),
+            cbar_kws={"label": "RSCU"},
+        )
     if sample_id:
         g.fig.suptitle(f"Per-Gene RSCU Heatmap — {sample_id}", y=1.02)
     _save_fig(g.fig, output_path)
@@ -499,21 +507,23 @@ def plot_heatmap_clustered(
         cmap = dict(zip(unique_groups, palette))
         row_colors = groups.map(cmap)
 
-    g = sns.clustermap(
-        data,
-        cmap="RdYlGn_r",
-        center=1.0,
-        method="complete",
-        metric="manhattan",
-        row_cluster=True,
-        col_cluster=True,
-        xticklabels=col_labels,
-        yticklabels=False,
-        row_colors=row_colors,
-        figsize=(14, min(12, max(6, len(data) // 100))),
-        linewidths=0,
-        cbar_kws={"label": "RSCU"},
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Clustering large matrix")
+        g = sns.clustermap(
+            data,
+            cmap="RdYlGn_r",
+            center=1.0,
+            method="complete",
+            metric="manhattan",
+            row_cluster=True,
+            col_cluster=True,
+            xticklabels=col_labels,
+            yticklabels=False,
+            row_colors=row_colors,
+            figsize=(14, min(12, max(6, len(data) // 100))),
+            linewidths=0,
+            cbar_kws={"label": "RSCU"},
+        )
     g.fig.suptitle(title, y=1.02)
     _save_fig(g.fig, output_path)
 
@@ -1088,7 +1098,7 @@ def plot_trna_codon_correlation(
     # Correlation
     valid = df[df["tRNA_copy_number"] > 0]
     if len(valid) > 5:
-        r, p_val = stats.pearsonr(valid["tRNA_copy_number"], valid[rscu_col])
+        r, p_val = stats.spearmanr(valid["tRNA_copy_number"], valid[rscu_col])
         ax.set_xlabel(f"tRNA Gene Copy Number")
         label_text = "high-expression genes" if rscu_col == "rscu_high_expr" else "all genes"
         ax.set_ylabel(f"RSCU ({label_text})")
@@ -1108,8 +1118,8 @@ def plot_trna_codon_correlation(
         df2 = trna_corr_df.dropna(subset=["tRNA_copy_number", "rscu_high_expr", "rscu_low_expr"])
         valid2 = df2[df2["tRNA_copy_number"] > 0]
         if len(valid2) > 5:
-            r_hi, p_hi = stats.pearsonr(valid2["tRNA_copy_number"], valid2["rscu_high_expr"])
-            r_lo, p_lo = stats.pearsonr(valid2["tRNA_copy_number"], valid2["rscu_low_expr"])
+            r_hi, p_hi = stats.spearmanr(valid2["tRNA_copy_number"], valid2["rscu_high_expr"])
+            r_lo, p_lo = stats.spearmanr(valid2["tRNA_copy_number"], valid2["rscu_low_expr"])
             ax.scatter(valid2["tRNA_copy_number"], valid2["rscu_high_expr"],
                        s=25, alpha=0.6, c="#d62728", label=f"High (r={r_hi:.3f})", edgecolors="none")
             ax.scatter(valid2["tRNA_copy_number"], valid2["rscu_low_expr"],
@@ -1234,7 +1244,7 @@ def plot_gene_length_vs_bias(
             ax.plot(bin_centers, bin_medians, "k-", linewidth=1.5, alpha=0.8, label="Binned median")
 
         # Correlation
-        r, p_val = stats.pearsonr(length_kb, valid[metric])
+        r, p_val = stats.spearmanr(length_kb, valid[metric])
         ax.set_title(f"{metric} (r = {r:.3f})")
         ax.set_xlabel("Gene Length (kb)")
         ax.set_ylabel(metric)
@@ -1584,7 +1594,7 @@ def plot_hgt_scatter(
     has_expr = "expression_class" in hgt_df.columns
 
     # Plot non-HGT candidates
-    non_hgt = hgt_df[hgt_df.get("hgt_flag", False) == False]
+    non_hgt = hgt_df[~hgt_df["hgt_flag"]] if "hgt_flag" in hgt_df.columns else hgt_df
     if not non_hgt.empty:
         ax.scatter(
             non_hgt.get("gc3_deviation", 0),
@@ -1598,7 +1608,7 @@ def plot_hgt_scatter(
         )
 
     # Plot HGT candidates
-    hgt = hgt_df[hgt_df.get("hgt_flag", False) == True]
+    hgt = hgt_df[hgt_df["hgt_flag"]] if "hgt_flag" in hgt_df.columns else pd.DataFrame()
     if not hgt.empty:
         if has_expr:
             for expr_class in ["high", "medium", "low"]:
@@ -1804,21 +1814,23 @@ def plot_position_effects(
             patch.set_facecolor(color)
             patch.set_alpha(0.7)
 
-        # Wilcoxon signed-rank test: 5' vs others
+        # Mann-Whitney U test: 5' vs other regions (independent samples)
         if "position" not in data.columns:
             continue
         for pos2, label2 in zip(["middle", "3prime"], ["5' vs Middle", "5' vs 3'"]):
             data5 = data[data["position"] == "5prime"]["fop"].dropna()
             data2 = data[data["position"] == pos2]["fop"].dropna()
 
-            if len(data5) > 0 and len(data2) > 0:
+            if len(data5) > 2 and len(data2) > 2:
                 try:
-                    stat, pval = stats.wilcoxon(data5, data2)
+                    stat, pval = stats.mannwhitneyu(
+                        data5, data2, alternative="two-sided"
+                    )
                     sig_str = f"p={pval:.3e}"
                     axis.text(0.5, 0.95 - (0.1 if label2 == "5' vs 3'" else 0.05), sig_str,
                              transform=axis.transAxes, fontsize=8, ha="center",
                              bbox=dict(boxstyle="round", facecolor="yellow", alpha=0.3))
-                except:
+                except Exception:
                     pass
 
         axis.set_ylabel("Fop", fontsize=10)
@@ -2078,7 +2090,10 @@ def plot_growth_rate_gauge(
         title_str += f" — {sample_id}"
     fig.suptitle(title_str, fontsize=13, weight="bold")
 
-    fig.tight_layout()
+    # GridSpec already controls spacing; bbox_inches="tight" in _save_fig
+    # handles final cropping, so tight_layout() is unnecessary here and
+    # would warn about incompatible axes.
+    gs.tight_layout(fig, rect=[0, 0, 1, 0.95])
     _save_fig(fig, output_path)
 
 
