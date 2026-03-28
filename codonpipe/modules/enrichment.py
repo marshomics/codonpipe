@@ -395,7 +395,7 @@ def _find_ko_column(df: pd.DataFrame) -> str | None:
 
 def _find_gene_column(df: pd.DataFrame) -> str | None:
     """Find the gene ID column in a KofamScan DataFrame."""
-    for col in ("gene", "gene_id", "query", "query_id"):
+    for col in ("gene_name", "gene", "gene_id", "query", "query_id"):
         if col in df.columns:
             return col
     return None
