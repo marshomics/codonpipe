@@ -35,6 +35,8 @@ rp <- list(rp = rp_ids)
 
 tryCatch({{
     fasta <- readSet(file = fasta_file)
+    # Strip FASTA headers to first word so IDs match rp_ids
+    names(fasta) <- sub(" .*", "", names(fasta))
     codons <- codonTable(fasta)
     codons@KO <- codons@ID
 
@@ -73,6 +75,8 @@ rp <- list(rp = rp_ids)
 
 tryCatch({{
     fasta <- readSet(file = fasta_file)
+    # Strip FASTA headers to first word so IDs match rp_ids
+    names(fasta) <- sub(" .*", "", names(fasta))
     codons <- codonTable(fasta)
     codons@KO <- codons@ID
 
@@ -111,6 +115,8 @@ rp <- list(rp = rp_ids)
 
 tryCatch({{
     fasta <- readSet(file = fasta_file)
+    # Strip FASTA headers to first word so IDs match rp_ids
+    names(fasta) <- sub(" .*", "", names(fasta))
     codons <- codonTable(fasta)
     codons@KO <- codons@ID
 
