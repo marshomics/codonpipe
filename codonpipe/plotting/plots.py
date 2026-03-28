@@ -1866,10 +1866,12 @@ def plot_strand_asymmetry(
     if strand_df.empty or "rscu_plus" not in strand_df.columns:
         return
 
-    # BH correction for multiple testing
-    from scipy.stats import rankdata
-
-    if "p_value" in strand_df.columns:
+    # Use pre-computed FDR-adjusted p-values from bio_ecology if available;
+    # otherwise fall back to BH correction here for backward compatibility.
+    if "p_adjusted" in strand_df.columns and "significant" in strand_df.columns:
+        pass  # already corrected upstream
+    elif "p_value" in strand_df.columns:
+        from scipy.stats import rankdata
         n_tests = len(strand_df)
         ranks = rankdata(strand_df["p_value"])
         strand_df = strand_df.copy()
