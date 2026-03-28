@@ -159,7 +159,7 @@ def _read_enc_summary(paths: dict, row: dict) -> None:
 def _read_growth_rate(paths: dict, row: dict) -> None:
     """Read growth rate prediction (stored as a single-row TSV or in bio outputs)."""
     # Try bio ecology output path pattern
-    for key in ("bio_growth_rate_prediction", "growth_rate_prediction"):
+    for key in ("bio_growth_rate_prediction_path", "bio_growth_rate_prediction", "growth_rate_prediction"):
         p = paths.get(key)
         if p and Path(p).exists():
             try:
@@ -176,7 +176,7 @@ def _read_growth_rate(paths: dict, row: dict) -> None:
 
 
 def _read_hgt_summary(paths: dict, row: dict) -> None:
-    for key in ("bio_hgt_candidates", "hgt_candidates"):
+    for key in ("bio_hgt_candidates_path", "bio_hgt_candidates", "hgt_candidates"):
         p = paths.get(key)
         if p and Path(p).exists():
             try:
@@ -202,7 +202,7 @@ def _read_hgt_summary(paths: dict, row: dict) -> None:
 
 
 def _read_strand_asymmetry(paths: dict, row: dict) -> None:
-    for key in ("bio_strand_asymmetry", "strand_asymmetry"):
+    for key in ("bio_strand_asymmetry_path", "bio_strand_asymmetry", "strand_asymmetry"):
         p = paths.get(key)
         if p and Path(p).exists():
             try:
@@ -219,7 +219,7 @@ def _read_strand_asymmetry(paths: dict, row: dict) -> None:
 
 
 def _read_operon_summary(paths: dict, row: dict) -> None:
-    for key in ("bio_operon_coadaptation", "operon_coadaptation"):
+    for key in ("bio_operon_coadaptation_path", "bio_operon_coadaptation", "operon_coadaptation"):
         p = paths.get(key)
         if p and Path(p).exists():
             try:
@@ -275,7 +275,7 @@ def _read_s_value(paths: dict, row: dict) -> None:
 def _read_translational_selection(paths: dict, row: dict) -> None:
     """Read translational selection metrics from fop_gradient and position_effects."""
     # Read fop_gradient (quintile analysis)
-    p_grad = paths.get("bio_trans_sel_fop_gradient")
+    p_grad = paths.get("bio_trans_sel_fop_gradient_path") or paths.get("bio_trans_sel_fop_gradient")
     if p_grad and Path(p_grad).exists():
         try:
             df = pd.read_csv(p_grad, sep="\t")
@@ -291,7 +291,7 @@ def _read_translational_selection(paths: dict, row: dict) -> None:
             pass
 
     # Read position_effects (5prime, middle, 3prime)
-    p_pos = paths.get("bio_trans_sel_position_effects")
+    p_pos = paths.get("bio_trans_sel_position_effects_path") or paths.get("bio_trans_sel_position_effects")
     if p_pos and Path(p_pos).exists():
         try:
             df = pd.read_csv(p_pos, sep="\t")
@@ -400,7 +400,7 @@ def _read_enrichment_summary(paths: dict, row: dict) -> None:
 
 def _read_phage_mobile_summary(paths: dict, row: dict) -> None:
     """Read phage/mobile element detection results."""
-    for key in ("bio_phage_mobile_elements", "phage_mobile_elements"):
+    for key in ("bio_phage_mobile_elements_path", "bio_phage_mobile_elements", "phage_mobile_elements"):
         p = paths.get(key)
         if p and Path(p).exists():
             try:
@@ -420,7 +420,7 @@ def _read_phage_mobile_summary(paths: dict, row: dict) -> None:
 
 def _read_hgt_mahalanobis(paths: dict, row: dict) -> None:
     """Read mean Mahalanobis distance from HGT results as genome heterogeneity metric."""
-    for key in ("bio_hgt_candidates", "hgt_candidates"):
+    for key in ("bio_hgt_candidates_path", "bio_hgt_candidates", "hgt_candidates"):
         p = paths.get(key)
         if p and Path(p).exists():
             try:
@@ -1126,7 +1126,7 @@ def between_condition_strand_asymmetry_patterns(
     for sid, paths in sample_outputs.items():
         if sid not in sid_cond:
             continue
-        for key in ("bio_strand_asymmetry", "strand_asymmetry"):
+        for key in ("bio_strand_asymmetry_path", "bio_strand_asymmetry", "strand_asymmetry"):
             p = paths.get(key)
             if p and Path(p).exists():
                 try:
@@ -1224,7 +1224,7 @@ def between_condition_optimal_codons(
     for sid, paths in sample_outputs.items():
         if sid not in sid_cond:
             continue
-        for key in ("bio_trans_sel_optimal_codons",):
+        for key in ("bio_trans_sel_optimal_codons_path", "bio_trans_sel_optimal_codons"):
             p = paths.get(key)
             if p and Path(p).exists():
                 try:
@@ -1290,7 +1290,7 @@ def between_condition_hgt_burden(
     for sid, paths in sample_outputs.items():
         if sid not in sid_cond:
             continue
-        for key in ("bio_hgt_candidates", "hgt_candidates"):
+        for key in ("bio_hgt_candidates_path", "bio_hgt_candidates", "hgt_candidates"):
             p = paths.get(key)
             if p and Path(p).exists():
                 try:
