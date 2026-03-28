@@ -1185,6 +1185,516 @@ def plot_operon_coadaptation_comparison(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# BIO/ECOLOGY BETWEEN-CONDITION PLOTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def plot_hgt_burden_comparison(
+    hgt_burden: dict,
+    metrics_df: pd.DataFrame,
+    condition_col: str,
+    output_path: Path,
+) -> None:
+    """Two-panel comparison of HGT burden between conditions.
+
+    Left: box+strip of median Mahalanobis distance per sample.
+    Right: box+strip of HGT candidate fraction per sample.
+    Both annotated with Mann-Whitney U p-value and Cliff's delta.
+    """
+    _apply_style()
+    conditions = metrics_df[condition_col].dropna().unique()
+    colors = _condition_colors(list(conditions))
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    panels = [
+        ("mahalanobis", "median_mahalanobis_dist", "Median Mahalanobis Distance",
+         "Genomic RSCU Heterogeneity"),
+        ("hgt_fraction", "hgt_fraction", "HGT Candidate Fraction",
+         "Proportion of Genes Flagged as HGT"),
+    ]
+
+    for ax, (burden_key, metric_col, ylabel, title) in zip(axes, panels):
+        if metric_col in metrics_df.columns:
+            plot_data = metrics_df[[condition_col, metric_col]].dropna()
+            if not plot_data.empty:
+                order = sorted(conditions)
+                sns.boxplot(
+                    data=plot_data, x=condition_col, y=metric_col,
+                    order=order, palette=colors, ax=ax, width=0.5,
+                    hue=condition_col, hue_order=order, legend=False,
+                    boxprops=dict(alpha=0.6), showfliers=False,
+                )
+                sns.stripplot(
+                    data=plot_data, x=condition_col, y=metric_col,
+                    order=order, palette=colors, ax=ax,
+                    hue=condition_col, hue_order=order, legend=False,
+                    size=6, alpha=0.7, jitter=0.15,
+                )
+                ax.set_ylabel(ylabel, fontsize=10)
+                ax.set_title(title, fontsize=11)
+
+                # Annotate with test results
+                if burden_key in hgt_burden:
+                    info = hgt_burden[burden_key]
+                    p_val = info.get("p_value", 1)
+                    delta = info.get("cliffs_delta", 0)
+                    label = info.get("effect_size", "")
+                    sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else "ns"
+                    ax.text(0.5, 0.98, f"p = {p_val:.3e}  |  δ = {delta:.3f} ({label}) {sig}",
+                            transform=ax.transAxes, ha="center", va="top", fontsize=9,
+                            bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray", alpha=0.8))
+        else:
+            ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center", va="center")
+            ax.set_title(title, fontsize=11)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_phage_mobile_comparison(
+    metrics_df: pd.DataFrame,
+    condition_col: str,
+    between_tests_df: pd.DataFrame | None,
+    output_path: Path,
+) -> None:
+    """Bar+strip comparison of phage/mobile element counts between conditions."""
+    _apply_style()
+    # Check for phage-related columns
+    phage_cols = [c for c in ("n_phage_mobile", "n_mobilome", "n_phage") if c in metrics_df.columns]
+    if not phage_cols:
+        return
+
+    conditions = sorted(metrics_df[condition_col].dropna().unique())
+    colors = _condition_colors(list(conditions))
+    n_panels = len(phage_cols)
+    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 5))
+    if n_panels == 1:
+        axes = [axes]
+
+    labels = {
+        "n_phage_mobile": "Phage/Mobile Element Genes",
+        "n_mobilome": "Mobilome Genes (COG X)",
+        "n_phage": "Phage-Related Genes",
+    }
+
+    for ax, col in zip(axes, phage_cols):
+        plot_data = metrics_df[[condition_col, col]].dropna()
+        if plot_data.empty:
+            continue
+        sns.boxplot(
+            data=plot_data, x=condition_col, y=col,
+            order=conditions, palette=colors, ax=ax, width=0.5,
+            hue=condition_col, hue_order=conditions, legend=False,
+            boxprops=dict(alpha=0.6), showfliers=False,
+        )
+        sns.stripplot(
+            data=plot_data, x=condition_col, y=col,
+            order=conditions, palette=colors, ax=ax,
+            hue=condition_col, hue_order=conditions, legend=False,
+            size=6, alpha=0.7, jitter=0.15,
+        )
+        ax.set_ylabel(labels.get(col, col), fontsize=10)
+        ax.set_title(labels.get(col, col), fontsize=11)
+
+        # Add significance from between_tests if available
+        if between_tests_df is not None and not between_tests_df.empty:
+            match = between_tests_df[between_tests_df["metric"] == col]
+            if not match.empty:
+                p_val = match.iloc[0].get("p_adjusted", match.iloc[0].get("p_value", 1))
+                delta = match.iloc[0].get("cliffs_delta", 0)
+                sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else "ns"
+                ax.text(0.5, 0.98, f"p = {p_val:.3e}  |  δ = {delta:.3f} {sig}",
+                        transform=ax.transAxes, ha="center", va="top", fontsize=9,
+                        bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray", alpha=0.8))
+
+    fig.suptitle("Phage & Mobile Element Comparison", fontsize=13, y=1.02)
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_optimal_codon_divergence(
+    optimal_codons_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """Dot plot showing which codons are optimal in each condition.
+
+    X-axis: delta-RSCU in condition A, Y-axis: delta-RSCU in condition B.
+    Points are colored by agreement (green = same, red = divergent).
+    Quadrant lines at 0 divide optimal/non-optimal per condition.
+    """
+    _apply_style()
+    if optimal_codons_df.empty:
+        return
+
+    # Identify the condition columns
+    delta_cols = [c for c in optimal_codons_df.columns if c.startswith("mean_delta_rscu_")]
+    if len(delta_cols) < 2:
+        return
+
+    cond_a = delta_cols[0].replace("mean_delta_rscu_", "")
+    cond_b = delta_cols[1].replace("mean_delta_rscu_", "")
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    agree = optimal_codons_df["agreement"]
+    ax.scatter(
+        optimal_codons_df.loc[agree, delta_cols[0]],
+        optimal_codons_df.loc[agree, delta_cols[1]],
+        c="#2ca02c", alpha=0.6, s=40, label="Agree", edgecolors="none",
+    )
+    ax.scatter(
+        optimal_codons_df.loc[~agree, delta_cols[0]],
+        optimal_codons_df.loc[~agree, delta_cols[1]],
+        c="#d62728", alpha=0.8, s=60, label="Diverge", edgecolors="black", linewidths=0.5,
+    )
+
+    # Label the most divergent codons
+    top_div = optimal_codons_df.loc[~agree].nlargest(10, "delta_difference", keep="first")
+    bottom_div = optimal_codons_df.loc[~agree].nsmallest(10, "delta_difference", keep="first")
+    for _, row in pd.concat([top_div, bottom_div]).iterrows():
+        ax.annotate(
+            row["codon"], (row[delta_cols[0]], row[delta_cols[1]]),
+            fontsize=7, ha="left", va="bottom",
+            xytext=(3, 3), textcoords="offset points",
+        )
+
+    ax.axhline(0, color="gray", linewidth=0.5, linestyle="--")
+    ax.axvline(0, color="gray", linewidth=0.5, linestyle="--")
+    ax.set_xlabel(f"ΔRSCU (high-expr enrichment) — {cond_a}", fontsize=11)
+    ax.set_ylabel(f"ΔRSCU (high-expr enrichment) — {cond_b}", fontsize=11)
+    ax.set_title("Optimal Codon Divergence Between Conditions", fontsize=12)
+    ax.legend(loc="upper left", fontsize=9)
+
+    # Quadrant labels
+    lim = max(abs(ax.get_xlim()[0]), abs(ax.get_xlim()[1]),
+              abs(ax.get_ylim()[0]), abs(ax.get_ylim()[1])) * 1.1
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.text(lim * 0.6, lim * 0.9, f"Optimal in both", fontsize=8, color="gray", ha="center")
+    ax.text(-lim * 0.6, -lim * 0.9, f"Non-optimal in both", fontsize=8, color="gray", ha="center")
+    ax.text(lim * 0.6, -lim * 0.9, f"Optimal only\nin {cond_a}", fontsize=8, color="gray", ha="center")
+    ax.text(-lim * 0.6, lim * 0.9, f"Optimal only\nin {cond_b}", fontsize=8, color="gray", ha="center")
+
+    n_agree = agree.sum()
+    n_disagree = (~agree).sum()
+    ax.text(0.02, 0.02, f"Agreement: {n_agree}/{len(agree)} codons  ({100*n_agree/len(agree):.0f}%)",
+            transform=ax.transAxes, fontsize=9,
+            bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.8))
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_strand_asymmetry_pattern_comparison(
+    strand_asym_patterns_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """Heatmap + lollipop of per-codon strand asymmetry differences between conditions.
+
+    Top: heatmap of mean asymmetry (plus-minus RSCU) per condition per codon.
+    Bottom: lollipop plot of difference in asymmetry, colored by significance.
+    """
+    _apply_style()
+    if strand_asym_patterns_df.empty:
+        return
+
+    # Identify condition columns
+    asym_cols = [c for c in strand_asym_patterns_df.columns if c.startswith("mean_asymmetry_")]
+    if len(asym_cols) < 2:
+        return
+
+    cond_a = asym_cols[0].replace("mean_asymmetry_", "")
+    cond_b = asym_cols[1].replace("mean_asymmetry_", "")
+
+    df = strand_asym_patterns_df.copy()
+    df = df.sort_values("diff", key=abs, ascending=False)
+
+    fig, (ax_heat, ax_lollipop) = plt.subplots(
+        2, 1, figsize=(max(12, len(df) * 0.35), 10),
+        gridspec_kw={"height_ratios": [1, 2]},
+    )
+
+    # -- Heatmap --
+    heat_data = df[[asym_cols[0], asym_cols[1]]].T
+    heat_data.columns = df["codon"].values
+    heat_data.index = [cond_a, cond_b]
+    vmax = max(abs(heat_data.values.min()), abs(heat_data.values.max()))
+    im = ax_heat.imshow(heat_data.values, aspect="auto", cmap="RdBu_r",
+                        vmin=-vmax, vmax=vmax)
+    ax_heat.set_xticks(range(len(heat_data.columns)))
+    ax_heat.set_xticklabels(heat_data.columns, rotation=90, fontsize=7)
+    ax_heat.set_yticks(range(2))
+    ax_heat.set_yticklabels([cond_a, cond_b], fontsize=10)
+    ax_heat.set_title("Per-Codon Strand Asymmetry (+ minus − strand RSCU)", fontsize=11)
+    plt.colorbar(im, ax=ax_heat, shrink=0.6, label="ΔRSCU (plus − minus)")
+
+    # -- Lollipop --
+    x = range(len(df))
+    sig_mask = df["significant"].values
+    colors_lollipop = ["#d62728" if s else "#cccccc" for s in sig_mask]
+    ax_lollipop.vlines(x, 0, df["diff"].values, colors=colors_lollipop, linewidth=1.5)
+    ax_lollipop.scatter(x, df["diff"].values, c=colors_lollipop, s=30, zorder=3)
+    ax_lollipop.axhline(0, color="black", linewidth=0.5)
+    ax_lollipop.set_xticks(list(x))
+    ax_lollipop.set_xticklabels(df["codon"].values, rotation=90, fontsize=7)
+    ax_lollipop.set_ylabel(f"Asymmetry Difference ({cond_a} − {cond_b})", fontsize=10)
+    ax_lollipop.set_title(
+        f"Condition Difference in Strand Asymmetry  "
+        f"(red = FDR < 0.05, {sig_mask.sum()}/{len(sig_mask)} significant)",
+        fontsize=11,
+    )
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_neutrality_scatter_by_condition(
+    gc3_gc12_df: pd.DataFrame,
+    metrics_df: pd.DataFrame,
+    condition_col: str,
+    output_path: Path,
+) -> None:
+    """GC3 vs GC12 scatter colored by condition with separate regression lines.
+
+    Shows mutational bias (neutrality) vs selection pressure across conditions.
+    Points are per-gene values pooled from all samples within each condition.
+    """
+    _apply_style()
+    if gc3_gc12_df.empty or "condition" not in gc3_gc12_df.columns:
+        return
+    if "GC3" not in gc3_gc12_df.columns or "GC12" not in gc3_gc12_df.columns:
+        return
+
+    conditions = sorted(gc3_gc12_df["condition"].unique())
+    colors = _condition_colors(conditions)
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    for cond in conditions:
+        sub = gc3_gc12_df[gc3_gc12_df["condition"] == cond]
+        ax.scatter(sub["GC3"], sub["GC12"], c=colors[cond], alpha=0.15, s=8,
+                   label=f"{cond} (n={len(sub):,})", edgecolors="none")
+
+        # Regression line
+        if len(sub) > 10 and sub["GC3"].nunique() > 1:
+            slope, intercept, r, p_val, _ = sp_stats.linregress(sub["GC3"], sub["GC12"])
+            x_line = np.linspace(sub["GC3"].min(), sub["GC3"].max(), 100)
+            ax.plot(x_line, slope * x_line + intercept, color=colors[cond],
+                    linewidth=2, label=f"  slope={slope:.3f}, r={r:.3f}")
+
+    # Reference: neutrality line (slope=1)
+    gc_range = np.linspace(gc3_gc12_df["GC3"].min(), gc3_gc12_df["GC3"].max(), 100)
+    mean_gc12 = gc3_gc12_df["GC12"].mean()
+    ax.plot(gc_range, gc_range * 1.0 + (mean_gc12 - gc3_gc12_df["GC3"].mean()),
+            "k--", linewidth=1, alpha=0.4, label="Neutral expectation (slope=1)")
+
+    ax.set_xlabel("GC3 (third codon position GC content)", fontsize=11)
+    ax.set_ylabel("GC12 (first + second position GC content)", fontsize=11)
+    ax.set_title("Neutrality Plot by Condition", fontsize=12)
+    ax.legend(fontsize=8, loc="best", ncol=1)
+    ax.grid(True, alpha=0.15)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EXPRESSION-CLASS RSCU & ENRICHMENT COMPARISON PLOTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def plot_expression_class_rscu_volcano(
+    rscu_tests_df: pd.DataFrame,
+    gene_set_label: str,
+    output_path: Path,
+) -> None:
+    """Volcano plot for expression-class-specific RSCU differences between conditions.
+
+    X-axis: log2 fold-change, Y-axis: -log10(adjusted p-value).
+    Significant codons (FDR < 0.05, |log2FC| > 0.3) are labeled.
+    """
+    _apply_style()
+    if rscu_tests_df.empty or "p_adjusted" not in rscu_tests_df.columns:
+        return
+
+    df = rscu_tests_df.copy()
+    df["-log10_padj"] = -np.log10(df["p_adjusted"].clip(lower=1e-50))
+
+    sig_mask = df["significant"] & (df["log2_fc"].abs() > 0.3)
+    nonsig = df[~sig_mask]
+    sig = df[sig_mask]
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.scatter(nonsig["log2_fc"], nonsig["-log10_padj"], c="#cccccc", s=30,
+               alpha=0.5, edgecolors="none", label="Not significant")
+
+    # Color by direction
+    sig_up = sig[sig["log2_fc"] > 0]
+    sig_down = sig[sig["log2_fc"] < 0]
+    cond_cols = [c for c in df.columns if c.startswith("mean_")]
+    cond_names = [c.replace("mean_", "") for c in cond_cols]
+    label_up = f"Higher in {cond_names[0]}" if len(cond_names) >= 1 else "Higher in cond1"
+    label_down = f"Higher in {cond_names[1]}" if len(cond_names) >= 2 else "Higher in cond2"
+
+    ax.scatter(sig_up["log2_fc"], sig_up["-log10_padj"], c="#d62728", s=50,
+               alpha=0.8, edgecolors="black", linewidths=0.5, label=label_up)
+    ax.scatter(sig_down["log2_fc"], sig_down["-log10_padj"], c="#1f77b4", s=50,
+               alpha=0.8, edgecolors="black", linewidths=0.5, label=label_down)
+
+    # Label significant codons
+    for _, row in sig.iterrows():
+        codon_label = f"{row['amino_acid']}-{row['codon']}" if row.get("amino_acid") else row["codon"]
+        ax.annotate(codon_label, (row["log2_fc"], row["-log10_padj"]),
+                    fontsize=7, ha="left", va="bottom",
+                    xytext=(3, 3), textcoords="offset points")
+
+    ax.axhline(-np.log10(0.05), color="gray", linestyle="--", linewidth=0.8, alpha=0.5)
+    ax.axvline(0.3, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
+    ax.axvline(-0.3, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
+    ax.set_xlabel("log₂ Fold-Change", fontsize=11)
+    ax.set_ylabel("-log₁₀(adjusted p-value)", fontsize=11)
+    title_label = "Ribosomal Protein" if gene_set_label == "ribosomal" else "High-Expression"
+    ax.set_title(f"{title_label} RSCU: Condition Differences", fontsize=12)
+    ax.legend(fontsize=9, loc="best")
+    ax.grid(True, alpha=0.15)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_expression_class_rscu_heatmap(
+    rp_tests_df: pd.DataFrame | None,
+    he_tests_df: pd.DataFrame | None,
+    output_path: Path,
+) -> None:
+    """Side-by-side heatmap of log2FC for ribosomal and high-expression RSCU.
+
+    Codons on y-axis grouped by amino acid, two columns (ribosomal, high-expr).
+    Significant codons marked with asterisks.
+    """
+    _apply_style()
+    dfs = []
+    labels = []
+    if rp_tests_df is not None and not rp_tests_df.empty and "log2_fc" in rp_tests_df.columns:
+        dfs.append(rp_tests_df)
+        labels.append("Ribosomal")
+    if he_tests_df is not None and not he_tests_df.empty and "log2_fc" in he_tests_df.columns:
+        dfs.append(he_tests_df)
+        labels.append("High-Expression")
+    if not dfs:
+        return
+
+    # Get union of codons
+    all_codons = set()
+    for df in dfs:
+        all_codons.update(df["codon_col"].values)
+    all_codons = sorted(all_codons)
+
+    # Build heatmap matrix
+    heat_data = pd.DataFrame(index=all_codons)
+    sig_data = pd.DataFrame(index=all_codons)
+    for df, label in zip(dfs, labels):
+        fc_map = dict(zip(df["codon_col"], df["log2_fc"]))
+        sig_map = dict(zip(df["codon_col"], df.get("significant", pd.Series(dtype=bool))))
+        heat_data[label] = [fc_map.get(c, 0) for c in all_codons]
+        sig_data[label] = [sig_map.get(c, False) for c in all_codons]
+
+    fig, ax = plt.subplots(figsize=(4 + len(labels) * 1.5, max(8, len(all_codons) * 0.22)))
+    vmax = max(abs(heat_data.values.min()), abs(heat_data.values.max()), 0.1)
+    im = ax.imshow(heat_data.values, aspect="auto", cmap="RdBu_r",
+                   vmin=-vmax, vmax=vmax)
+
+    # Asterisks for significant
+    for i in range(len(all_codons)):
+        for j in range(len(labels)):
+            if sig_data.iloc[i, j]:
+                ax.text(j, i, "*", ha="center", va="center", fontsize=8, fontweight="bold")
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=10)
+    ax.set_yticks(range(len(all_codons)))
+    ax.set_yticklabels(all_codons, fontsize=7)
+    ax.set_title("Expression-Class RSCU Differences Between Conditions\n(log₂FC, * = FDR < 0.05)",
+                 fontsize=11)
+    plt.colorbar(im, ax=ax, shrink=0.6, label="log₂ Fold-Change")
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_enrichment_comparison(
+    enrichment_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """Dot plot comparing pathway enrichment frequency between conditions.
+
+    Each pathway is a row. Dot size = fraction of samples enriched.
+    Color = -log10(adjusted p-value). Only pathways enriched in ≥1 sample shown.
+    """
+    _apply_style()
+    if enrichment_df.empty:
+        return
+
+    # Get condition names from column names
+    frac_cols = [c for c in enrichment_df.columns if c.startswith("frac_enriched_")]
+    if len(frac_cols) < 2:
+        return
+
+    cond_a = frac_cols[0].replace("frac_enriched_", "")
+    cond_b = frac_cols[1].replace("frac_enriched_", "")
+
+    # Filter to pathways with at least some enrichment
+    df = enrichment_df.copy()
+    df = df[(df[frac_cols[0]] > 0) | (df[frac_cols[1]] > 0)]
+    if df.empty:
+        return
+
+    # Sort by significance
+    df = df.sort_values("p_adjusted").head(30)  # Top 30 most significant
+    df = df.sort_values("p_adjusted", ascending=False)  # Reverse for plot
+
+    # Use pathway_name if available, else pathway
+    y_labels = df["pathway_name"].fillna(df["pathway"]).values
+    y_pos = np.arange(len(df))
+
+    fig, ax = plt.subplots(figsize=(10, max(5, len(df) * 0.35)))
+
+    # Plot two columns of dots
+    offset = 0.15
+    for i, (frac_col, cond, color, marker) in enumerate([
+        (frac_cols[0], cond_a, "#1f77b4", "o"),
+        (frac_cols[1], cond_b, "#d62728", "s"),
+    ]):
+        sizes = df[frac_col].values * 300 + 20  # Scale for visibility
+        ax.scatter(
+            df[frac_col].values, y_pos + (i - 0.5) * offset,
+            s=sizes, c=color, marker=marker, alpha=0.7,
+            edgecolors="black", linewidths=0.5, label=cond,
+        )
+
+    # Mark significant with bold y-label
+    sig_mask = df["significant"].values
+    for idx, (label, is_sig) in enumerate(zip(y_labels, sig_mask)):
+        weight = "bold" if is_sig else "normal"
+        ax.text(-0.02, idx, label, ha="right", va="center", fontsize=8,
+                fontweight=weight, transform=ax.get_yaxis_transform())
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels([""] * len(y_pos))  # Labels drawn manually
+    ax.set_xlabel("Fraction of Samples with Pathway Enriched (FDR < 0.05)", fontsize=10)
+    ax.set_title("Pathway Enrichment Comparison Between Conditions\n(bold = significantly different)",
+                 fontsize=11)
+    ax.legend(fontsize=9, loc="lower right")
+    ax.set_xlim(-0.05, 1.05)
+    ax.grid(True, axis="x", alpha=0.2)
+    ax.axvline(0.5, color="gray", linestyle=":", linewidth=0.5, alpha=0.5)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1196,6 +1706,13 @@ def generate_comparative_plots(
     rscu_tests_df: pd.DataFrame | None = None,
     rscu_disp_df: pd.DataFrame | None = None,
     perm_result: dict | None = None,
+    hgt_burden: dict | None = None,
+    strand_asym_patterns_df: pd.DataFrame | None = None,
+    optimal_codons_df: pd.DataFrame | None = None,
+    gc3_gc12_df: pd.DataFrame | None = None,
+    rp_rscu_tests_df: pd.DataFrame | None = None,
+    he_rscu_tests_df: pd.DataFrame | None = None,
+    enrichment_comp_df: pd.DataFrame | None = None,
 ) -> dict[str, Path]:
     """Generate all within- and between-condition comparative plots.
 
@@ -1362,6 +1879,79 @@ def generate_comparative_plots(
             outputs["operon_coadaptation_comparison"] = p.with_suffix(".png")
         except Exception as e:
             logger.warning("Failed: operon_coadaptation_comparison — %s", e)
+
+        # ── Bio/ecology between-condition plots ───────────────────────
+        if hgt_burden:
+            try:
+                p = plot_dir / "hgt_burden_comparison"
+                plot_hgt_burden_comparison(hgt_burden, metrics_df, condition_col, p)
+                outputs["hgt_burden_comparison"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Failed: hgt_burden_comparison — %s", e)
+
+        try:
+            p = plot_dir / "phage_mobile_comparison"
+            plot_phage_mobile_comparison(metrics_df, condition_col, between_tests_df, p)
+            outputs["phage_mobile_comparison"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Failed: phage_mobile_comparison — %s", e)
+
+        if optimal_codons_df is not None and not optimal_codons_df.empty:
+            try:
+                p = plot_dir / "optimal_codon_divergence"
+                plot_optimal_codon_divergence(optimal_codons_df, p)
+                outputs["optimal_codon_divergence"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Failed: optimal_codon_divergence — %s", e)
+
+        if strand_asym_patterns_df is not None and not strand_asym_patterns_df.empty:
+            try:
+                p = plot_dir / "strand_asymmetry_pattern_comparison"
+                plot_strand_asymmetry_pattern_comparison(strand_asym_patterns_df, p)
+                outputs["strand_asymmetry_pattern_comparison"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Failed: strand_asymmetry_pattern_comparison — %s", e)
+
+        if gc3_gc12_df is not None and not gc3_gc12_df.empty:
+            try:
+                p = plot_dir / "neutrality_scatter_by_condition"
+                plot_neutrality_scatter_by_condition(gc3_gc12_df, metrics_df, condition_col, p)
+                outputs["neutrality_scatter_by_condition"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Failed: neutrality_scatter_by_condition — %s", e)
+
+        # ── Expression-class RSCU & enrichment plots ─────────────────
+        if rp_rscu_tests_df is not None and not rp_rscu_tests_df.empty:
+            try:
+                p = plot_dir / "ribosomal_rscu_volcano"
+                plot_expression_class_rscu_volcano(rp_rscu_tests_df, "ribosomal", p)
+                outputs["ribosomal_rscu_volcano"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Failed: ribosomal_rscu_volcano — %s", e)
+
+        if he_rscu_tests_df is not None and not he_rscu_tests_df.empty:
+            try:
+                p = plot_dir / "high_expression_rscu_volcano"
+                plot_expression_class_rscu_volcano(he_rscu_tests_df, "high_expression", p)
+                outputs["high_expression_rscu_volcano"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Failed: high_expression_rscu_volcano — %s", e)
+
+        if rp_rscu_tests_df is not None or he_rscu_tests_df is not None:
+            try:
+                p = plot_dir / "expression_class_rscu_heatmap"
+                plot_expression_class_rscu_heatmap(rp_rscu_tests_df, he_rscu_tests_df, p)
+                outputs["expression_class_rscu_heatmap"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Failed: expression_class_rscu_heatmap — %s", e)
+
+        if enrichment_comp_df is not None and not enrichment_comp_df.empty:
+            try:
+                p = plot_dir / "enrichment_comparison"
+                plot_enrichment_comparison(enrichment_comp_df, p)
+                outputs["enrichment_comparison"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Failed: enrichment_comparison — %s", e)
 
     logger.info("Generated %d comparative plots", len(outputs))
     return outputs
