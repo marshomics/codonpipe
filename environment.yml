@@ -2,7 +2,6 @@ name: codonpipe
 channels:
   - conda-forge
   - bioconda
-  - defaults
 dependencies:
   # Python
   - python>=3.9
