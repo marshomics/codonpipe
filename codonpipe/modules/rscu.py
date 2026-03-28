@@ -12,6 +12,7 @@ from Bio import SeqIO
 
 from codonpipe.utils.codon_tables import (
     AA_CODON_GROUPS,
+    AA_CODON_GROUPS_RSCU,
     CODON_TABLE_11,
     RSCU_COLUMN_NAMES,
     SENSE_CODONS,
@@ -44,11 +45,15 @@ def compute_rscu_from_counts(codon_counts: Counter) -> dict[str, float]:
     RSCU = (observed frequency of codon) / (expected frequency if all synonymous
     codons were used equally) = (count_i * n_synonymous) / sum(counts for that AA)
 
+    Ser, Leu, and Arg are split into 4-fold and 2-fold subfamilies
+    (Ser4/Ser2, Leu4/Leu2, Arg4/Arg2) because the two groups occupy
+    different codon boxes and should not be pooled (Sharp et al. 1986).
+
     Returns:
         Dict mapping RSCU column names (e.g., "Phe-UUU") to RSCU values.
     """
     rscu = {}
-    for aa, codons in AA_CODON_GROUPS.items():
+    for family_name, codons in AA_CODON_GROUPS_RSCU.items():
         total = sum(codon_counts.get(c, 0) for c in codons)
         n_syn = len(codons)
         for codon in codons:
@@ -59,7 +64,7 @@ def compute_rscu_from_counts(codon_counts: Counter) -> dict[str, float]:
                 rscu_val = 0.0
 
             # Build the column name matching our convention
-            col_name = _codon_to_col_name(codon, aa)
+            col_name = f"{family_name}-{codon}"
             rscu[col_name] = rscu_val
 
     return rscu
@@ -229,21 +234,23 @@ def _calculate_enc(codon_counts: Counter) -> float:
             f_values[6].append(f_hat)
 
     # ENC = number of aa families + K/F_avg for each degeneracy class
+    # Wright (1990): Nc = 2 + 9/F̄₂ + 1/F̄₃ + 5/F̄₄ + 3/F̄₆
     enc = 2.0  # Met + Trp always contribute 1 each
+    n_families = {2: 9, 3: 1, 4: 5, 6: 3}
 
     for k, f_list in f_values.items():
         if f_list:
             f_avg = np.mean(f_list)
             if f_avg > 0:
-                n_families = {2: 9, 3: 1, 4: 5, 6: 3}
                 enc += n_families[k] / f_avg
             else:
-                n_families = {2: 9, 3: 1, 4: 5, 6: 3}
+                # F_hat = 0 shouldn't happen with n > 1, but if it does
+                # treat as no bias: each family contributes k codons
                 enc += n_families[k] * k
         else:
-            # If no data for this class, assume no bias
-            n_families = {2: 9, 3: 1, 4: 5, 6: 3}
-            enc += n_families[k] * 1.0  # F=1 → ENC contribution = n_families
+            # No amino acids observed for this degeneracy class.
+            # Assume no bias: F = 1/k → contribution = n_families * k
+            enc += n_families[k] * k
 
     return min(enc, 61.0)
 
