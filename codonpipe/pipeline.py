@@ -23,6 +23,7 @@ from codonpipe.modules.expression import run_expression_analysis
 from codonpipe.modules.cu_statistics import run_cu_statistics
 from codonpipe.modules.enrichment import run_enrichment_analysis
 from codonpipe.modules.advanced_analyses import run_advanced_analyses
+from codonpipe.modules.ace_convergence import run_ace_convergence
 from codonpipe.modules.bio_ecology import run_bio_ecology_analyses
 from codonpipe.modules.codon_table_formats import generate_all_codon_tables
 from codonpipe.modules.statistics import run_batch_statistics
@@ -74,6 +75,8 @@ def run_single_genome(
     skip_kofamscan: bool = False,
     kofam_results_file: Path | None = None,
     skip_expression: bool = False,
+    skip_ace: bool = False,
+    ace_top_pct: float = 5.0,
     kegg_ko_pathway: Path | None = None,
     gff_file: Path | None = None,
     force: bool = False,
@@ -91,12 +94,17 @@ def run_single_genome(
         8. Advanced analyses (COA, S-value, neutrality, PR2, delta RSCU,
            tRNA-codon correlation, COG enrichment, gene length vs bias,
            ENC-ENC' difference)
-        9. Biological/ecological analyses (HGT detection, growth rate
+        9. ACE convergence — adaptive codon enrichment via iterative
+           multi-seed convergence to derive a genome-specific optimal
+           codon usage table
+       10. Biological/ecological analyses (HGT detection, growth rate
            prediction, translational selection, phage detection, strand
            asymmetry, operon co-adaptation)
-       10. Codon usage tables in all standard formats (RSCU, counts,
-           per-thousand, W values, adaptation weights, CBI)
-       11. Publication-ready plots
+       11. Codon usage tables in all standard formats (RSCU, counts,
+           per-thousand, W values, adaptation weights, CBI) plus
+           ACE-specific tables (ACE weights, w-values, adaptation
+           weights, optimal codons, per-gene ACE CAI)
+       12. Publication-ready plots
 
     Args:
         genome_fasta: Path to genome assembly FASTA.
@@ -117,6 +125,8 @@ def run_single_genome(
             When provided, KofamScan execution is skipped and this file is
             parsed directly. Overrides skip_kofamscan.
         skip_expression: Skip R-based expression analysis.
+        skip_ace: Skip ACE iterative convergence analysis.
+        ace_top_pct: Percentage of genes to select each ACE iteration (default 5).
         kegg_ko_pathway: User-supplied KO-to-pathway mapping TSV for offline use.
         gff_file: GFF3 annotation file for tRNA extraction (auto-detected from
             Prokka output if omitted).
@@ -138,13 +148,13 @@ def run_single_genome(
 
     # ── Step 1: Prokka (or use pre-existing files) ─────────────────────
     if prokka_files is not None:
-        logger.info("[Step 1/11] Using pre-existing Prokka files (skipping Prokka)")
+        logger.info("[Step 1/12] Using pre-existing Prokka files (skipping Prokka)")
         _validate_prokka_files(prokka_files)
         # Convert all values to Path objects
         prokka_out = {k: Path(v) for k, v in prokka_files.items()}
         all_outputs.update({f"prokka_{k}": v for k, v in prokka_out.items()})
     else:
-        logger.info("[Step 1/11] Running Prokka gene prediction")
+        logger.info("[Step 1/12] Running Prokka gene prediction")
         prokka_out = run_prokka(
             genome_fasta, output_dir, sample_id,
             kingdom=kingdom, cpus=cpus, metagenome=metagenome, force=force,
@@ -155,7 +165,7 @@ def run_single_genome(
     ffn_path = prokka_out["ffn"]
 
     # ── Step 2: COGclassifier ───────────────────────────────────────────
-    logger.info("[Step 2/11] Running COGclassifier for ribosomal protein identification")
+    logger.info("[Step 2/12] Running COGclassifier for ribosomal protein identification")
     cog_result = run_cogclassifier(faa_path, output_dir, sample_id, cpus=cpus, force=force)
     all_outputs["cog_result"] = cog_result
 
@@ -170,7 +180,7 @@ def run_single_genome(
     # ── Step 3: KofamScan ───────────────────────────────────────────────
     kofam_df = None
     if kofam_results_file is not None:
-        logger.info("[Step 3/11] Loading pre-computed KofamScan results from %s", kofam_results_file)
+        logger.info("[Step 3/12] Loading pre-computed KofamScan results from %s", kofam_results_file)
         try:
             kofam_df = parse_kofamscan(kofam_results_file)
             kofam_out = output_dir / "kofamscan" / f"{sample_id}_kofam_parsed.tsv"
@@ -180,7 +190,7 @@ def run_single_genome(
         except Exception as e:
             logger.warning("Failed to parse pre-computed KofamScan results: %s. Continuing without annotations.", e, exc_info=True)
     elif not skip_kofamscan:
-        logger.info("[Step 3/11] Running KofamScan annotation")
+        logger.info("[Step 3/12] Running KofamScan annotation")
         try:
             kofam_result = run_kofamscan(
                 faa_path, output_dir, sample_id,
@@ -194,10 +204,10 @@ def run_single_genome(
         except (FileNotFoundError, RuntimeError) as e:
             logger.warning("KofamScan failed: %s. Continuing without annotations.", e, exc_info=True)
     else:
-        logger.info("[Step 3/11] Skipping KofamScan (--skip-kofamscan)")
+        logger.info("[Step 3/12] Skipping KofamScan (--skip-kofamscan)")
 
     # ── Step 4: RSCU analysis ───────────────────────────────────────────
-    logger.info("[Step 4/11] Running RSCU analysis")
+    logger.info("[Step 4/12] Running RSCU analysis")
     rscu_outputs = run_rscu_analysis(ffn_path, rp_ffn, output_dir, sample_id)
     all_outputs.update(rscu_outputs)
 
@@ -223,7 +233,7 @@ def run_single_genome(
     encprime_df = None
     milc_df = None
     if not skip_expression:
-        logger.info("[Step 5/11] Computing CU bias statistics (ENCprime, MILC)")
+        logger.info("[Step 5/12] Computing CU bias statistics (ENCprime, MILC)")
         try:
             cu_stat_outputs = run_cu_statistics(
                 ffn_path, output_dir, sample_id, force=force,
@@ -237,12 +247,12 @@ def run_single_genome(
         except (FileNotFoundError, RuntimeError) as e:
             logger.warning("CU statistics failed: %s. Continuing.", e, exc_info=True)
     else:
-        logger.info("[Step 5/11] Skipping CU bias statistics (--skip-expression)")
+        logger.info("[Step 5/12] Skipping CU bias statistics (--skip-expression)")
 
     # ── Step 6: Expression analysis ─────────────────────────────────────
     expr_df = None
     if not skip_expression and rp_ids_file and rp_ids_file.exists():
-        logger.info("[Step 6/11] Running expression level prediction (MELP/CAI/Fop)")
+        logger.info("[Step 6/12] Running expression level prediction (MELP/CAI/Fop)")
         try:
             expr_outputs = run_expression_analysis(
                 ffn_path, rp_ids_file, output_dir, sample_id, force=force,
@@ -251,6 +261,25 @@ def run_single_genome(
 
             if "expression_combined" in expr_outputs:
                 expr_df = pd.read_csv(expr_outputs["expression_combined"], sep="\t")
+
+                # Merge ENC' residual (ENC - ENC') as first-class column
+                if enc_df is not None and encprime_df is not None:
+                    try:
+                        from codonpipe.modules.advanced_analyses import compute_enc_diff
+                        enc_diff_df = compute_enc_diff(enc_df, encprime_df)
+                        if not enc_diff_df.empty and "gene" in enc_diff_df.columns:
+                            expr_df = expr_df.merge(
+                                enc_diff_df[["gene", "ENC_diff"]].rename(
+                                    columns={"ENC_diff": "ENCprime_residual"}
+                                ),
+                                on="gene", how="left",
+                            )
+                            # Re-save the updated expression table
+                            expr_df.to_csv(expr_outputs["expression_combined"], sep="\t", index=False)
+                            logger.info("Merged ENC' residual into expression table (%d genes with values)",
+                                        expr_df["ENCprime_residual"].notna().sum())
+                    except Exception as e:
+                        logger.warning("Could not merge ENC' residual: %s", e)
 
                 # Annotate with KofamScan
                 if kofam_df is not None and not kofam_df.empty:
@@ -261,14 +290,14 @@ def run_single_genome(
         except (FileNotFoundError, RuntimeError) as e:
             logger.warning("Expression analysis failed: %s. Continuing.", e, exc_info=True)
     elif skip_expression:
-        logger.info("[Step 6/11] Skipping expression analysis (--skip-expression)")
+        logger.info("[Step 6/12] Skipping expression analysis (--skip-expression)")
     else:
-        logger.info("[Step 6/11] Skipping expression analysis (no ribosomal proteins found)")
+        logger.info("[Step 6/12] Skipping expression analysis (no ribosomal proteins found)")
 
     # ── Step 7: Pathway enrichment ───────────────────────────────────────
     enrichment_results = {}
     if expr_df is not None and kofam_df is not None and not kofam_df.empty:
-        logger.info("[Step 7/11] Running pathway enrichment (hypergeometric test)")
+        logger.info("[Step 7/12] Running pathway enrichment (hypergeometric test)")
         try:
             enrich_outputs = run_enrichment_analysis(
                 expr_df, kofam_df, output_dir, sample_id,
@@ -283,12 +312,12 @@ def run_single_genome(
             logger.warning("Pathway enrichment failed: %s. Continuing.", e, exc_info=True)
     else:
         logger.info(
-            "[Step 7/11] Skipping pathway enrichment (%s)",
+            "[Step 7/12] Skipping pathway enrichment (%s)",
             "no expression data" if expr_df is None else "no KofamScan annotations",
         )
 
     # ── Step 8: Advanced analyses ────────────────────────────────────────
-    logger.info("[Step 8/11] Running advanced codon usage analyses")
+    logger.info("[Step 8/12] Running advanced codon usage analyses")
     advanced_results = {}
     try:
         # Resolve GFF path: explicit > Prokka output > batch table
@@ -327,8 +356,87 @@ def run_single_genome(
     if not advanced_results:
         logger.info("SKIPPED: advanced analyses produced no results")
 
-    # ── Step 9: Biological/ecological analyses ──────────────────────────
-    logger.info("[Step 9/11] Running biological and ecological analyses")
+    # ── Step 9: ACE convergence ─────────────────────────────────────────
+    ace_results = {}
+    ace_cai_df = None
+    if not skip_ace:
+        logger.info("[Step 9/12] Running ACE iterative convergence")
+        try:
+            # Pass the per-gene RSCU DataFrame from step 4 (already computed
+            # by compute_rscu_per_gene).  Also pass ribosomal-protein per-gene
+            # RSCU for the RP seed.  The RP RSCU needs a "gene" column so the
+            # seed builder can identify individual RP genes.
+            rp_rscu_df = None
+            if rp_ffn and rp_ffn.exists():
+                try:
+                    rp_rscu_df = compute_rscu_per_gene(rp_ffn)
+                except Exception:
+                    pass
+
+            ace_out = run_ace_convergence(
+                rscu_gene_df=rscu_gene_df,
+                output_dir=output_dir,
+                sample_id=sample_id,
+                enc_df=enc_df,
+                encprime_df=encprime_df,
+                rscu_rp=rp_rscu_df,
+                expr_df=expr_df,
+                advanced_results=advanced_results,
+                top_pct=ace_top_pct,
+            )
+
+            # Separate file paths from in-memory objects
+            for key, val in ace_out.items():
+                if isinstance(val, Path):
+                    all_outputs[f"ace_{key}"] = val
+                else:
+                    ace_results[key] = val
+
+            ace_scores_df = ace_results.get("ace_scores_df")
+
+            # Merge ACE scores into expression table and promote ACE-MELP
+            # as the primary expression metric.  The convergence loop uses
+            # cosine similarity (composition-independent), so ace_melp
+            # doesn't degrade in high-GC organisms the way CAI does.
+            # expression_class is reclassified from ace_expression_class
+            # when ACE is available; the ribosomal-reference MELP class
+            # is preserved as melp_rp_class for comparison.
+            if ace_scores_df is not None and expr_df is not None and not expr_df.empty:
+                try:
+                    # Preserve the original RP-based expression_class
+                    if "expression_class" in expr_df.columns:
+                        expr_df = expr_df.rename(
+                            columns={"expression_class": "expression_class_rp"}
+                        )
+
+                    expr_df = expr_df.merge(
+                        ace_scores_df[["gene", "ace_melp", "ace_cai",
+                                       "ace_expression_class", "in_ace_core"]],
+                        on="gene", how="left",
+                    )
+
+                    # Promote ACE-MELP classification as the primary
+                    expr_df["expression_class"] = expr_df["ace_expression_class"].fillna(
+                        expr_df.get("expression_class_rp", "unknown")
+                    )
+
+                    # Re-save the updated expression table
+                    expr_combined_path = all_outputs.get("expression_combined")
+                    if expr_combined_path and expr_combined_path.exists():
+                        expr_df.to_csv(expr_combined_path, sep="\t", index=False)
+                        logger.info(
+                            "Merged ACE scores into expression table; "
+                            "expression_class now derived from ACE-MELP"
+                        )
+                except Exception as e:
+                    logger.warning("Could not merge ACE scores into expression table: %s", e)
+        except Exception as e:
+            logger.warning("ACE convergence failed: %s. Continuing.", e, exc_info=True)
+    else:
+        logger.info("[Step 9/12] Skipping ACE convergence (--skip-ace)")
+
+    # ── Step 10: Biological/ecological analyses ─────────────────────────
+    logger.info("[Step 10/12] Running biological and ecological analyses")
     bio_ecology_results = {}
     try:
         bio_outputs = run_bio_ecology_analyses(
@@ -371,10 +479,11 @@ def run_single_genome(
     if not bio_ecology_results:
         logger.info("SKIPPED: bio/ecology analyses produced no results")
 
-    # ── Step 10: Codon usage tables ──────────────────────────────────────
-    logger.info("[Step 10/11] Generating codon usage tables in all standard formats")
+    # ── Step 11: Codon usage tables ──────────────────────────────────────
+    logger.info("[Step 11/12] Generating codon usage tables in all standard formats")
     try:
         rp_ffn = rp_outputs.get("rp_ffn")
+        ace_core_genes = ace_results.get("ace_core_gene_set")
         table_outputs = generate_all_codon_tables(
             ffn_path=ffn_path,
             rp_ffn_path=rp_ffn,
@@ -382,13 +491,14 @@ def run_single_genome(
             sample_id=sample_id,
             expr_df=expr_df,
             rp_ids_file=rp_ids_file,
+            ace_core_gene_ids=ace_core_genes,
         )
         all_outputs.update(table_outputs)
     except Exception as e:
         logger.warning("Codon usage table generation failed: %s. Continuing.", e, exc_info=True)
 
-    # ── Step 11: Plots ────────────────────────────────────────────────────
-    logger.info("[Step 11/11] Generating publication-ready plots")
+    # ── Step 12: Plots ────────────────────────────────────────────────────
+    logger.info("[Step 12/12] Generating publication-ready plots")
     plot_outputs = generate_single_genome_plots(
         sample_id, output_dir,
         freq_df=freq_df,
