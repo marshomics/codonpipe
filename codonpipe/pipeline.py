@@ -39,6 +39,14 @@ from codonpipe.utils.io import load_batch_table, write_tsv
 
 logger = logging.getLogger("codonpipe")
 
+# Columns in the batch table that are consumed by the pipeline itself
+# (not user metadata).  Defined once so run_batch() and _run_batch_analyses()
+# stay in sync.
+_PIPELINE_COLS = frozenset({
+    "genome_path", "sample_id", "prokka_faa", "prokka_ffn",
+    "prokka_gff", "gff_path", "kofam_results",
+})
+
 
 def _validate_prokka_files(prokka_files: dict[str, Path]) -> None:
     """Validate that user-supplied Prokka files exist and are non-empty."""
@@ -362,6 +370,7 @@ def run_single_genome(
     # ── Step 9: GMM clustering on COA space ──────────────────────────────
     gmm_results = {}
     gmm_cluster_gene_ids = None
+    gmm_cluster_rscu = None
     if not skip_gmm:
         logger.info("[Step 9/12] Running GMM clustering on COA-projected RSCU")
         try:
@@ -393,6 +402,7 @@ def run_single_genome(
                     all_outputs[f"gmm_{key}"] = val
 
             gmm_cluster_gene_ids = gmm_results.get("gmm_cluster_gene_ids")
+            gmm_cluster_rscu = gmm_results.get("gmm_cluster_rscu")
 
             # Annotate expression table with GMM cluster membership
             if gmm_cluster_gene_ids and expr_df is not None and not expr_df.empty:
@@ -409,6 +419,18 @@ def run_single_genome(
             logger.warning("GMM clustering failed: %s. Continuing.", e, exc_info=True)
     else:
         logger.info("[Step 9/12] Skipping GMM clustering (--skip-gmm)")
+
+    # Save GMM cluster RSCU to rscu/ directory alongside genome and RP RSCU
+    if gmm_cluster_rscu is not None and not gmm_cluster_rscu.empty:
+        try:
+            rscu_dir = output_dir / "rscu"
+            rscu_dir.mkdir(parents=True, exist_ok=True)
+            gmm_rscu_path = rscu_dir / f"{sample_id}_rscu_gmm_cluster.tsv"
+            gmm_cluster_rscu.to_frame("RSCU").to_csv(gmm_rscu_path, sep="\t")
+            all_outputs["rscu_gmm_cluster"] = gmm_rscu_path
+            logger.info("GMM cluster RSCU table saved to rscu/ directory")
+        except Exception as e:
+            logger.warning("Could not save GMM cluster RSCU to rscu/: %s", e)
 
     # ── Step 9b: Re-run expression scoring with GMM cluster as reference ─
     # Step 6 scored genes against RP-only IDs.  The GMM cluster provides a
@@ -515,11 +537,10 @@ def run_single_genome(
         except Exception as e:
             logger.warning("GMM-tier pathway enrichment failed: %s. Continuing.", e, exc_info=True)
 
-    # ── Step 9d: Recompute S-value against GMM-cluster RSCU ────────────
-    # Step 8 computed S-value against ribosomal proteins.  The GMM cluster
-    # provides a broader reference (RP + co-clustered genes).  Recompute
-    # S-value and delta RSCU with the GMM-derived reference.
-    gmm_cluster_rscu = gmm_results.get("gmm_cluster_rscu")
+    # ── Step 9d: Recompute S-value and COG enrichment with GMM reference ──
+    # Step 8 computed S-value against ribosomal proteins and COG enrichment
+    # against RP-based expression tiers.  Now that expression is re-scored
+    # against the GMM cluster, recompute both.
     if gmm_cluster_rscu is not None and not gmm_cluster_rscu.empty:
         try:
             from codonpipe.modules.advanced_analyses import compute_s_value, compute_delta_rscu
@@ -527,7 +548,8 @@ def run_single_genome(
             adv_dir = output_dir / "advanced"
 
             logger.info("[Step 9d/12] Recomputing S-value with GMM-cluster RSCU reference")
-            s_val_gmm_df = compute_s_value(rscu_gene_df, rscu_rp, rscu_ace=rscu_gmm_dict)
+            s_val_gmm_df = compute_s_value(rscu_gene_df, rscu_rp,
+                                            rscu_gmm_cluster=rscu_gmm_dict)
             if not s_val_gmm_df.empty:
                 s_val_path = adv_dir / f"{sample_id}_s_value.tsv"
                 s_val_gmm_df.to_csv(s_val_path, sep="\t", index=False)
@@ -546,6 +568,19 @@ def run_single_genome(
                             delta_df.to_csv(out_path, sep="\t", index=False)
                             all_outputs[f"advanced_delta_rscu_{metric}_path"] = out_path
                             advanced_results[f"delta_rscu_{metric}"] = delta_df
+            # Re-run COG enrichment with GMM-based expression tiers
+            cog_tsv = all_outputs.get("cog_result")
+            if cog_tsv and Path(cog_tsv).exists() and expr_df is not None:
+                from codonpipe.modules.advanced_analyses import compute_cog_enrichment
+                adv_dir = output_dir / "advanced"
+                cog_enrich_gmm = compute_cog_enrichment(Path(cog_tsv), expr_df)
+                if not cog_enrich_gmm.empty:
+                    cog_path = adv_dir / f"{sample_id}_cog_enrichment.tsv"
+                    cog_enrich_gmm.to_csv(cog_path, sep="\t", index=False)
+                    all_outputs["advanced_cog_enrichment_path"] = cog_path
+                    advanced_results["cog_enrichment"] = cog_enrich_gmm
+                    logger.info("COG enrichment recomputed with GMM-based expression tiers")
+
         except Exception as e:
             logger.warning("GMM-aware metric recomputation failed: %s. Keeping RP-based values.", e)
 
@@ -564,6 +599,8 @@ def run_single_genome(
             cog_result_tsv=all_outputs.get("cog_result"),
             kofam_df=kofam_df,
             gff_path=resolved_gff,
+            gmm_cluster_rscu=gmm_cluster_rscu,
+            gmm_cluster_gene_ids=gmm_cluster_gene_ids,
         )
         # Normalize keys and flatten nested dicts for plotting compatibility
         _bio_key_map = {
@@ -626,6 +663,9 @@ def run_single_genome(
         advanced_results=advanced_results if advanced_results else None,
         bio_ecology_results=bio_ecology_results if bio_ecology_results else None,
         gff_path=resolved_gff,
+        gmm_cluster_rscu=gmm_cluster_rscu,
+        gmm_rp_cluster=gmm_results.get("gmm_rp_cluster"),
+        gmm_cluster_size=len(gmm_cluster_gene_ids) if gmm_cluster_gene_ids else None,
     )
     all_outputs.update(plot_outputs)
 
@@ -698,7 +738,7 @@ def run_batch(
         )
 
     # Detect metadata columns — exclude pipeline-specific columns
-    pipeline_cols = {"genome_path", "sample_id", "prokka_faa", "prokka_ffn", "prokka_gff", "gff_path", "kofam_results"}
+    pipeline_cols = _PIPELINE_COLS
     if metadata_cols is None:
         metadata_cols = [c for c in df.columns if c not in pipeline_cols]
     logger.info("Metadata columns for comparative analysis: %s", metadata_cols or "(none)")
@@ -820,7 +860,7 @@ def _run_batch_analyses(
     combined_rscu = pd.concat(rscu_rows, ignore_index=True)
 
     # Merge metadata from batch table (exclude pipeline-internal columns)
-    pipeline_cols = {"genome_path", "sample_id", "prokka_faa", "prokka_ffn", "prokka_gff", "gff_path", "kofam_results"}
+    pipeline_cols = _PIPELINE_COLS
     meta_cols_to_merge = ["sample_id"] + [
         c for c in metadata_cols if c in batch_df.columns and c not in pipeline_cols
     ]
