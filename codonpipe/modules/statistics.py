@@ -153,13 +153,15 @@ def compute_zscore_normalization(
     result = df.copy()
 
     if method == "clr":
-        # Centered log-ratio transform: log(x / geometric_mean(x)) per row
+        # Centered log-ratio transform: log(x / geometric_mean(x)) per row.
+        # Replace zeros/NaN with a small pseudocount before the log transform
+        # to avoid -inf values while minimally perturbing the ratios.
+        pseudocount = 1e-6
         for idx in result.index:
             vals = result.loc[idx, rscu_cols].values.astype(float)
-            # Add small pseudocount to handle zeros
-            vals_pseudo = vals + 1e-6
-            geo_mean = np.exp(np.mean(np.log(vals_pseudo)))
-            result.loc[idx, rscu_cols] = np.log(vals_pseudo / geo_mean)
+            vals = np.where(np.isnan(vals) | (vals == 0), pseudocount, vals)
+            geo_mean = np.exp(np.mean(np.log(vals)))
+            result.loc[idx, rscu_cols] = np.log(vals / geo_mean)
     elif method == "zscore":
         for col in rscu_cols:
             vals = result[col]
