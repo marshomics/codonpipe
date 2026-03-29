@@ -102,7 +102,12 @@ def load_batch_table(table_path: Path) -> pd.DataFrame:
 
     logger = logging.getLogger("codonpipe")
 
-    sep = "\t" if table_path.suffix in (".tsv", ".tab") else ","
+    # Auto-detect delimiter by sniffing the header line for tabs.
+    # Falls back to extension heuristic, then comma.
+    table_path = Path(table_path)
+    with open(table_path) as fh:
+        header_line = fh.readline()
+    sep = "\t" if "\t" in header_line else ","
     df = pd.read_csv(table_path, sep=sep, dtype=str)
 
     if "genome_path" not in df.columns:
