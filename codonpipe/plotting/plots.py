@@ -1098,7 +1098,7 @@ def plot_enc_diff(
     # Panel B: scatter ENC_diff vs GC3
     ax = axes[1]
     plot_df = enc_diff_df.copy()
-    # Color by expression_class (ACE-MELP when available, RP-MELP otherwise)
+    # Color by expression_class (RP-MELP based)
     _color_col = next((c for c in ("expression_class", "CAI_class")
                        if expr_df is not None and c in expr_df.columns), None)
     if expr_df is not None and "gene" in expr_df.columns and _color_col is not None:
@@ -1197,7 +1197,7 @@ def plot_pr2(
     fig, ax = plt.subplots(figsize=(7, 7))
 
     plot_df = pr2_df.copy()
-    # Color by expression_class (ACE-MELP when available, RP-MELP otherwise)
+    # Color by expression_class (RP-MELP based)
     _color_col = next((c for c in ("expression_class", "CAI_class")
                        if expr_df is not None and c in expr_df.columns), None)
     if expr_df is not None and "gene" in expr_df.columns and _color_col is not None:
@@ -3279,16 +3279,19 @@ def generate_single_genome_plots(
     # Enrichment plots
     if enrichment_results:
         # Per-comparison bar plots
-        # Keys are prefixed: "rp_enrichment_MELP_high" or "ace_enrichment_expression_high"
+        # Keys are prefixed: "rp_enrichment_MELP_high" or "gmm_enrichment_MELP_high"
         for key, edf in enrichment_results.items():
             if edf.empty:
                 continue
-            # Parse source (rp/ace) and metric/tier from the key
+            # Parse source (rp/gmm) and metric/tier from the key
             stripped = key
             source = ""
             if stripped.startswith("rp_"):
                 source = "RP-based "
                 stripped = stripped[3:]
+            elif stripped.startswith("gmm_"):
+                source = "GMM-based "
+                stripped = stripped[4:]
             elif stripped.startswith("ace_"):
                 source = "ACE-based "
                 stripped = stripped[4:]
