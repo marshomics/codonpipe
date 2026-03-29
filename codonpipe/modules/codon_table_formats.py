@@ -462,10 +462,11 @@ def generate_all_codon_tables(
             }
 
     # Add high-expression genes if available
+    # Prefer expression_class (ACE-MELP when ACE ran, RP-MELP otherwise),
+    # then fall back to CAI_class if expression_class isn't present.
     if expr_df is not None and not expr_df.empty:
-        # Try to find high-expression genes
         high_expr_ids = None
-        for col in ["expression_class", "CAI_class"]:
+        for col in ["expression_class", "ace_expression_class", "CAI_class"]:
             if col in expr_df.columns:
                 mask = expr_df[col] == "high"
                 if mask.any():
@@ -474,6 +475,8 @@ def generate_all_codon_tables(
                         expr_df.columns[0],
                     )
                     high_expr_ids = set(expr_df.loc[mask, gene_col])
+                    logger.info("High-expression gene set derived from '%s' (%d genes)",
+                                col, len(high_expr_ids))
                     break
 
         if high_expr_ids:
