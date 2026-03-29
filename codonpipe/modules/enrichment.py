@@ -100,7 +100,8 @@ def load_pathway_names(
             with open(cache_dir / "kegg_pathway_names.json", "w") as f:
                 json.dump(names, f)
         return names
-    except Exception:
+    except Exception as e:
+        logger.warning("Could not load KEGG pathway names: %s", e)
         return {}
 
 
