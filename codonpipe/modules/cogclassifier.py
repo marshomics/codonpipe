@@ -146,6 +146,11 @@ def extract_ribosomal_proteins(
             break
     if query_col is None:
         query_col = cog_df.columns[0]
+        logger.warning(
+            "Could not identify gene ID column in %s by name; falling back to "
+            "first column '%s'. If results look wrong, check COGclassifier output format.",
+            cog_result_tsv, query_col,
+        )
 
     # Filter for ribosomal proteins
     rp_mask = cog_df[cog_col].isin(ribosomal_cogs)
