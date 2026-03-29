@@ -143,28 +143,39 @@ def compute_s_value(
     rscu_gene_df: pd.DataFrame,
     rscu_rp: dict[str, float] | None,
     metric: str = "euclidean",
+    rscu_ace: dict[str, float] | None = None,
 ) -> pd.DataFrame:
-    """Compute per-gene RSCU distance to the ribosomal protein reference set.
+    """Compute per-gene RSCU distance to a reference codon usage profile.
 
-    Genes with low S-values have codon usage similar to ribosomal proteins
+    When *rscu_ace* is provided (ACE consensus RSCU), it is used as the
+    reference instead of ribosomal proteins.  The ACE consensus is
+    genome-specific and composition-independent, making S-values more
+    comparable across organisms with different GC content.
+
+    Genes with low S-values have codon usage similar to the reference
     (i.e. adapted toward translational optimization).
 
     Args:
         rscu_gene_df: Per-gene RSCU table.
-        rscu_rp: Concatenated RSCU for ribosomal proteins (reference vector).
+        rscu_rp: Concatenated RSCU for ribosomal proteins (fallback reference).
         metric: 'euclidean' or 'chi_squared'.
+        rscu_ace: ACE consensus RSCU dict (preferred reference when available).
 
     Returns:
-        DataFrame with gene, S_value columns.
+        DataFrame with gene, S_value, S_reference columns.
     """
-    if rscu_rp is None:
-        return pd.DataFrame(columns=["gene", "S_value"])
+    # Prefer ACE consensus over RP-based reference
+    ref = rscu_ace if rscu_ace is not None else rscu_rp
+    ref_label = "ace" if rscu_ace is not None else "rp"
 
-    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns and c in rscu_rp]
+    if ref is None:
+        return pd.DataFrame(columns=["gene", "S_value", "S_reference"])
+
+    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns and c in ref]
     if not rscu_cols:
-        return pd.DataFrame(columns=["gene", "S_value"])
+        return pd.DataFrame(columns=["gene", "S_value", "S_reference"])
 
-    ref_vec = np.array([rscu_rp[c] for c in rscu_cols])
+    ref_vec = np.array([ref[c] for c in rscu_cols])
     gene_mat = rscu_gene_df[rscu_cols].values
 
     if metric == "chi_squared":
@@ -178,6 +189,7 @@ def compute_s_value(
     return pd.DataFrame({
         "gene": rscu_gene_df["gene"].values,
         "S_value": dists,
+        "S_reference": ref_label,
     })
 
 
@@ -327,12 +339,15 @@ def compute_pr2(ffn_path: Path, min_length: int = 240) -> pd.DataFrame:
 def compute_delta_rscu(
     rscu_gene_df: pd.DataFrame,
     expr_df: pd.DataFrame,
-    class_col: str = "CAI_class",
+    class_col: str = "expression_class",
 ) -> pd.DataFrame:
     """Compute delta RSCU (high-expression genes vs genome average) per codon.
 
     Positive delta = codon favored in highly expressed genes.
     Negative delta = codon avoided in highly expressed genes.
+
+    The default *class_col* is ``expression_class``, which resolves to
+    ACE-MELP tiers when ACE has run, or RP-MELP tiers otherwise.
 
     Args:
         rscu_gene_df: Per-gene RSCU table.
@@ -483,7 +498,7 @@ def compute_trna_codon_correlation(
     trna_df: pd.DataFrame,
     rscu_gene_df: pd.DataFrame,
     expr_df: pd.DataFrame | None = None,
-    class_col: str = "CAI_class",
+    class_col: str = "expression_class",
 ) -> pd.DataFrame:
     """Correlate tRNA gene copy number with codon frequency in highly expressed genes.
 
@@ -494,7 +509,8 @@ def compute_trna_codon_correlation(
         trna_df: tRNA count table (from extract_trna_counts_from_gff).
         rscu_gene_df: Per-gene RSCU table.
         expr_df: Expression table for subsetting high-expression genes.
-        class_col: Expression classification column.
+        class_col: Expression classification column (defaults to
+            ``expression_class``, which is ACE-MELP when available).
 
     Returns:
         DataFrame with codon, amino_acid, tRNA_copy_number, codon_freq_all,
@@ -549,7 +565,7 @@ def compute_trna_codon_correlation(
 def compute_cog_enrichment(
     cog_result_tsv: Path,
     expr_df: pd.DataFrame,
-    class_col: str = "CAI_class",
+    class_col: str = "expression_class",
 ) -> pd.DataFrame:
     """Test COG functional category enrichment in expression tiers.
 
@@ -559,7 +575,8 @@ def compute_cog_enrichment(
     Args:
         cog_result_tsv: COGclassifier result.tsv.
         expr_df: Expression table with gene and *_class columns.
-        class_col: Expression classification column to use.
+        class_col: Expression classification column to use (defaults to
+            ``expression_class``, which is ACE-MELP when available).
 
     Returns:
         DataFrame with COG_category, description, tier, n_tier, n_background,
@@ -761,6 +778,7 @@ def run_advanced_analyses(
     encprime_df: pd.DataFrame | None = None,
     gff_path: Path | None = None,
     cog_result_tsv: Path | None = None,
+    rscu_ace: dict[str, float] | None = None,
 ) -> dict[str, pd.DataFrame | Path]:
     """Run all advanced codon usage analyses.
 
@@ -775,6 +793,8 @@ def run_advanced_analyses(
         encprime_df: ENCprime table.
         gff_path: GFF3 annotation file (for tRNA extraction).
         cog_result_tsv: COGclassifier result.tsv (for COG enrichment).
+        rscu_ace: ACE consensus RSCU dict. When provided, S-value uses
+            this genome-specific reference instead of ribosomal proteins.
 
     Returns:
         Dict of output DataFrames and file paths.
@@ -793,9 +813,10 @@ def run_advanced_analyses(
             outputs[key] = df
             outputs[f"{key}_path"] = out_path
 
-    # 2. S-value
-    logger.info("Computing S-value (RSCU distance to ribosomal proteins) for %s", sample_id)
-    s_val_df = compute_s_value(rscu_gene_df, rscu_rp)
+    # 2. S-value (prefer ACE consensus reference when available)
+    ref_label = "ACE consensus" if rscu_ace is not None else "ribosomal proteins"
+    logger.info("Computing S-value (RSCU distance to %s) for %s", ref_label, sample_id)
+    s_val_df = compute_s_value(rscu_gene_df, rscu_rp, rscu_ace=rscu_ace)
     if not s_val_df.empty:
         out_path = adv_dir / f"{sample_id}_s_value.tsv"
         s_val_df.to_csv(out_path, sep="\t", index=False)
@@ -833,7 +854,10 @@ def run_advanced_analyses(
     # 6. Delta RSCU
     if expr_df is not None:
         logger.info("Computing delta RSCU (high-expression vs genome avg) for %s", sample_id)
-        for class_col in ["CAI_class", "MELP_class", "Fop_class"]:
+        # Include ACE-derived expression classes when available
+        delta_class_cols = ["expression_class", "ace_expression_class",
+                           "CAI_class", "MELP_class", "Fop_class"]
+        for class_col in delta_class_cols:
             if class_col in expr_df.columns:
                 delta_df = compute_delta_rscu(rscu_gene_df, expr_df, class_col)
                 if not delta_df.empty:
