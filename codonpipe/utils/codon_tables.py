@@ -108,6 +108,12 @@ for _aa, _codons in AA_CODON_GROUPS.items():
 
 
 # DNA to RNA codon conversion
+# Minimum gene length (nucleotides) to include in codon analyses.
+# A single shared constant used by all analysis modules to ensure consistent
+# gene filtering.  240 nt ≈ 80 codons, the minimum for stable RSCU estimates.
+MIN_GENE_LENGTH = 240
+
+
 def dna_to_rna(seq: str) -> str:
     """Convert a DNA sequence to RNA."""
     return seq.upper().replace("T", "U")
