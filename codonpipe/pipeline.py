@@ -435,6 +435,71 @@ def run_single_genome(
     else:
         logger.info("[Step 9/12] Skipping ACE convergence (--skip-ace)")
 
+    # ── Step 9b: Re-run pathway enrichment on ACE-derived tiers ─────────
+    # The step-7 enrichment used RP-based expression tiers.  Now that ACE
+    # has reclassified genes, run enrichment again against the ACE-MELP
+    # tiers so downstream consumers get the composition-independent view.
+    if (
+        not skip_ace
+        and expr_df is not None
+        and "ace_expression_class" in (expr_df.columns if expr_df is not None else [])
+        and kofam_df is not None
+        and not kofam_df.empty
+    ):
+        logger.info("[Step 9b/12] Re-running pathway enrichment on ACE-derived expression tiers")
+        try:
+            ace_enrich_outputs = run_enrichment_analysis(
+                expr_df, kofam_df, output_dir, sample_id,
+                kegg_ko_pathway_file=kegg_ko_pathway,
+                metrics=["ace_expression"],
+                output_subdir="enrichment_ace",
+            )
+            all_outputs.update({
+                f"ace_{k}": v for k, v in ace_enrich_outputs.items()
+            })
+            # Reload enrichment results for plotting
+            for key, path in ace_enrich_outputs.items():
+                if key.startswith("enrichment_") and path.exists():
+                    enrichment_results[f"ace_{key}"] = pd.read_csv(path, sep="\t")
+        except Exception as e:
+            logger.warning("ACE-tier pathway enrichment failed: %s. Continuing.", e, exc_info=True)
+
+    # ── Step 9c: Re-compute ACE-aware advanced metrics ──────────────────
+    # Step 8 ran S-value against ribosomal proteins and delta RSCU against
+    # RP-based tiers.  Now that ACE has converged and reclassified genes,
+    # recompute with the composition-independent reference and tiers.
+    if ace_results.get("ace_weights_array") is not None and ace_results.get("ace_codon_cols"):
+        try:
+            from codonpipe.modules.advanced_analyses import compute_s_value, compute_delta_rscu
+            ace_weights = ace_results["ace_weights_array"]
+            ace_cols = ace_results["ace_codon_cols"]
+            rscu_ace_dict = dict(zip(ace_cols, ace_weights))
+            adv_dir = output_dir / "advanced"
+
+            # S-value against ACE consensus
+            logger.info("[Step 9c/12] Recomputing S-value and delta RSCU with ACE-derived values")
+            s_val_ace_df = compute_s_value(rscu_gene_df, rscu_rp, rscu_ace=rscu_ace_dict)
+            if not s_val_ace_df.empty:
+                s_val_path = adv_dir / f"{sample_id}_s_value.tsv"
+                s_val_ace_df.to_csv(s_val_path, sep="\t", index=False)
+                all_outputs["advanced_s_value_path"] = s_val_path
+                advanced_results["s_value"] = s_val_ace_df
+                logger.info("S-value recomputed against ACE consensus (%d genes)", len(s_val_ace_df))
+
+            # Delta RSCU with ACE expression tiers
+            if expr_df is not None:
+                for class_col in ["expression_class", "ace_expression_class"]:
+                    if class_col in expr_df.columns:
+                        delta_df = compute_delta_rscu(rscu_gene_df, expr_df, class_col)
+                        if not delta_df.empty:
+                            metric = class_col.replace("_class", "")
+                            out_path = adv_dir / f"{sample_id}_delta_rscu_{metric}.tsv"
+                            delta_df.to_csv(out_path, sep="\t", index=False)
+                            all_outputs[f"advanced_delta_rscu_{metric}_path"] = out_path
+                            advanced_results[f"delta_rscu_{metric}"] = delta_df
+        except Exception as e:
+            logger.warning("ACE-aware metric recomputation failed: %s. Keeping RP-based values.", e)
+
     # ── Step 10: Biological/ecological analyses ─────────────────────────
     logger.info("[Step 10/12] Running biological and ecological analyses")
     bio_ecology_results = {}
