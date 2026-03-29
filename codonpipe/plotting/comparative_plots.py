@@ -20,6 +20,7 @@ from scipy import stats as sp_stats
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
+from codonpipe.plotting.utils import DPI, FORMATS, apply_style as _apply_style, save_fig as _save_fig
 from codonpipe.utils.codon_tables import RSCU_COLUMN_NAMES
 
 logger = logging.getLogger("codonpipe")
@@ -35,29 +36,6 @@ _CONDITION_PALETTE = [
 def _condition_colors(conditions: list[str]) -> dict[str, str]:
     unique = sorted(set(conditions))
     return {c: _CONDITION_PALETTE[i % len(_CONDITION_PALETTE)] for i, c in enumerate(unique)}
-
-
-DPI = 300
-FORMATS = ["png", "svg"]
-
-
-def _apply_style():
-    plt.rcParams.update({
-        "font.family": "sans-serif",
-        "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
-        "font.size": 10,
-        "axes.linewidth": 0.8,
-        "xtick.major.width": 0.6,
-        "ytick.major.width": 0.6,
-        "svg.fonttype": "none",
-    })
-
-
-def _save_fig(fig, base_path: Path, dpi: int = DPI):
-    for fmt in FORMATS:
-        out = base_path.with_suffix(f".{fmt}")
-        fig.savefig(out, format=fmt, dpi=dpi, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
