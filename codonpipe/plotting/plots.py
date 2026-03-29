@@ -26,6 +26,7 @@ from scipy.cluster.hierarchy import dendrogram, linkage
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
+from codonpipe.plotting.utils import DPI, FORMATS, apply_style as _apply_style, save_fig as _save_fig
 from codonpipe.utils.codon_tables import AMINO_ACID_FAMILIES, RSCU_COLUMN_NAMES
 
 logger = logging.getLogger("codonpipe")
@@ -36,44 +37,6 @@ def _safe_label(value, fallback: str = "", maxlen: int = 50) -> str:
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return str(fallback)[:maxlen] if fallback else ""
     return str(value)[:maxlen]
-
-# Publication style defaults
-STYLE_PARAMS = {
-    "font.family": "sans-serif",
-    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
-    "font.size": 10,
-    "axes.labelsize": 12,
-    "axes.titlesize": 13,
-    "xtick.labelsize": 9,
-    "ytick.labelsize": 9,
-    "legend.fontsize": 9,
-    "figure.dpi": 300,
-    "savefig.dpi": 300,
-    "savefig.bbox": "tight",
-    "savefig.pad_inches": 0.1,
-    # SVG settings: embed fonts so glyphs render correctly in Illustrator
-    # without requiring the font to be installed on the editing machine.
-    "svg.fonttype": "none",  # output text as <text> elements (editable in AI)
-}
-
-DPI = 300
-FORMATS = ["png", "svg"]
-
-
-def _apply_style():
-    """Apply publication-quality matplotlib style."""
-    plt.rcParams.update(STYLE_PARAMS)
-    sns.set_style("whitegrid", {"grid.linestyle": "--", "grid.alpha": 0.3})
-
-
-def _save_fig(fig: plt.Figure, path: Path, formats: list[str] | None = None):
-    """Save figure in multiple formats."""
-    formats = formats or FORMATS
-    for fmt in formats:
-        out = path.with_suffix(f".{fmt}")
-        fig.savefig(out, format=fmt, dpi=DPI, bbox_inches="tight")
-        logger.debug("Saved figure: %s", out)
-    plt.close(fig)
 
 
 # ─── Single-genome plots ────────────────────────────────────────────────────
@@ -1052,8 +1015,13 @@ def plot_s_value_scatter(
                 label=f"r = {r:.3f}, p = {p_val:.2e}")
         ax.legend(fontsize=8)
 
+    # Determine S-value reference from the DataFrame if available
+    _s_ref_map = {"gmm_cluster": "GMM cluster", "ace": "ACE consensus", "rp": "ribosomal proteins"}
+    _s_ref_raw = merged["S_reference"].iloc[0] if "S_reference" in merged.columns else "rp"
+    _s_ref_label = _s_ref_map.get(_s_ref_raw, _s_ref_raw)
+
     ax.set_xlabel(f"{metric} Score")
-    ax.set_ylabel("S-value (RSCU distance to ribosomal proteins)")
+    ax.set_ylabel(f"S-value (RSCU distance to {_s_ref_label})")
     if sample_id:
         ax.set_title(f"S-value vs {metric} — {sample_id}")
 
@@ -2251,11 +2219,13 @@ def plot_growth_rate_gauge(
 ):
     """Gauge/infographic plot showing growth rate and associated metrics.
 
-    Displays predicted doubling time, mean CAI of RP genes, and growth class
-    with color-coded zones: green (<2h fast), yellow (2-8h moderate), red (>8h slow).
+    Displays predicted doubling time, mean expression metric of RP genes, and
+    growth class with color-coded zones: green (<2h fast), yellow (2-8h moderate),
+    red (>8h slow).
 
     Args:
-        growth_dict: Dict with keys doubling_time, mean_cai_rp, growth_class.
+        growth_dict: Dict with keys predicted_doubling_time_hours, mean_metric_rp,
+            expression_metric, growth_class.
         output_path: Base path for saving.
         sample_id: Sample identifier.
     """
@@ -2265,7 +2235,12 @@ def plot_growth_rate_gauge(
 
     doubling_time = growth_dict.get("predicted_doubling_time_hours",
                                      growth_dict.get("doubling_time", 0))
-    mean_cai = growth_dict.get("mean_cai_rp", 0)
+    expr_metric = growth_dict.get("expression_metric", "CAI")
+    mean_metric = growth_dict.get("mean_metric",
+                                   growth_dict.get("mean_metric_rp",
+                                   growth_dict.get("mean_cai_rp", 0)))
+    ref_set = growth_dict.get("reference_set", "ribosomal_proteins")
+    ref_display = ref_set.replace("_", " ").title()
     growth_class = growth_dict.get("growth_class", "unknown")
 
     fig = plt.figure(figsize=(10, 6))
@@ -2305,8 +2280,8 @@ def plot_growth_rate_gauge(
 
     # CAI panel
     ax_cai = fig.add_subplot(gs[1, 0])
-    ax_cai.text(0.5, 0.6, f"{mean_cai:.3f}", ha="center", va="center", fontsize=20, weight="bold", transform=ax_cai.transAxes)
-    ax_cai.text(0.5, 0.2, "Mean CAI\n(Ribosomal Proteins)", ha="center", va="center", fontsize=10, transform=ax_cai.transAxes)
+    ax_cai.text(0.5, 0.6, f"{mean_metric:.3f}", ha="center", va="center", fontsize=20, weight="bold", transform=ax_cai.transAxes)
+    ax_cai.text(0.5, 0.2, f"Mean {expr_metric}\n({ref_display})", ha="center", va="center", fontsize=10, transform=ax_cai.transAxes)
     ax_cai.axis("off")
 
     # Growth class panel
@@ -2364,8 +2339,10 @@ def plot_grodon2_summary(
     growth_class = grodon_dict.get("growth_class", "unknown")
 
     cai_d = None
+    vs_metric = "CAI"
     if cai_growth_dict:
         cai_d = cai_growth_dict.get("predicted_doubling_time_hours")
+        vs_metric = cai_growth_dict.get("expression_metric", "CAI")
 
     fig = plt.figure(figsize=(12, 7))
     gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.45, wspace=0.35)
@@ -2386,9 +2363,9 @@ def plot_grodon2_summary(
     errs_hi.append(hi - d if hi else 0)
     colors.append("#2196F3")
 
-    # CAI method
+    # Vieira-Silva method (metric may be MELP, CAI, or Fop)
     if cai_d is not None:
-        labels.append("CAI\n(Vieira-Silva)")
+        labels.append(f"{vs_metric}\n(Vieira-Silva)")
         vals.append(cai_d)
         errs_lo.append(0)
         errs_hi.append(0)
@@ -2577,9 +2554,13 @@ def plot_grodon2_batch_comparison(
             ax3.set_xlim(0, lim_max)
             ax3.set_ylim(0, lim_max)
 
-        ax3.set_xlabel("CAI-based Doubling Time (h)", fontsize=10)
+        # Determine which expression metric the Vieira-Silva model used
+        _vs_labels = {s: cai_data[s].get("expression_metric", "CAI")
+                      for s in cai_data if cai_data[s]}
+        _vs_metric = next(iter(_vs_labels.values()), "CAI") if _vs_labels else "CAI"
+        ax3.set_xlabel(f"{_vs_metric}-based Doubling Time (h)", fontsize=10)
         ax3.set_ylabel("gRodon2 Doubling Time (h)", fontsize=10)
-        ax3.set_title("gRodon2 vs CAI Model", fontsize=10, weight="bold")
+        ax3.set_title(f"gRodon2 vs {_vs_metric} Model", fontsize=10, weight="bold")
         ax3.grid(True, alpha=0.3)
 
     fig.suptitle("gRodon2 Growth Rate Comparison Across Genomes", fontsize=12, weight="bold")
@@ -2998,8 +2979,15 @@ def plot_mge_vs_core_rscu(
     merged = enc_df.copy()
     if "mahalanobis_dist" in hgt_df.columns:
         merged = merged.merge(hgt_df[["gene", "mahalanobis_dist"]], on="gene", how="left")
-    if expr_df is not None and "CAI" in expr_df.columns:
-        merged = merged.merge(expr_df[["gene", "CAI"]], on="gene", how="left")
+    # Prefer MELP > CAI > Fop for the expression panel
+    _expr_col = None
+    if expr_df is not None:
+        for _m in ("MELP", "CAI", "Fop"):
+            if _m in expr_df.columns:
+                _expr_col = _m
+                break
+    if _expr_col is not None:
+        merged = merged.merge(expr_df[["gene", _expr_col]], on="gene", how="left")
 
     def _assign_class(gene):
         if gene in mge_genes:
@@ -3019,8 +3007,8 @@ def plot_mge_vs_core_rscu(
         panels.append(("GC3", "GC3"))
     if "mahalanobis_dist" in merged.columns:
         panels.append(("mahalanobis_dist", "Mahalanobis distance"))
-    if "CAI" in merged.columns:
-        panels.append(("CAI", "CAI"))
+    if _expr_col is not None and _expr_col in merged.columns:
+        panels.append((_expr_col, _expr_col))
 
     if not panels:
         return
@@ -3140,6 +3128,9 @@ def generate_single_genome_plots(
     advanced_results: dict[str, pd.DataFrame] | None = None,
     bio_ecology_results: dict[str, pd.DataFrame | dict] | None = None,
     gff_path: Path | None = None,
+    gmm_cluster_rscu: "pd.Series | None" = None,
+    gmm_rp_cluster: int | None = None,
+    gmm_cluster_size: int | None = None,
 ) -> dict[str, Path]:
     """Generate all single-genome plots.
 
@@ -3201,6 +3192,24 @@ def generate_single_genome_plots(
             logger.warning("RSCU heatmap plot failed: %s", e)
     else:
         logger.info("SKIPPED: RSCU heatmap (no per-gene RSCU data)")
+
+    # GMM cluster RSCU rounded heatmap — shows the translationally optimised
+    # cluster's pooled codon usage, placed alongside the genome-wide heatmaps
+    # for direct visual comparison.
+    if gmm_cluster_rscu is not None and not gmm_cluster_rscu.empty:
+        try:
+            from codonpipe.modules.gmm_clustering import _plot_gmm_cluster_rscu_heatmap
+            p = plot_dir / f"{sample_id}_gmm_cluster_rscu_heatmap"
+            _plot_gmm_cluster_rscu_heatmap(
+                gmm_cluster_rscu, p, sample_id,
+                cluster_label=gmm_rp_cluster if gmm_rp_cluster is not None else 0,
+                n_genes=gmm_cluster_size if gmm_cluster_size is not None else 0,
+            )
+            outputs["gmm_cluster_rscu_heatmap"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("GMM cluster RSCU heatmap failed: %s", e)
+    else:
+        logger.info("SKIPPED: GMM cluster RSCU heatmap (no GMM cluster data)")
 
     if enc_df is not None and not enc_df.empty:
         try:
@@ -3396,7 +3405,7 @@ def _generate_advanced_plots(
     # S-value scatter
     if "s_value" in adv and expr_df is not None:
         try:
-            for metric in ["CAI", "MELP", "Fop"]:
+            for metric in ["MELP", "CAI", "Fop"]:
                 if metric in expr_df.columns:
                     p = plot_dir / f"{sample_id}_s_value_vs_{metric.lower()}"
                     plot_s_value_scatter(adv["s_value"], expr_df, p, sample_id, metric)
@@ -4004,7 +4013,8 @@ def plot_genome_metrics_comparison(
 
         gr = sample_data[sid].get("growth_rate")
         if isinstance(gr, dict) and "predicted_doubling_time_hours" in gr:
-            row["Doubling time\n(CAI, h)"] = gr["predicted_doubling_time_hours"]
+            _gr_metric = gr.get("expression_metric", "CAI")
+            row[f"Doubling time\n({_gr_metric}, h)"] = gr["predicted_doubling_time_hours"]
 
         grodon = sample_data[sid].get("grodon2")
         if isinstance(grodon, dict) and "predicted_doubling_time_hours" in grodon:
