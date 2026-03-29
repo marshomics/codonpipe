@@ -466,7 +466,7 @@ def generate_all_codon_tables(
     # then fall back to CAI_class if expression_class isn't present.
     if expr_df is not None and not expr_df.empty:
         high_expr_ids = None
-        for col in ["expression_class", "ace_expression_class", "CAI_class"]:
+        for col in ["expression_class", "ace_MELP_class", "CAI_class"]:
             if col in expr_df.columns:
                 mask = expr_df[col] == "high"
                 if mask.any():
