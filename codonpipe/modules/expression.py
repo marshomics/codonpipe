@@ -13,12 +13,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from codonpipe.utils.codon_tables import MIN_GENE_LENGTH
 from codonpipe.utils.io import check_tool, run_cmd
 
 logger = logging.getLogger("codonpipe")
 
-# R script template for MELP calculation
-_MELP_R_SCRIPT = r"""
+
+_EXPRESSION_R_TEMPLATE = r"""
 library(coRdon)
 library(Biostrings)
 library(IRanges)
@@ -33,109 +34,46 @@ rp_ids <- readLines(rp_ids_file)
 rp_ids <- rp_ids[nchar(rp_ids) > 0]
 rp <- list(rp = rp_ids)
 
-tryCatch({{
+tryCatch({
     fasta <- readSet(file = fasta_file)
     # Strip FASTA headers to first word so IDs match rp_ids
     names(fasta) <- sub(" .*", "", names(fasta))
     codons <- codonTable(fasta)
     codons@KO <- codons@ID
 
-    melp <- MELP(codons, filtering = "none", subsets = rp, id_or_name2 = "11")
-    melp_df <- as.data.frame(melp)
+    scores <- __METRIC__(codons, filtering = "none", subsets = rp, id_or_name2 = "11")
+    scores_df <- as.data.frame(scores)
 
     names_df <- data.frame(gene = names(fasta))
     width_df <- data.frame(width = width(fasta))
 
-    result <- cbind(melp_df, names_df, width_df)
-    result <- subset(result, width > 240)
+    result <- cbind(scores_df, names_df, width_df)
+    result <- subset(result, width > __MIN_LEN__)
 
     write.table(result, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
-    cat("MELP analysis complete:", nrow(result), "genes\n")
-}}, error = function(e) {{
+    cat("__METRIC__ analysis complete:", nrow(result), "genes\n")
+}, error = function(e) {
     message("ERROR: ", e$message)
     quit(status = 1)
-}})
+})
 """
 
-# R script template for CAI calculation
-_CAI_R_SCRIPT = r"""
-library(coRdon)
-library(Biostrings)
-library(IRanges)
 
-args <- commandArgs(trailingOnly = TRUE)
-fasta_file <- args[1]
-rp_ids_file <- args[2]
-output_file <- args[3]
+def _expression_r_script(metric_func: str) -> str:
+    """Build an R script for a coRdon expression metric.
 
-# Read ribosomal protein IDs
-rp_ids <- readLines(rp_ids_file)
-rp_ids <- rp_ids[nchar(rp_ids) > 0]
-rp <- list(rp = rp_ids)
+    The template is shared across MELP, CAI, and Fop; only the function
+    call differs.  MIN_GENE_LENGTH is injected so the R-side filter stays
+    in sync with the Python constant.
 
-tryCatch({{
-    fasta <- readSet(file = fasta_file)
-    # Strip FASTA headers to first word so IDs match rp_ids
-    names(fasta) <- sub(" .*", "", names(fasta))
-    codons <- codonTable(fasta)
-    codons@KO <- codons@ID
-
-    cai <- CAI(codons, filtering = "none", subsets = rp, id_or_name2 = "11")
-    cai_df <- as.data.frame(cai)
-
-    names_df <- data.frame(gene = names(fasta))
-    width_df <- data.frame(width = width(fasta))
-
-    result <- cbind(cai_df, names_df, width_df)
-    result <- subset(result, width > 240)
-
-    write.table(result, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
-    cat("CAI analysis complete:", nrow(result), "genes\n")
-}}, error = function(e) {{
-    message("ERROR: ", e$message)
-    quit(status = 1)
-}})
-"""
-
-# R script template for Fop (Frequency of optimal codons) calculation
-_FOP_R_SCRIPT = r"""
-library(coRdon)
-library(Biostrings)
-library(IRanges)
-
-args <- commandArgs(trailingOnly = TRUE)
-fasta_file <- args[1]
-rp_ids_file <- args[2]
-output_file <- args[3]
-
-# Read ribosomal protein IDs
-rp_ids <- readLines(rp_ids_file)
-rp_ids <- rp_ids[nchar(rp_ids) > 0]
-rp <- list(rp = rp_ids)
-
-tryCatch({{
-    fasta <- readSet(file = fasta_file)
-    # Strip FASTA headers to first word so IDs match rp_ids
-    names(fasta) <- sub(" .*", "", names(fasta))
-    codons <- codonTable(fasta)
-    codons@KO <- codons@ID
-
-    fop <- Fop(codons, filtering = "none", subsets = rp, id_or_name2 = "11")
-    fop_df <- as.data.frame(fop)
-
-    names_df <- data.frame(gene = names(fasta))
-    width_df <- data.frame(width = width(fasta))
-
-    result <- cbind(fop_df, names_df, width_df)
-    result <- subset(result, width > 240)
-
-    write.table(result, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
-    cat("Fop analysis complete:", nrow(result), "genes\n")
-}}, error = function(e) {{
-    message("ERROR: ", e$message)
-    quit(status = 1)
-}})
-"""
+    Args:
+        metric_func: coRdon function name — "MELP", "CAI", or "Fop".
+    """
+    return (
+        _EXPRESSION_R_TEMPLATE
+        .replace("__METRIC__", metric_func)
+        .replace("__MIN_LEN__", str(MIN_GENE_LENGTH))
+    )
 
 
 def run_expression_analysis(
@@ -171,26 +109,20 @@ def run_expression_analysis(
         )
         return outputs
 
-    # MELP
-    melp_out = expr_dir / f"{sample_id}_melp.tsv"
-    if not melp_out.exists() or force:
-        logger.info("Computing MELP expression scores for %s", sample_id)
-        _run_r_expression(_MELP_R_SCRIPT, ffn_path, rp_ids_file, melp_out, "MELP", sample_id)
-    outputs["melp"] = melp_out
+    # Run each metric using the shared R script template
+    for metric, outname in [("MELP", "melp"), ("CAI", "cai"), ("Fop", "fop")]:
+        out_path = expr_dir / f"{sample_id}_{outname}.tsv"
+        if not out_path.exists() or force:
+            logger.info("Computing %s expression scores for %s", metric, sample_id)
+            _run_r_expression(
+                _expression_r_script(metric),
+                ffn_path, rp_ids_file, out_path, metric, sample_id,
+            )
+        outputs[outname] = out_path
 
-    # CAI
-    cai_out = expr_dir / f"{sample_id}_cai.tsv"
-    if not cai_out.exists() or force:
-        logger.info("Computing CAI expression scores for %s", sample_id)
-        _run_r_expression(_CAI_R_SCRIPT, ffn_path, rp_ids_file, cai_out, "CAI", sample_id)
-    outputs["cai"] = cai_out
-
-    # Fop (Frequency of optimal codons)
-    fop_out = expr_dir / f"{sample_id}_fop.tsv"
-    if not fop_out.exists() or force:
-        logger.info("Computing Fop (frequency of optimal codons) for %s", sample_id)
-        _run_r_expression(_FOP_R_SCRIPT, ffn_path, rp_ids_file, fop_out, "Fop", sample_id)
-    outputs["fop"] = fop_out
+    melp_out = outputs.get("melp", expr_dir / f"{sample_id}_melp.tsv")
+    cai_out = outputs.get("cai", expr_dir / f"{sample_id}_cai.tsv")
+    fop_out = outputs.get("fop", expr_dir / f"{sample_id}_fop.tsv")
 
     # Combine and classify expression levels
     combined_out = expr_dir / f"{sample_id}_expression.tsv"
@@ -269,6 +201,28 @@ def _classify_by_percentile(
     )
 
 
+def _rename_score_column(df: pd.DataFrame, target_name: str) -> pd.DataFrame:
+    """Rename the single numeric score column in a coRdon output DataFrame.
+
+    coRdon produces a TSV with columns: a numeric score, 'gene', and 'width'.
+    This function finds the first numeric column that isn't 'gene' or 'width'
+    and renames it to *target_name*.  If no suitable column is found, the
+    DataFrame is returned unchanged and a warning is logged.
+    """
+    meta_cols = {"gene", "width"}
+    for col in df.columns:
+        if col in meta_cols:
+            continue
+        if pd.api.types.is_numeric_dtype(df[col]):
+            return df.rename(columns={col: target_name})
+    logger.warning(
+        "No numeric score column found in coRdon output (columns: %s); "
+        "expected a column to rename to '%s'",
+        list(df.columns), target_name,
+    )
+    return df
+
+
 def _combine_expression(
     melp_path: Path, cai_path: Path, fop_path: Path, sample_id: str,
 ) -> pd.DataFrame:
@@ -276,8 +230,8 @@ def _combine_expression(
 
     Each metric gets its own classification column (MELP_class, CAI_class,
     Fop_class) using the same percentile scheme:
-        - high: >= 95th percentile of that metric
-        - low:  <= 5th percentile of that metric
+        - high: >= 90th percentile of that metric
+        - low:  <= 10th percentile of that metric
         - medium: everything else
 
     The ``expression_class`` column defaults to MELP_class (MELP outperforms
@@ -286,12 +240,10 @@ def _combine_expression(
     melp_df = pd.read_csv(melp_path, sep="\t")
     cai_df = pd.read_csv(cai_path, sep="\t")
 
-    # Rename the score columns
-    melp_score_col = [c for c in melp_df.columns if c not in ("gene", "width")][0]
-    cai_score_col = [c for c in cai_df.columns if c not in ("gene", "width")][0]
-
-    melp_df = melp_df.rename(columns={melp_score_col: "MELP"})
-    cai_df = cai_df.rename(columns={cai_score_col: "CAI"})
+    # Rename the score column.  coRdon outputs a single numeric column
+    # alongside 'gene' and 'width'; identify it by excluding those two.
+    melp_df = _rename_score_column(melp_df, "MELP")
+    cai_df = _rename_score_column(cai_df, "CAI")
 
     # Merge MELP and CAI on gene
     combined = melp_df[["gene", "width", "MELP"]].merge(
@@ -301,13 +253,11 @@ def _combine_expression(
     # Merge Fop if available
     if fop_path.exists():
         fop_df = pd.read_csv(fop_path, sep="\t")
-        fop_score_candidates = [c for c in fop_df.columns if c not in ("gene", "width")]
-        if not fop_score_candidates:
-            logger.warning("Fop output has no score column; skipping Fop merge")
-        else:
-            fop_score_col = fop_score_candidates[0]
-            fop_df = fop_df.rename(columns={fop_score_col: "Fop"})
+        fop_df = _rename_score_column(fop_df, "Fop")
+        if "Fop" in fop_df.columns:
             combined = combined.merge(fop_df[["gene", "Fop"]], on="gene", how="outer")
+        else:
+            logger.warning("Fop output has no usable score column; skipping Fop merge")
 
     # Per-metric classification
     for metric in ["MELP", "CAI", "Fop"]:
