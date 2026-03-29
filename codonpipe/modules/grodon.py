@@ -100,24 +100,39 @@ local({
 
 
 def _r_user_lib(rscript: str) -> str | None:
-    """Return the first user-writable R library path, creating it if needed."""
+    """Return R's resolved user library path.
+
+    Asks R to expand ``R_LIBS_USER`` (which may contain ``%p`` and ``%v``
+    placeholders for platform and version) into an actual directory path.
+    Falls back to ``~/R/library`` if the environment variable is unset.
+    """
+    # R expands the placeholders internally via path.expand + sub;
+    # we ask R itself to do it so we get the same path it would use.
+    r_code = (
+        "p <- Sys.getenv('R_LIBS_USER', unset='');"
+        "if (nchar(p) == 0) p <- file.path(Sys.getenv('HOME'), 'R', 'library');"
+        "p <- gsub('%p', R.version$platform, p, fixed=TRUE);"
+        "p <- gsub('%v', paste(R.version$major, R.version$minor, sep='.'), p, fixed=TRUE);"
+        "p <- gsub('%V', paste(R.version$major, substr(R.version$minor, 1, 1), sep='.'), p, fixed=TRUE);"
+        "cat(p)"
+    )
     try:
         result = subprocess.run(
-            [rscript, "--no-save", "--no-restore", "-e",
-             "cat(Sys.getenv('R_LIBS_USER', unset=path.expand('~/R/library')))"],
+            [rscript, "--no-save", "--no-restore", "-e", r_code],
             capture_output=True, text=True, timeout=15,
         )
         if result.returncode == 0 and result.stdout.strip():
-            p = result.stdout.strip().split("\n")[-1]
-            # R_LIBS_USER can contain %V or %p placeholders
-            if "%" not in p:
-                return p
+            return result.stdout.strip().split("\n")[-1]
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
     return None
 
 
-def _probe_grodon(rscript: str, extra_lib: str | None = None) -> str | None:
+def _probe_grodon(
+    rscript: str,
+    extra_lib: str | None = None,
+    verbose: bool = False,
+) -> str | None:
     """Try to load gRodon2 in R. Returns the version string or None.
 
     Uses ``--no-save --no-restore`` instead of ``--vanilla`` so that
@@ -127,24 +142,43 @@ def _probe_grodon(rscript: str, extra_lib: str | None = None) -> str | None:
     If *extra_lib* is given it is prepended to ``.libPaths()`` before
     the ``library()`` call, which handles the case where the user lib
     directory was created during install but isn't on the default path.
+
+    When *verbose* is True the R stderr is logged at INFO level (used
+    during install verification to surface the actual error).
     """
+    # Use a sentinel marker so we can extract the version from stdout
+    # even when R prints warnings or other messages before it.
+    marker = "GRODON_VER="
     preamble = ""
     if extra_lib:
         preamble = f".libPaths(c('{extra_lib}', .libPaths())); "
+    r_code = (
+        preamble
+        + f"library(gRodon); cat('{marker}', "
+        + "paste(packageVersion('gRodon')[[1]], collapse='.'), '\\n', sep='')"
+    )
     try:
         result = subprocess.run(
-            [rscript, "--no-save", "--no-restore", "-e",
-             preamble + "library(gRodon); cat(packageVersion('gRodon')[[1]], sep='.')"],
+            [rscript, "--no-save", "--no-restore", "-e", r_code],
             capture_output=True,
             text=True,
             timeout=30,
         )
         if result.returncode == 0:
-            ver = result.stdout.strip()
-            if ver:
-                return ver
+            for line in result.stdout.splitlines():
+                if line.startswith(marker):
+                    ver = line[len(marker):].strip()
+                    if ver:
+                        return ver
+            # Marker not found — library loaded but version output garbled
+            logger.debug("gRodon2 probe stdout (no marker):\n%s", result.stdout[:500])
         else:
-            logger.debug("gRodon2 probe stderr:\n%s", result.stderr[:1000])
+            log = logger.info if verbose else logger.debug
+            log("gRodon2 probe failed (exit %d):\n%s",
+                result.returncode, result.stderr[:2000])
+            if verbose:
+                logger.info("gRodon2 probe .libPaths used: %s",
+                            extra_lib or "(default)")
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
     return None
@@ -199,12 +233,14 @@ def install_grodon(timeout: int = 600) -> bool:
 
             # Verify the install is loadable — try plain probe first,
             # then with the explicit library path from the install.
-            version = _probe_grodon(rscript)
+            # Use verbose=True so any R error is logged at INFO level.
+            version = _probe_grodon(rscript, verbose=True)
             if version is None and install_lib:
-                logger.debug(
+                logger.info(
                     "Plain probe failed; retrying with lib=%s", install_lib
                 )
-                version = _probe_grodon(rscript, extra_lib=install_lib)
+                version = _probe_grodon(rscript, extra_lib=install_lib,
+                                        verbose=True)
             if version is not None:
                 logger.info("gRodon2 version %s is now available", version)
                 return True
