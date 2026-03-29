@@ -401,7 +401,7 @@ def generate_all_codon_tables(
     sample_id: str,
     expr_df: pd.DataFrame | None = None,
     rp_ids_file: Path | None = None,
-    ace_core_gene_ids: set[str] | None = None,
+    gmm_cluster_gene_ids: set[str] | None = None,
 ) -> dict[str, Path]:
     """Generate comprehensive codon usage tables for multiple gene sets.
 
@@ -409,7 +409,7 @@ def generate_all_codon_tables(
     a) All genes (genome-wide)
     b) Ribosomal protein genes (from rp_ffn_path if provided)
     c) High-expression genes (if expr_df available)
-    d) ACE core genes (if ace_core_gene_ids provided)
+    d) GMM RP-cluster genes (if gmm_cluster_gene_ids provided)
 
     Saves tables as TSVs to output_dir/codon_tables/
     Naming: {sample_id}_{geneset}_{format}.tsv
@@ -422,7 +422,7 @@ def generate_all_codon_tables(
         expr_df: Optional DataFrame with expression data. Should have columns
                  'gene_id' and either 'expression_class' or 'CAI_class' with values like 'high'.
         rp_ids_file: Optional path to file with ribosomal protein gene IDs (one per line).
-        ace_core_gene_ids: Optional set of gene IDs from ACE convergence core set.
+        gmm_cluster_gene_ids: Optional set of gene IDs from the GMM RP cluster.
 
     Returns:
         Dict mapping output descriptions to file paths.
@@ -462,11 +462,10 @@ def generate_all_codon_tables(
             }
 
     # Add high-expression genes if available
-    # Prefer expression_class (ACE-MELP when ACE ran, RP-MELP otherwise),
-    # then fall back to CAI_class if expression_class isn't present.
+    # Prefer expression_class (RP-MELP based), then fall back to CAI_class.
     if expr_df is not None and not expr_df.empty:
         high_expr_ids = None
-        for col in ["expression_class", "ace_MELP_class", "CAI_class"]:
+        for col in ["expression_class", "CAI_class"]:
             if col in expr_df.columns:
                 mask = expr_df[col] == "high"
                 if mask.any():
@@ -486,12 +485,12 @@ def generate_all_codon_tables(
                 "desc": "High-expression genes",
             }
 
-    # Add ACE core genes if available
-    if ace_core_gene_ids and len(ace_core_gene_ids) >= 5:
-        gene_sets["ace_core"] = {
+    # Add GMM RP-cluster genes if available
+    if gmm_cluster_gene_ids and len(gmm_cluster_gene_ids) >= 5:
+        gene_sets["gmm_cluster"] = {
             "ffn": ffn_path,
-            "gene_ids": ace_core_gene_ids,
-            "desc": "ACE convergence core genes",
+            "gene_ids": gmm_cluster_gene_ids,
+            "desc": "GMM RP-cluster genes",
         }
 
     # Generate tables for each gene set
@@ -590,37 +589,37 @@ def generate_all_codon_tables(
                     outputs["cbi"] = cbi_path
                     logger.info("Saved CBI to %s", cbi_path)
 
-    # Compute ACE-core-based adaptation weights and CBI (ACE core vs all genes)
-    if "ace_core" in gene_sets and "all" in gene_sets:
-        logger.info("Computing codon adaptation weights (ACE core vs all genes)")
-        ace_ids = gene_sets["ace_core"]["gene_ids"]
-        ace_weights_df = compute_codon_adaptation_weights(ffn_path, ffn_path, ace_ids)
+    # Compute GMM-cluster-based adaptation weights and CBI (GMM cluster vs all genes)
+    if "gmm_cluster" in gene_sets and "all" in gene_sets:
+        logger.info("Computing codon adaptation weights (GMM RP-cluster vs all genes)")
+        gmm_ids = gene_sets["gmm_cluster"]["gene_ids"]
+        gmm_weights_df = compute_codon_adaptation_weights(ffn_path, ffn_path, gmm_ids)
 
-        if not ace_weights_df.empty:
-            ace_w_path = codon_dir / f"{sample_id}_ace_core_adaptation_weights.tsv"
-            ace_weights_df.to_csv(ace_w_path, sep="\t", index=False)
-            outputs["ace_core_adaptation_weights"] = ace_w_path
-            logger.info("Saved ACE-core adaptation weights to %s", ace_w_path)
+        if not gmm_weights_df.empty:
+            gmm_w_path = codon_dir / f"{sample_id}_gmm_cluster_adaptation_weights.tsv"
+            gmm_weights_df.to_csv(gmm_w_path, sep="\t", index=False)
+            outputs["gmm_cluster_adaptation_weights"] = gmm_w_path
+            logger.info("Saved GMM-cluster adaptation weights to %s", gmm_w_path)
 
-            # Extract ACE-derived optimal codons and compute CBI
-            ace_opt_sorted = (
-                ace_weights_df[ace_weights_df["is_optimal"]]
+            # Extract GMM-derived optimal codons and compute CBI
+            gmm_opt_sorted = (
+                gmm_weights_df[gmm_weights_df["is_optimal"]]
                 .sort_values("weight", ascending=False)
             )
-            ace_optimal_codons = dict(
-                ace_opt_sorted
+            gmm_optimal_codons = dict(
+                gmm_opt_sorted
                 .drop_duplicates(subset=["amino_acid"])
                 .set_index("amino_acid")["codon"]
             )
 
-            if ace_optimal_codons:
-                logger.info("Computing CBI from ACE-derived optimal codons")
-                ace_cbi_df = compute_cbi(ffn_path, ace_optimal_codons)
-                if not ace_cbi_df.empty:
-                    ace_cbi_path = codon_dir / f"{sample_id}_ace_core_cbi.tsv"
-                    ace_cbi_df.to_csv(ace_cbi_path, sep="\t", index=False)
-                    outputs["ace_core_cbi"] = ace_cbi_path
-                    logger.info("Saved ACE-core CBI to %s", ace_cbi_path)
+            if gmm_optimal_codons:
+                logger.info("Computing CBI from GMM-cluster-derived optimal codons")
+                gmm_cbi_df = compute_cbi(ffn_path, gmm_optimal_codons)
+                if not gmm_cbi_df.empty:
+                    gmm_cbi_path = codon_dir / f"{sample_id}_gmm_cluster_cbi.tsv"
+                    gmm_cbi_df.to_csv(gmm_cbi_path, sep="\t", index=False)
+                    outputs["gmm_cluster_cbi"] = gmm_cbi_path
+                    logger.info("Saved GMM-cluster CBI to %s", gmm_cbi_path)
 
     logger.info("Codon table generation complete. Output directory: %s", codon_dir)
     return outputs
