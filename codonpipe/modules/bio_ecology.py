@@ -1116,7 +1116,8 @@ def run_bio_ecology_analyses(
     try:
         from codonpipe.modules.grodon import run_grodon
 
-        grodon_result = run_grodon(ffn_path, output_dir, sample_id)
+        grodon_result = run_grodon(ffn_path, output_dir, sample_id,
+                                   rp_ids_file=rp_ids_file)
         if grodon_result is not None:
             grodon_path = grodon_result.pop("path", None)
             outputs["grodon2_prediction"] = grodon_result
