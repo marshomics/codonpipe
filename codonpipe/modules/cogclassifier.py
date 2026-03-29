@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.resources
 import logging
 from pathlib import Path
 
