@@ -291,12 +291,14 @@ def run_enrichment_analysis(
     pathway_names: dict[str, str] | None = None,
     kegg_ko_pathway_file: Path | None = None,
     fdr_threshold: float = 0.05,
+    metrics: list[str] | None = None,
+    output_subdir: str = "enrichment",
 ) -> dict[str, Path]:
     """Run pathway enrichment for high- and low-expression gene sets.
 
-    Tests each expression metric (CAI, MELP, Fop) independently. For each
-    metric, genes classified as 'high' and 'low' are tested separately
-    against the full genome as background.
+    Tests each expression metric independently. For each metric, genes
+    classified as 'high' and 'low' are tested separately against the full
+    genome as background.
 
     Args:
         expr_df: Combined expression table with gene, KO, and *_class columns.
@@ -307,11 +309,16 @@ def run_enrichment_analysis(
         pathway_names: Pre-loaded pathway names.
         kegg_ko_pathway_file: User-supplied KO-pathway mapping file.
         fdr_threshold: FDR significance threshold.
+        metrics: List of metric names to test. For each name ``m``, the
+            expression table must contain a column ``{m}_class`` with values
+            'high', 'medium', 'low'.  Defaults to ["CAI", "MELP", "Fop"].
+        output_subdir: Subdirectory name under output_dir for results.
+            Defaults to "enrichment".
 
     Returns:
         Dict of output file paths.
     """
-    enrich_dir = output_dir / "enrichment"
+    enrich_dir = output_dir / output_subdir
     enrich_dir.mkdir(parents=True, exist_ok=True)
     outputs = {}
 
@@ -373,9 +380,11 @@ def run_enrichment_analysis(
     background_kos = _explode_kos(annotated_genes["KO"])
 
     # Per-metric enrichment
-    metrics = [m for m in ["CAI", "MELP", "Fop"] if f"{m}_class" in expr_annotated.columns]
+    if metrics is None:
+        metrics = ["CAI", "MELP", "Fop"]
+    test_metrics = [m for m in metrics if f"{m}_class" in expr_annotated.columns]
 
-    for metric in metrics:
+    for metric in test_metrics:
         class_col = f"{metric}_class"
         for tier in ["high", "low"]:
             tier_genes = annotated_genes[annotated_genes[class_col] == tier]
