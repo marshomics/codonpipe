@@ -144,13 +144,17 @@ def compute_s_value(
     rscu_rp: dict[str, float] | None,
     metric: str = "euclidean",
     rscu_ace: dict[str, float] | None = None,
+    rscu_gmm_cluster: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     """Compute per-gene RSCU distance to a reference codon usage profile.
 
-    When *rscu_ace* is provided (ACE consensus RSCU), it is used as the
-    reference instead of ribosomal proteins.  The ACE consensus is
-    genome-specific and composition-independent, making S-values more
-    comparable across organisms with different GC content.
+    Reference priority: GMM cluster > ACE consensus > ribosomal proteins.
+
+    The GMM optimal cluster captures the codon usage of translationally
+    optimised genes identified by data-driven clustering, making it the
+    most biologically grounded reference.  ACE consensus is genome-specific
+    and composition-independent.  Ribosomal proteins are the traditional
+    fallback.
 
     Genes with low S-values have codon usage similar to the reference
     (i.e. adapted toward translational optimization).
@@ -159,14 +163,22 @@ def compute_s_value(
         rscu_gene_df: Per-gene RSCU table.
         rscu_rp: Concatenated RSCU for ribosomal proteins (fallback reference).
         metric: 'euclidean' or 'chi_squared'.
-        rscu_ace: ACE consensus RSCU dict (preferred reference when available).
+        rscu_ace: ACE consensus RSCU dict.
+        rscu_gmm_cluster: GMM optimal cluster RSCU dict (preferred reference).
 
     Returns:
         DataFrame with gene, S_value, S_reference columns.
     """
-    # Prefer ACE consensus over RP-based reference
-    ref = rscu_ace if rscu_ace is not None else rscu_rp
-    ref_label = "ace" if rscu_ace is not None else "rp"
+    # Priority: GMM cluster > ACE consensus > RP
+    if rscu_gmm_cluster is not None:
+        ref = rscu_gmm_cluster
+        ref_label = "gmm_cluster"
+    elif rscu_ace is not None:
+        ref = rscu_ace
+        ref_label = "ace"
+    else:
+        ref = rscu_rp
+        ref_label = "rp"
 
     if ref is None:
         return pd.DataFrame(columns=["gene", "S_value", "S_reference"])
@@ -779,6 +791,7 @@ def run_advanced_analyses(
     gff_path: Path | None = None,
     cog_result_tsv: Path | None = None,
     rscu_ace: dict[str, float] | None = None,
+    rscu_gmm_cluster: dict[str, float] | None = None,
 ) -> dict[str, pd.DataFrame | Path]:
     """Run all advanced codon usage analyses.
 
@@ -793,8 +806,9 @@ def run_advanced_analyses(
         encprime_df: ENCprime table.
         gff_path: GFF3 annotation file (for tRNA extraction).
         cog_result_tsv: COGclassifier result.tsv (for COG enrichment).
-        rscu_ace: ACE consensus RSCU dict. When provided, S-value uses
-            this genome-specific reference instead of ribosomal proteins.
+        rscu_ace: ACE consensus RSCU dict.
+        rscu_gmm_cluster: GMM optimal cluster RSCU dict. When provided,
+            S-value uses this as the reference (highest priority).
 
     Returns:
         Dict of output DataFrames and file paths.
@@ -813,10 +827,16 @@ def run_advanced_analyses(
             outputs[key] = df
             outputs[f"{key}_path"] = out_path
 
-    # 2. S-value (prefer ACE consensus reference when available)
-    ref_label = "ACE consensus" if rscu_ace is not None else "ribosomal proteins"
+    # 2. S-value (reference priority: GMM cluster > ACE consensus > RP)
+    if rscu_gmm_cluster is not None:
+        ref_label = "GMM cluster"
+    elif rscu_ace is not None:
+        ref_label = "ACE consensus"
+    else:
+        ref_label = "ribosomal proteins"
     logger.info("Computing S-value (RSCU distance to %s) for %s", ref_label, sample_id)
-    s_val_df = compute_s_value(rscu_gene_df, rscu_rp, rscu_ace=rscu_ace)
+    s_val_df = compute_s_value(rscu_gene_df, rscu_rp, rscu_ace=rscu_ace,
+                                rscu_gmm_cluster=rscu_gmm_cluster)
     if not s_val_df.empty:
         out_path = adv_dir / f"{sample_id}_s_value.tsv"
         s_val_df.to_csv(out_path, sep="\t", index=False)
