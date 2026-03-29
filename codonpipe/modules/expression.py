@@ -314,9 +314,13 @@ def _combine_expression(
     # Merge Fop if available
     if fop_path.exists():
         fop_df = pd.read_csv(fop_path, sep="\t")
-        fop_score_col = [c for c in fop_df.columns if c not in ("gene", "width")][0]
-        fop_df = fop_df.rename(columns={fop_score_col: "Fop"})
-        combined = combined.merge(fop_df[["gene", "Fop"]], on="gene", how="outer")
+        fop_score_candidates = [c for c in fop_df.columns if c not in ("gene", "width")]
+        if not fop_score_candidates:
+            logger.warning("Fop output has no score column; skipping Fop merge")
+        else:
+            fop_score_col = fop_score_candidates[0]
+            fop_df = fop_df.rename(columns={fop_score_col: "Fop"})
+            combined = combined.merge(fop_df[["gene", "Fop"]], on="gene", how="outer")
 
     # Per-metric classification
     for metric in ["MELP", "CAI", "Fop"]:
