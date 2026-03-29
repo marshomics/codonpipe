@@ -30,6 +30,7 @@ from codonpipe.modules.comparative import run_comparative_analyses
 from codonpipe.plotting.plots import (
     generate_single_genome_plots,
     generate_batch_plots,
+    generate_pairwise_comparison_plots,
 )
 from codonpipe.plotting.comparative_plots import generate_comparative_plots
 from codonpipe.utils.codon_tables import RSCU_COLUMN_NAMES
@@ -177,7 +178,7 @@ def run_single_genome(
             kofam_df.to_csv(kofam_out, sep="\t", index=False)
             all_outputs["kofam_parsed"] = kofam_out
         except Exception as e:
-            logger.warning("Failed to parse pre-computed KofamScan results: %s. Continuing without annotations.", e)
+            logger.warning("Failed to parse pre-computed KofamScan results: %s. Continuing without annotations.", e, exc_info=True)
     elif not skip_kofamscan:
         logger.info("[Step 3/11] Running KofamScan annotation")
         try:
@@ -191,7 +192,7 @@ def run_single_genome(
             kofam_df.to_csv(kofam_out, sep="\t", index=False)
             all_outputs["kofam_parsed"] = kofam_out
         except (FileNotFoundError, RuntimeError) as e:
-            logger.warning("KofamScan failed: %s. Continuing without annotations.", e)
+            logger.warning("KofamScan failed: %s. Continuing without annotations.", e, exc_info=True)
     else:
         logger.info("[Step 3/11] Skipping KofamScan (--skip-kofamscan)")
 
@@ -234,7 +235,7 @@ def run_single_genome(
             if "milc" in cu_stat_outputs and cu_stat_outputs["milc"].exists():
                 milc_df = pd.read_csv(cu_stat_outputs["milc"], sep="\t")
         except (FileNotFoundError, RuntimeError) as e:
-            logger.warning("CU statistics failed: %s. Continuing.", e)
+            logger.warning("CU statistics failed: %s. Continuing.", e, exc_info=True)
     else:
         logger.info("[Step 5/11] Skipping CU bias statistics (--skip-expression)")
 
@@ -258,7 +259,7 @@ def run_single_genome(
                     expr_ann.to_csv(expr_ann_path, sep="\t", index=False)
                     all_outputs["expression_annotated"] = expr_ann_path
         except (FileNotFoundError, RuntimeError) as e:
-            logger.warning("Expression analysis failed: %s. Continuing.", e)
+            logger.warning("Expression analysis failed: %s. Continuing.", e, exc_info=True)
     elif skip_expression:
         logger.info("[Step 6/11] Skipping expression analysis (--skip-expression)")
     else:
@@ -279,7 +280,7 @@ def run_single_genome(
                 if key.startswith("enrichment_") and path.exists():
                     enrichment_results[key] = pd.read_csv(path, sep="\t")
         except Exception as e:
-            logger.warning("Pathway enrichment failed: %s. Continuing.", e)
+            logger.warning("Pathway enrichment failed: %s. Continuing.", e, exc_info=True)
     else:
         logger.info(
             "[Step 7/11] Skipping pathway enrichment (%s)",
@@ -321,7 +322,7 @@ def run_single_genome(
             elif isinstance(val, pd.DataFrame):
                 advanced_results[key] = val
     except Exception as e:
-        logger.warning("Advanced analyses failed: %s. Continuing.", e)
+        logger.warning("Advanced analyses failed: %s. Continuing.", e, exc_info=True)
 
     if not advanced_results:
         logger.info("SKIPPED: advanced analyses produced no results")
@@ -365,7 +366,7 @@ def run_single_genome(
                 norm_key = _bio_key_map.get(key, key)
                 bio_ecology_results[norm_key] = val
     except Exception as e:
-        logger.warning("Biological/ecological analyses failed: %s. Continuing.", e)
+        logger.warning("Biological/ecological analyses failed: %s. Continuing.", e, exc_info=True)
 
     if not bio_ecology_results:
         logger.info("SKIPPED: bio/ecology analyses produced no results")
@@ -384,7 +385,7 @@ def run_single_genome(
         )
         all_outputs.update(table_outputs)
     except Exception as e:
-        logger.warning("Codon usage table generation failed: %s. Continuing.", e)
+        logger.warning("Codon usage table generation failed: %s. Continuing.", e, exc_info=True)
 
     # ── Step 11: Plots ────────────────────────────────────────────────────
     logger.info("[Step 11/11] Generating publication-ready plots")
@@ -401,6 +402,7 @@ def run_single_genome(
         enrichment_results=enrichment_results if enrichment_results else None,
         advanced_results=advanced_results if advanced_results else None,
         bio_ecology_results=bio_ecology_results if bio_ecology_results else None,
+        gff_path=resolved_gff,
     )
     all_outputs.update(plot_outputs)
 
@@ -539,11 +541,11 @@ def run_batch(
                 except Exception as e:
                     logger.error("Failed: %s — %s", sid, e)
     else:
-        for idx, row in df.iterrows():
+        for i, (idx, row) in enumerate(df.iterrows()):
             sid = row["sample_id"]
             gpath = Path(row["genome_path"])
             row_kwargs = _build_kwargs_for_row(row)
-            logger.info("Processing %s (%d/%d)", sid, idx + 1, n_samples)
+            logger.info("Processing %s (%d/%d)", sid, i + 1, n_samples)
             try:
                 result = run_single_genome(
                     genome_fasta=gpath,
@@ -648,6 +650,18 @@ def _run_batch_analyses(
         wilcoxon_results=wilcoxon_results if wilcoxon_results else None,
     )
     outputs.update(plot_outputs)
+
+    # ── Pairwise qualitative comparison plots (works with any ≥2 genomes) ──
+    if len(sample_outputs) >= 2:
+        try:
+            pairwise_outputs = generate_pairwise_comparison_plots(
+                sample_outputs=sample_outputs,
+                combined_rscu=combined_rscu,
+                output_dir=output_dir,
+            )
+            outputs.update(pairwise_outputs)
+        except Exception as e:
+            logger.warning("Pairwise comparison plots failed: %s", e)
 
     # ── Condition-aware comparative analyses ──────────────────────────
     if condition_col:
@@ -763,7 +777,7 @@ def _run_batch_analyses(
             logger.info("Condition-aware comparative analyses complete: %d outputs",
                         len(comp_outputs) + len(comp_plot_outputs))
         except Exception as e:
-            logger.warning("Condition-aware comparative analyses failed: %s. Continuing.", e)
+            logger.warning("Condition-aware comparative analyses failed: %s. Continuing.", e, exc_info=True)
     else:
         logger.info("No condition column specified; skipping condition-aware analyses")
 
