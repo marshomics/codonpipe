@@ -236,5 +236,43 @@ def batch(
         sys.exit(1)
 
 
+@main.command("install-grodon")
+@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
+@click.option("--timeout", default=600, type=int, show_default=True,
+              help="Maximum seconds to wait for installation.")
+def install_grodon_cmd(verbose: bool, timeout: int):
+    """Install gRodon2 and its R/Bioconductor dependencies.
+
+    Requires R (>= 4.0) with Rscript on PATH. Installs:
+
+    \b
+      - BiocManager (CRAN)
+      - Biostrings, coRdon (Bioconductor)
+      - matrixStats, dplyr, jsonlite, remotes (CRAN)
+      - gRodon2 (GitHub: jlw-ecoevo/gRodon2)
+
+    Run this once after creating the conda environment:
+
+    \b
+        conda env create -f environment.yml
+        conda activate codonpipe
+        codonpipe install-grodon
+    """
+    logger = setup_logger(verbose=verbose)
+
+    from codonpipe.modules.grodon import install_grodon
+
+    success = install_grodon(timeout=timeout)
+    if success:
+        logger.info("gRodon2 is ready to use.")
+    else:
+        logger.error(
+            "gRodon2 installation failed. Check the output above for details. "
+            "You can also install manually in R:\n"
+            "  remotes::install_github('jlw-ecoevo/gRodon2')"
+        )
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()
