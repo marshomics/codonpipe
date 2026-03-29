@@ -28,6 +28,7 @@ from codonpipe.utils.codon_tables import (
     AA_CODON_GROUPS,
     AA_CODON_GROUPS_RSCU,
     CODON_TABLE_11,
+    MIN_GENE_LENGTH,
     SENSE_CODONS,
     codon_to_col_name,
     dna_to_rna,
@@ -35,13 +36,6 @@ from codonpipe.utils.codon_tables import (
 from codonpipe.modules.rscu import count_codons, compute_rscu_from_counts
 
 logger = logging.getLogger("codonpipe")
-
-# Minimum gene length (nucleotides) to include in codon analysis
-MIN_GENE_LENGTH = 240
-
-
-# Alias for backward compatibility (canonical implementation in utils.codon_tables)
-_codon_to_col_name = codon_to_col_name
 
 
 def _get_sequence_ids_from_file(ffn_path: Path) -> set[str]:
@@ -173,7 +167,7 @@ def compute_rscu_table(
     for codon in sorted(SENSE_CODONS.keys()):
         aa = CODON_TABLE_11[codon]
         count = total_counts.get(codon, 0)
-        col_name = _codon_to_col_name(codon, aa)
+        col_name = codon_to_col_name(codon, aa)
         rscu_val = rscu_vals.get(col_name, np.nan)
 
         rows.append({
@@ -225,7 +219,7 @@ def compute_relative_adaptiveness(
     rows = []
     for codon in sorted(SENSE_CODONS.keys()):
         aa = CODON_TABLE_11[codon]
-        col_name = _codon_to_col_name(codon, aa)
+        col_name = codon_to_col_name(codon, aa)
         family_name = col_name.split("-")[0]
         rscu_val = rscu_vals.get(col_name, 0.0)
         max_rscu = max_rscu_per_family.get(family_name, 1.0)
@@ -289,7 +283,7 @@ def compute_codon_adaptation_weights(
     rows = []
     for codon in sorted(SENSE_CODONS.keys()):
         aa = CODON_TABLE_11[codon]
-        col_name = _codon_to_col_name(codon, aa)
+        col_name = codon_to_col_name(codon, aa)
         rscu_ref = ref_rscu.get(col_name, 0.0)
         rscu_all = all_rscu.get(col_name, 0.0)
 
