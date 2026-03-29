@@ -311,7 +311,11 @@ def is_grodon_available() -> bool:
 
 _R_SCRIPT = r"""
 # gRodon2 wrapper called by CodonPipe
-# Arguments: <cds_fasta> <output_json>
+# Arguments: <cds_fasta> <output_json> [<rp_ids_file>]
+#
+# If rp_ids_file is provided (one gene ID per line), those IDs are used
+# to mark highly-expressed genes.  Otherwise falls back to gRodon2's
+# built-in regex on FASTA headers.
 
 # Ensure user library is on the search path even when .Renviron is absent
 local({
@@ -328,18 +332,31 @@ suppressPackageStartupMessages({
 })
 
 args <- commandArgs(trailingOnly = TRUE)
-cds_fasta  <- args[1]
+cds_fasta   <- args[1]
 output_json <- args[2]
+rp_ids_file <- if (length(args) >= 3) args[3] else NULL
 
 genes <- readDNAStringSet(cds_fasta)
 
-# Identify ribosomal proteins from FASTA headers (same regex as gRodon's own getStatistics)
-highly_expressed <- grepl(
-  "^(?!.*(methyl|hydroxy)).*0S ribosomal protein",
-  names(genes),
-  ignore.case = TRUE,
-  perl = TRUE
-)
+# Extract the gene ID (first whitespace-delimited token) from each FASTA header
+gene_ids <- sub("\\s.*", "", names(genes))
+
+if (!is.null(rp_ids_file) && file.exists(rp_ids_file)) {
+  # Use CodonPipe's COGclassifier-derived ribosomal protein IDs
+  rp_ids <- readLines(rp_ids_file)
+  rp_ids <- trimws(rp_ids[nchar(trimws(rp_ids)) > 0])
+  highly_expressed <- gene_ids %in% rp_ids
+  cat(sprintf("Using %d COGclassifier RP IDs; matched %d/%d CDS\n",
+              length(rp_ids), sum(highly_expressed), length(genes)))
+} else {
+  # Fallback: gRodon2's own regex on FASTA headers
+  highly_expressed <- grepl(
+    "^(?!.*(methyl|hydroxy)).*0S ribosomal protein",
+    names(genes),
+    ignore.case = TRUE,
+    perl = TRUE
+  )
+}
 
 n_he <- sum(highly_expressed)
 if (n_he < 1) {
@@ -386,6 +403,7 @@ def run_grodon(
     ffn_path: Path,
     output_dir: Path,
     sample_id: str,
+    rp_ids_file: Path | str | None = None,
 ) -> dict | None:
     """Run gRodon2 growth rate prediction on a CDS FASTA file.
 
@@ -393,6 +411,10 @@ def run_grodon(
         ffn_path: Path to CDS nucleotide FASTA (in-frame coding sequences).
         output_dir: Directory to save the result TSV.
         sample_id: Sample identifier.
+        rp_ids_file: Optional path to a file listing ribosomal protein gene
+            IDs (one per line), as identified by COGclassifier.  When
+            provided, these IDs are used to mark highly expressed genes
+            instead of relying on gRodon2's header regex.
 
     Returns:
         Dict with gRodon2 results (doubling time, CI, codon stats),
@@ -418,8 +440,12 @@ def run_grodon(
     json_out.close()
 
     try:
+        cmd = ["Rscript", "--no-save", "--no-restore", r_script_path,
+               str(ffn_path), json_out_path]
+        if rp_ids_file is not None and Path(rp_ids_file).exists():
+            cmd.append(str(rp_ids_file))
         result = subprocess.run(
-            ["Rscript", "--no-save", "--no-restore", r_script_path, str(ffn_path), json_out_path],
+            cmd,
             capture_output=True,
             text=True,
             timeout=300,  # 5 min should be plenty for a single genome
@@ -434,7 +460,16 @@ def run_grodon(
             raw = json.load(f)
 
         if raw.get("status") == "no_highly_expressed_genes":
-            logger.warning("gRodon2: no ribosomal proteins identified in FASTA headers")
+            if rp_ids_file and Path(rp_ids_file).exists():
+                logger.warning(
+                    "gRodon2: none of the %s RP IDs matched CDS headers in %s",
+                    rp_ids_file, ffn_path,
+                )
+            else:
+                logger.warning(
+                    "gRodon2: no ribosomal proteins identified in FASTA headers "
+                    "(no RP IDs file provided and header regex found no matches)"
+                )
             return None
 
         if raw.get("status") == "error":
