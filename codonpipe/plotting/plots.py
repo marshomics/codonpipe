@@ -1098,11 +1098,14 @@ def plot_enc_diff(
     # Panel B: scatter ENC_diff vs GC3
     ax = axes[1]
     plot_df = enc_diff_df.copy()
-    if expr_df is not None and "gene" in expr_df.columns and "CAI_class" in expr_df.columns:
-        plot_df = plot_df.merge(expr_df[["gene", "CAI_class"]], on="gene", how="left")
+    # Color by expression_class (ACE-MELP when available, RP-MELP otherwise)
+    _color_col = next((c for c in ("expression_class", "CAI_class")
+                       if expr_df is not None and c in expr_df.columns), None)
+    if expr_df is not None and "gene" in expr_df.columns and _color_col is not None:
+        plot_df = plot_df.merge(expr_df[["gene", _color_col]], on="gene", how="left")
         tier_colors = {"high": "#d62728", "medium": "#aaaaaa", "low": "#1f77b4"}
         for tier in ["medium", "low", "high"]:
-            mask = plot_df["CAI_class"] == tier
+            mask = plot_df[_color_col] == tier
             if mask.any():
                 ax.scatter(plot_df.loc[mask, "GC3"], plot_df.loc[mask, "ENC_diff"],
                            s=6, alpha=0.4, c=tier_colors.get(tier, "gray"),
@@ -1194,11 +1197,14 @@ def plot_pr2(
     fig, ax = plt.subplots(figsize=(7, 7))
 
     plot_df = pr2_df.copy()
-    if expr_df is not None and "gene" in expr_df.columns and "CAI_class" in expr_df.columns:
-        plot_df = plot_df.merge(expr_df[["gene", "CAI_class"]], on="gene", how="left")
+    # Color by expression_class (ACE-MELP when available, RP-MELP otherwise)
+    _color_col = next((c for c in ("expression_class", "CAI_class")
+                       if expr_df is not None and c in expr_df.columns), None)
+    if expr_df is not None and "gene" in expr_df.columns and _color_col is not None:
+        plot_df = plot_df.merge(expr_df[["gene", _color_col]], on="gene", how="left")
         tier_colors = {"high": "#d62728", "medium": "#aaaaaa", "low": "#1f77b4"}
         for tier in ["medium", "low", "high"]:
-            mask = plot_df["CAI_class"] == tier
+            mask = plot_df[_color_col] == tier
             if mask.any():
                 ax.scatter(plot_df.loc[mask, "A3_ratio"], plot_df.loc[mask, "G3_ratio"],
                            s=6, alpha=0.4, c=tier_colors.get(tier, "gray"),
@@ -2618,7 +2624,7 @@ def plot_rp_vs_he_rscu(
 
     # Compute high-expression gene median RSCU
     he_genes = set()
-    for col in ("CAI_class", "MELP_class"):
+    for col in ("expression_class", "CAI_class", "MELP_class"):
         if col in expr_df.columns:
             he_genes |= set(expr_df.loc[expr_df[col] == "high", "gene"])
     if not he_genes:
@@ -2687,7 +2693,7 @@ def plot_rp_he_rscu_scatter(
 
     # High-expression gene median RSCU
     he_genes = set()
-    for col in ("CAI_class", "MELP_class"):
+    for col in ("expression_class", "CAI_class", "MELP_class"):
         if col in expr_df.columns:
             he_genes |= set(expr_df.loc[expr_df[col] == "high", "gene"])
     if not he_genes:
@@ -2773,7 +2779,7 @@ def plot_rp_he_delta_heatmap(
     genome_median = rscu_gene_df[rscu_cols].median()
 
     he_genes = set()
-    for col in ("CAI_class", "MELP_class"):
+    for col in ("expression_class", "CAI_class", "MELP_class"):
         if col in expr_df.columns:
             he_genes |= set(expr_df.loc[expr_df[col] == "high", "gene"])
     if not he_genes:
@@ -3352,7 +3358,8 @@ def _generate_advanced_plots(
         try:
             coa_coords = adv["coa_coords"]
             coa_inertia = adv["coa_inertia"]
-            color_col = "CAI_class" if "CAI_class" in coa_coords.columns else None
+            color_col = next((c for c in ("expression_class", "CAI_class")
+                                if c in coa_coords.columns), None)
             p = plot_dir / f"{sample_id}_coa"
             plot_coa(coa_coords, coa_inertia, p, sample_id, color_col=color_col)
             outputs["coa"] = p.with_suffix(".png")
