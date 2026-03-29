@@ -34,8 +34,9 @@ dependencies:
   - r-jsonlite>=1.8
   - r-remotes>=2.4
 
-  # gRodon2 (not available via conda — installed from GitHub at first run,
-  # or manually via: Rscript -e "remotes::install_github('jlw-ecoevo/gRodon2')")
+  # gRodon2 is not available via conda — install after environment creation:
+  #   conda activate codonpipe
+  #   codonpipe install-grodon
 
   # Development (optional)
   - pytest>=7.0
