@@ -53,7 +53,11 @@ def load_ko_pathway_map(
             logger.info("Loading cached KO-pathway map from %s", cached)
             with open(cached) as f:
                 raw = json.load(f)
-            return {k: set(v) for k, v in raw.items()}
+            # Filter out map* IDs that may exist in older cache files
+            return {
+                k: {pw for pw in v if not pw.startswith("map")}
+                for k, v in raw.items()
+            }
 
     # Download from KEGG REST API
     try:
@@ -116,6 +120,9 @@ def _load_user_ko_map(path: Path) -> dict[str, set[str]]:
             if len(parts) >= 2:
                 ko = parts[0].strip().replace("ko:", "")
                 pathway = parts[1].strip().replace("path:", "")
+                # Skip map* duplicates (same pathway as the ko* entry)
+                if pathway.startswith("map"):
+                    continue
                 ko_map[ko].add(pathway)
     logger.info("Loaded user KO-pathway map: %d KOs from %s", len(ko_map), path)
     return dict(ko_map)
@@ -136,6 +143,11 @@ def _download_kegg_ko_map() -> dict[str, set[str]]:
         if len(parts) >= 2:
             ko = parts[0].strip().replace("ko:", "")
             pathway = parts[1].strip().replace("path:", "")
+            # KEGG returns both ko* and map* IDs for each pathway; keep
+            # only ko* to avoid duplicate entries (map* lacks name mappings
+            # and represents the same pathway).
+            if pathway.startswith("map"):
+                continue
             ko_map[ko].add(pathway)
 
     logger.info("Downloaded %d KO-pathway associations", sum(len(v) for v in ko_map.values()))
@@ -325,9 +337,15 @@ def run_enrichment_analysis(
         logger.warning("Could not identify KO/gene columns in KofamScan output")
         return outputs
 
-    ko_lookup = dict(zip(kofam_df[gene_col], kofam_df[ko_col]))
+    # Build gene -> KO mapping. A gene may have multiple KO annotations;
+    # keep all of them by joining with semicolons so enrichment sees every
+    # pathway a gene participates in.
+    ko_groups = kofam_df.groupby(gene_col)[ko_col].apply(
+        lambda kos: ";".join(sorted(set(kos.dropna().astype(str))))
+    )
+    ko_lookup = ko_groups.to_dict()
 
-    # Annotated expression table (gene -> KO)
+    # Annotated expression table (gene -> KO, semicolon-separated if >1)
     expr_annotated = expr_df.copy()
     expr_annotated["KO"] = expr_annotated["gene"].map(ko_lookup)
 
@@ -340,9 +358,19 @@ def run_enrichment_analysis(
         len(expr_annotated), expr_annotated["KO"].notna().sum(),
     )
 
+    # Helper: explode semicolon-separated KO values into individual KOs
+    def _explode_kos(series: pd.Series) -> set[str]:
+        kos = set()
+        for val in series.dropna():
+            for ko in str(val).split(";"):
+                ko = ko.strip()
+                if ko:
+                    kos.add(ko)
+        return kos
+
     # Background: all genes with a KO annotation
     annotated_genes = expr_annotated.dropna(subset=["KO"])
-    background_kos = set(annotated_genes["KO"].unique())
+    background_kos = _explode_kos(annotated_genes["KO"])
 
     # Per-metric enrichment
     metrics = [m for m in ["CAI", "MELP", "Fop"] if f"{m}_class" in expr_annotated.columns]
@@ -351,7 +379,7 @@ def run_enrichment_analysis(
         class_col = f"{metric}_class"
         for tier in ["high", "low"]:
             tier_genes = annotated_genes[annotated_genes[class_col] == tier]
-            tier_kos = set(tier_genes["KO"].unique())
+            tier_kos = _explode_kos(tier_genes["KO"])
 
             if len(tier_kos) < 2:
                 logger.info(
