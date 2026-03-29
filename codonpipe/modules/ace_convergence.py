@@ -688,7 +688,7 @@ def _build_ace_codon_tables(
         ace_adaptation: Log-ratio weights (ACE core vs genome background)
         ace_optimal:    Optimal codon set derived from ACE convergence
         ace_scores:     Per-gene scores: ace_melp (cosine, primary), ace_cai
-                        (secondary), and ace_expression_class derived from MELP
+                        (secondary), and ace_MELP_class derived from MELP
     """
     tables: dict[str, pd.DataFrame] = {}
     aa_groups = _group_codons_by_aa(codon_cols)
@@ -797,7 +797,7 @@ def _build_ace_codon_tables(
             "gene": gid,
             "ace_melp": round(melp_val, 6),
             "ace_cai": round(float(cai_scores[idx]), 6),
-            "ace_expression_class": expr_class,
+            "ace_MELP_class": expr_class,
             "in_ace_core": gid in core_gene_set,
         })
     tables["ace_scores"] = pd.DataFrame(score_rows)
@@ -928,7 +928,7 @@ def run_ace_convergence(
     The convergence loop uses cosine similarity exclusively.  CAI is
     computed as a secondary output for literature comparability, but the
     primary expression metric (``ace_melp``) and the derived
-    ``ace_expression_class`` come from cosine similarity against the
+    ``ace_MELP_class`` come from cosine similarity against the
     converged reference.
 
     Args:
@@ -953,7 +953,7 @@ def run_ace_convergence(
             - 'ace_codon_cols': list of codon column names
             - 'ace_tables': dict of ACE-specific codon table DataFrames
             - 'ace_scores_df': DataFrame with per-gene ACE MELP/CAI scores
-              and ace_expression_class
+              and ace_MELP_class
     """
     logger.info("Running ACE iterative convergence (top_pct=%.1f%%, scoring=cosine)",
                 top_pct)
