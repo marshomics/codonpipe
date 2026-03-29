@@ -1,21 +1,25 @@
-"""GMM-based codon usage clustering module.
+"""RP-anchored Mahalanobis distance module for translational optimization classification.
 
-Replaces ACE convergence with a statistically principled approach:
+Replaces GMM-based clustering with a deterministic, RP-anchored approach:
 
 1. Correspondence Analysis (COA) on per-gene RSCU matrix
-2. Gaussian Mixture Model (GMM) clustering on top COA axes (BIC-selected k)
-3. Identify the cluster containing ribosomal proteins
-4. Compute RSCU from that cluster as the genome-specific optimised reference
-5. Export cluster gene IDs for downstream expression scoring and enrichment
+2. Robust covariance estimation (MinCovDet) on RP gene coordinates
+3. Two-pass outlier removal to exclude atypical RP genes
+4. Mahalanobis distance from cleaned RP centroid to all genes
+5. Threshold at 2x median RP distance to define the optimized gene set
+6. Compute RSCU from the optimized set via concatenated codon pooling
 
-The RP-containing cluster captures translationally optimised genes beyond
-just ribosomal proteins, providing a broader and biologically grounded
-reference set for CAI/MELP scoring.
+Advantages over GMM:
+- Deterministic: no k selection, no random initialization
+- Stable cluster size: threshold is anchored to RP distribution, not BIC
+- Excludes atypical RP genes that would dilute the reference signal
+- Continuous membership scores via distance, not hard cluster labels
 """
 
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from pathlib import Path
 
 import warnings
@@ -23,22 +27,13 @@ import warnings
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.colors as mcolors
-import matplotlib.gridspec as gridspec
-import matplotlib.patheffects as pe
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatch
 import numpy as np
 import pandas as pd
-import seaborn as sns
 from scipy.spatial.distance import cosine as cosine_dist
-from sklearn.metrics import silhouette_samples, silhouette_score
-from sklearn.mixture import GaussianMixture
-
-try:
-    import umap
-    _HAS_UMAP = True
-except ImportError:
-    _HAS_UMAP = False
+from scipy.stats import chi2
+from sklearn.covariance import MinCovDet
 
 from Bio import SeqIO
 
@@ -54,12 +49,19 @@ logger = logging.getLogger("codonpipe")
 # ---------------------------------------------------------------------------
 
 _MIN_GENES_FOR_GMM = 50       # Minimum genes to attempt clustering
-_MAX_K = 8                    # Maximum number of GMM components to test
-_MIN_K = 2                    # Minimum number of GMM components
 _MIN_COA_AXES = 2             # Minimum COA axes required
-_MAX_COA_AXES = 8             # Maximum COA axes to use for clustering
+_MAX_COA_AXES = 8             # Maximum COA axes to use
 _CUMULATIVE_INERTIA_TARGET = 0.80  # Target cumulative inertia for axis selection
-_MIN_CLUSTER_SIZE = 10        # Warn if RP cluster has fewer genes than this
+_MIN_CLUSTER_SIZE = 10        # Warn if optimized set has fewer genes than this
+
+# Kept for signature compatibility (unused internally)
+_MIN_K = 2
+_MAX_K = 8
+
+# RP-anchored Mahalanobis approach
+_RP_OUTLIER_ALPHA = 0.025     # Chi-squared alpha for RP outlier detection
+_DISTANCE_MULTIPLIER = 2.0    # Threshold = multiplier x median RP Mahalanobis distance
+_MIN_RP_FOR_ROBUST = 10       # Min RP genes for MinCovDet; else empirical covariance
 
 
 # ---------------------------------------------------------------------------
@@ -88,94 +90,148 @@ def _select_n_axes(coa_inertia: pd.DataFrame, max_axes: int = _MAX_COA_AXES) -> 
     return max(_MIN_COA_AXES, min(n, max_axes, len(cum_pct)))
 
 
-def _fit_gmm_bic(X: np.ndarray, min_k: int = _MIN_K, max_k: int = _MAX_K) -> tuple[GaussianMixture, int, list[float]]:
-    """Fit GMMs for k in [min_k, max_k] and return the model with lowest BIC.
+def _fit_robust_rp_reference(
+    X_rp: np.ndarray,
+    n_axes: int,
+    alpha: float = _RP_OUTLIER_ALPHA,
+    min_rp: int = _MIN_RP_FOR_ROBUST,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Fit robust covariance on RP genes with two-pass outlier removal.
+
+    Pass 1: Fit MinCovDet on all RP genes, identify outliers beyond
+            chi-squared critical value.
+    Pass 2: Refit centroid and covariance excluding outliers.
 
     Args:
-        X: (n_samples, n_features) array of COA coordinates.
-        min_k: Minimum number of components.
-        max_k: Maximum number of components.
+        X_rp: (n_rp_genes, n_axes) RP gene COA coordinates.
+        n_axes: Number of COA axes (for chi-squared df).
+        alpha: Significance level for chi-squared outlier detection.
+        min_rp: Minimum RP genes to use MinCovDet; falls back to
+                empirical covariance if fewer.
 
     Returns:
-        best_gmm: Fitted GaussianMixture with lowest BIC.
-        best_k: Optimal number of components.
-        bic_scores: BIC for each k tested.
+        centroid: (n_axes,) cleaned RP centroid.
+        cov: (n_axes, n_axes) covariance matrix.
+        cov_inv: (n_axes, n_axes) inverse covariance matrix.
+        rp_outlier_mask: boolean array over RP genes, True for outliers.
     """
-    # Don't test more components than we have samples / 5
-    effective_max = min(max_k, max(min_k, X.shape[0] // 5))
+    n_rp = len(X_rp)
 
-    bic_scores = []
-    best_bic = np.inf
-    best_gmm = None
-    best_k = min_k
+    def _safe_inv(mat):
+        try:
+            return np.linalg.inv(mat)
+        except np.linalg.LinAlgError:
+            logger.warning("Singular covariance; using pseudo-inverse")
+            return np.linalg.pinv(mat)
 
-    for k in range(min_k, effective_max + 1):
-        gmm = GaussianMixture(
-            n_components=k,
-            covariance_type="full",
-            n_init=5,
-            max_iter=300,
-            random_state=42,
+    def _empirical_cov(X):
+        c = np.cov(X.T) if X.shape[0] > 1 else np.eye(X.shape[1])
+        if c.ndim == 0:
+            c = np.array([[float(c)]])
+        elif c.ndim == 1:
+            c = c.reshape(1, 1)
+        return c
+
+    if n_rp < min_rp:
+        logger.warning(
+            "Only %d RP genes; falling back to empirical covariance (< %d)",
+            n_rp, min_rp,
         )
-        gmm.fit(X)
-        bic = gmm.bic(X)
-        bic_scores.append(bic)
+        centroid = X_rp.mean(axis=0)
+        cov = _empirical_cov(X_rp)
+        rp_outlier_mask = np.zeros(n_rp, dtype=bool)
+        return centroid, cov, _safe_inv(cov), rp_outlier_mask
 
-        if bic < best_bic:
-            best_bic = bic
-            best_gmm = gmm
-            best_k = k
+    # Pass 1: Fit MinCovDet to identify outliers
+    try:
+        support_frac = max(0.5, min(0.9, (n_rp - 2) / n_rp))
+        mcd = MinCovDet(random_state=42, support_fraction=support_frac).fit(X_rp)
+        centroid_1 = mcd.location_
+        cov_1 = mcd.covariance_
+    except Exception as e:
+        logger.warning("MinCovDet failed (%s); using empirical covariance", e)
+        centroid_1 = X_rp.mean(axis=0)
+        cov_1 = _empirical_cov(X_rp)
 
-    return best_gmm, best_k, bic_scores
+    cov_1_inv = _safe_inv(cov_1)
 
+    # Mahalanobis distances for RP genes
+    rp_dists = np.array([
+        np.sqrt(max(0.0, (x - centroid_1) @ cov_1_inv @ (x - centroid_1)))
+        for x in X_rp
+    ])
 
-def _identify_rp_cluster(
-    gmm: GaussianMixture,
-    labels: np.ndarray,
-    gene_ids: list[str],
-    rp_gene_ids: set[str],
-) -> int:
-    """Identify which GMM cluster contains the most ribosomal proteins.
+    chi2_crit = np.sqrt(chi2.ppf(1 - alpha, df=n_axes))
+    rp_outlier_mask = rp_dists > chi2_crit
 
-    Args:
-        gmm: Fitted GMM.
-        labels: Cluster assignments for each gene.
-        gene_ids: Gene identifiers matching the rows of the clustering input.
-        rp_gene_ids: Set of ribosomal protein gene IDs.
-
-    Returns:
-        Cluster label (int) of the RP-containing cluster.
-    """
-    n_clusters = gmm.n_components
-    rp_counts = np.zeros(n_clusters, dtype=int)
-
-    for gid, label in zip(gene_ids, labels):
-        if gid in rp_gene_ids:
-            rp_counts[label] += 1
-
-    best_cluster = int(np.argmax(rp_counts))
-    total_rp_in_cluster = rp_counts[best_cluster]
-    total_rp_found = rp_counts.sum()
-
+    n_outliers = int(rp_outlier_mask.sum())
     logger.info(
-        "RP cluster identification: cluster %d contains %d/%d RPs (%.1f%%)",
-        best_cluster, total_rp_in_cluster, total_rp_found,
-        100 * total_rp_in_cluster / max(total_rp_found, 1),
+        "Pass 1: %d/%d RP outliers (Mahalanobis > %.2f, alpha=%.3f)",
+        n_outliers, n_rp, chi2_crit, alpha,
     )
 
-    if total_rp_found == 0:
-        logger.warning("No ribosomal proteins found in any cluster; defaulting to cluster 0")
-        return 0
+    # Pass 2: Refit excluding outliers
+    X_rp_clean = X_rp[~rp_outlier_mask]
+    if len(X_rp_clean) < max(2, n_axes + 1):
+        logger.warning(
+            "Too few non-outlier RP genes (%d); using all RP genes",
+            len(X_rp_clean),
+        )
+        X_rp_clean = X_rp
+        rp_outlier_mask = np.zeros(n_rp, dtype=bool)
 
-    # Warn if RPs are split across clusters
-    for k in range(n_clusters):
-        if k != best_cluster and rp_counts[k] > 0:
-            logger.info(
-                "  cluster %d also contains %d RPs (%.1f%%)",
-                k, rp_counts[k], 100 * rp_counts[k] / total_rp_found,
-            )
+    centroid = X_rp_clean.mean(axis=0)
+    cov = _empirical_cov(X_rp_clean)
+    cov_inv = _safe_inv(cov)
 
-    return best_cluster
+    logger.info(
+        "Pass 2: centroid computed from %d non-outlier RP genes",
+        len(X_rp_clean),
+    )
+
+    return centroid, cov, cov_inv, rp_outlier_mask
+
+
+def _compute_mahalanobis_distances(
+    X: np.ndarray,
+    centroid: np.ndarray,
+    cov_inv: np.ndarray,
+) -> np.ndarray:
+    """Compute Mahalanobis distance from each gene to RP centroid.
+
+    Args:
+        X: (n_genes, n_features) COA coordinates.
+        centroid: (n_features,) RP centroid.
+        cov_inv: (n_features, n_features) inverse covariance matrix.
+
+    Returns:
+        (n_genes,) Mahalanobis distances.
+    """
+    diff = X - centroid
+    # d = sqrt(diff @ cov_inv @ diff^T) per row
+    left = diff @ cov_inv
+    d_sq = np.sum(left * diff, axis=1)
+    d_sq = np.maximum(d_sq, 0.0)  # numerical safety
+    return np.sqrt(d_sq)
+
+
+def _distance_to_membership(
+    distances: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    """Convert Mahalanobis distances to soft membership scores.
+
+    Uses sigmoid: score = 1 / (1 + exp((d - threshold) / scale))
+    where scale = threshold / 5 for a smooth but fairly sharp transition.
+
+    Returns:
+        (n_genes, 2) array: col 0 = P(non-optimized), col 1 = P(optimized).
+    """
+    scale = max(threshold / 5.0, 1e-6)
+    z = (distances - threshold) / scale
+    z = np.clip(z, -500, 500)  # prevent overflow
+    score = 1.0 / (1.0 + np.exp(z))
+    return np.column_stack([1.0 - score, score])
 
 
 def _compute_cluster_rscu(
@@ -199,8 +255,6 @@ def _compute_cluster_rscu(
         Series indexed by RSCU column names (e.g. 'Phe-UUU') with pooled
         RSCU values.
     """
-    from collections import Counter
-
     total_counts: Counter = Counter()
     n_included = 0
 
@@ -226,583 +280,12 @@ def _compute_cluster_rscu(
         n_included, sum(total_counts.values()),
     )
 
-    # Return as a Series with only the standard RSCU column names
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_dict]
     return pd.Series({c: rscu_dict[c] for c in rscu_cols})
 
 
 # ---------------------------------------------------------------------------
-# Diagnostic plots
-# ---------------------------------------------------------------------------
-
-def _plot_bic_selection(
-    bic_scores: list[float],
-    best_k: int,
-    output_path: Path,
-    sample_id: str,
-) -> None:
-    """Plot BIC vs number of components."""
-    plt.rcParams.update(STYLE_PARAMS)
-    fig, ax = plt.subplots(figsize=(5, 3.5))
-
-    ks = list(range(_MIN_K, _MIN_K + len(bic_scores)))
-    ax.plot(ks, bic_scores, "o-", color="#2c7bb6", linewidth=1.5, markersize=5)
-    ax.axvline(best_k, color="#d7191c", linestyle="--", linewidth=1, alpha=0.7)
-    ax.set_xlabel("Number of components (k)")
-    ax.set_ylabel("BIC")
-    ax.set_title(f"{sample_id}: GMM model selection")
-    ax.set_xticks(ks)
-
-    for fmt in FORMATS:
-        fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_coa_clusters(
-    coa_coords: pd.DataFrame,
-    labels: np.ndarray,
-    rp_cluster: int,
-    rp_gene_ids: set[str],
-    output_path: Path,
-    sample_id: str,
-    inertia_pcts: tuple[float, float] = (0.0, 0.0),
-) -> None:
-    """Plot COA axes 1 & 2 colored by GMM cluster, with RP genes highlighted."""
-    plt.rcParams.update(STYLE_PARAMS)
-    fig, ax = plt.subplots(figsize=(7, 5.5))
-
-    genes = coa_coords["gene"].values
-    x = coa_coords["Axis1"].values
-    y = coa_coords["Axis2"].values
-
-    # Color palette
-    n_clusters = int(labels.max()) + 1
-    cmap = plt.cm.get_cmap("Set2", n_clusters)
-    colors = [cmap(l) for l in labels]
-
-    # Plot all genes, pale
-    ax.scatter(x, y, c=colors, alpha=0.35, s=12, edgecolors="none", rasterized=True)
-
-    # Overlay RP-cluster genes with stronger alpha
-    rp_mask = labels == rp_cluster
-    ax.scatter(
-        x[rp_mask], y[rp_mask],
-        c=[cmap(rp_cluster)] * rp_mask.sum(),
-        alpha=0.7, s=18, edgecolors="none", label=f"Cluster {rp_cluster} (RP cluster)",
-    )
-
-    # Mark actual RP genes
-    rp_idx = [i for i, g in enumerate(genes) if g in rp_gene_ids]
-    if rp_idx:
-        ax.scatter(
-            x[rp_idx], y[rp_idx],
-            facecolors="none", edgecolors="black", s=40, linewidths=0.8,
-            label=f"Ribosomal proteins (n={len(rp_idx)})", zorder=5,
-        )
-
-    pct1, pct2 = inertia_pcts
-    ax.set_xlabel(f"COA Axis 1 ({pct1:.1f}% inertia)")
-    ax.set_ylabel(f"COA Axis 2 ({pct2:.1f}% inertia)")
-    ax.set_title(f"{sample_id}: GMM clustering on COA space (k={n_clusters})")
-    ax.legend(fontsize=8, framealpha=0.7)
-
-    for fmt in FORMATS:
-        fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_coa_clusters_cosine(
-    coa_coords: pd.DataFrame,
-    labels: np.ndarray,
-    rp_cluster: int,
-    rp_gene_ids: set[str],
-    output_path: Path,
-    sample_id: str,
-    n_axes: int = 2,
-) -> None:
-    """COA scatter after cosine transformation (unit-sphere projection).
-
-    Projects each gene's COA coordinate vector onto the unit hypersphere,
-    removing magnitude (gene-length) effects and emphasising directional
-    similarity in codon preference.  The 2-D scatter shows Axis 1 vs
-    Axis 2 of the normalised vectors.
-    """
-    plt.rcParams.update(STYLE_PARAMS)
-    fig, ax = plt.subplots(figsize=(7, 5.5))
-
-    genes = coa_coords["gene"].values
-    axis_cols = [f"Axis{i+1}" for i in range(n_axes) if f"Axis{i+1}" in coa_coords.columns]
-    if len(axis_cols) < 2:
-        plt.close(fig)
-        return
-
-    V = coa_coords[axis_cols].values.copy()
-    # L2-normalise each row (project onto unit hypersphere)
-    norms = np.linalg.norm(V, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    V = V / norms
-
-    x, y = V[:, 0], V[:, 1]
-
-    n_clusters = int(labels.max()) + 1
-    cmap = plt.cm.get_cmap("Set2", n_clusters)
-    colors = [cmap(l) for l in labels]
-
-    ax.scatter(x, y, c=colors, alpha=0.35, s=12, edgecolors="none", rasterized=True)
-
-    rp_mask = labels == rp_cluster
-    ax.scatter(
-        x[rp_mask], y[rp_mask],
-        c=[cmap(rp_cluster)] * rp_mask.sum(),
-        alpha=0.7, s=18, edgecolors="none", label=f"Cluster {rp_cluster} (RP cluster)",
-    )
-
-    rp_idx = [i for i, g in enumerate(genes) if g in rp_gene_ids]
-    if rp_idx:
-        ax.scatter(
-            x[rp_idx], y[rp_idx],
-            facecolors="none", edgecolors="black", s=40, linewidths=0.8,
-            label=f"Ribosomal proteins (n={len(rp_idx)})", zorder=5,
-        )
-
-    ax.set_xlabel("COA Axis 1 (cosine-normalised)")
-    ax.set_ylabel("COA Axis 2 (cosine-normalised)")
-    ax.set_title(f"{sample_id}: cosine-transformed COA space (k={n_clusters})")
-    ax.legend(fontsize=8, framealpha=0.7)
-
-    for fmt in FORMATS:
-        fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_coa_clusters_zscore(
-    coa_coords: pd.DataFrame,
-    labels: np.ndarray,
-    rp_cluster: int,
-    rp_gene_ids: set[str],
-    output_path: Path,
-    sample_id: str,
-    n_axes: int = 2,
-) -> None:
-    """COA scatter after z-score standardisation per axis.
-
-    Standardising each axis to zero mean, unit variance makes the spread
-    comparable across genomes with different inertia distributions.  This
-    view is most useful in batch reports where cluster separation needs
-    to be visually comparable between samples.
-    """
-    plt.rcParams.update(STYLE_PARAMS)
-    fig, ax = plt.subplots(figsize=(7, 5.5))
-
-    genes = coa_coords["gene"].values
-    axis_cols = [f"Axis{i+1}" for i in range(n_axes) if f"Axis{i+1}" in coa_coords.columns]
-    if len(axis_cols) < 2:
-        plt.close(fig)
-        return
-
-    V = coa_coords[axis_cols].values.copy()
-    # Per-axis z-score: (x - mean) / std
-    means = V.mean(axis=0, keepdims=True)
-    stds = V.std(axis=0, keepdims=True)
-    stds[stds == 0] = 1.0
-    V = (V - means) / stds
-
-    x, y = V[:, 0], V[:, 1]
-
-    n_clusters = int(labels.max()) + 1
-    cmap = plt.cm.get_cmap("Set2", n_clusters)
-    colors = [cmap(l) for l in labels]
-
-    ax.scatter(x, y, c=colors, alpha=0.35, s=12, edgecolors="none", rasterized=True)
-
-    rp_mask = labels == rp_cluster
-    ax.scatter(
-        x[rp_mask], y[rp_mask],
-        c=[cmap(rp_cluster)] * rp_mask.sum(),
-        alpha=0.7, s=18, edgecolors="none", label=f"Cluster {rp_cluster} (RP cluster)",
-    )
-
-    rp_idx = [i for i, g in enumerate(genes) if g in rp_gene_ids]
-    if rp_idx:
-        ax.scatter(
-            x[rp_idx], y[rp_idx],
-            facecolors="none", edgecolors="black", s=40, linewidths=0.8,
-            label=f"Ribosomal proteins (n={len(rp_idx)})", zorder=5,
-        )
-
-    ax.set_xlabel("COA Axis 1 (z-score)")
-    ax.set_ylabel("COA Axis 2 (z-score)")
-    ax.set_title(f"{sample_id}: z-score-standardised COA space (k={n_clusters})")
-    ax.legend(fontsize=8, framealpha=0.7)
-
-    for fmt in FORMATS:
-        fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_cluster_separation(
-    coa_coords: pd.DataFrame,
-    labels: np.ndarray,
-    probabilities: np.ndarray,
-    rp_cluster: int,
-    output_path: Path,
-    sample_id: str,
-) -> None:
-    """Plot GMM posterior probability for the RP cluster across all genes."""
-    plt.rcParams.update(STYLE_PARAMS)
-    fig, ax = plt.subplots(figsize=(6, 3.5))
-
-    rp_probs = probabilities[:, rp_cluster]
-    ax.hist(rp_probs, bins=50, color="#2c7bb6", alpha=0.7, edgecolor="white", linewidth=0.3)
-    ax.axvline(0.5, color="#d7191c", linestyle="--", linewidth=1, alpha=0.7)
-    ax.set_xlabel(f"P(cluster {rp_cluster} | gene)")
-    ax.set_ylabel("Number of genes")
-    ax.set_title(f"{sample_id}: RP cluster membership probability")
-
-    for fmt in FORMATS:
-        fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_pairwise_coa_matrix(
-    coa_coords: pd.DataFrame,
-    labels: np.ndarray,
-    rp_cluster: int,
-    rp_gene_ids: set[str],
-    n_axes: int,
-    output_path: Path,
-    sample_id: str,
-) -> None:
-    """Pairwise scatter matrix of all retained COA axes.
-
-    Each off-diagonal panel shows a 2-D projection coloured by GMM cluster.
-    Diagonal panels show per-axis density by cluster.  This reveals cluster
-    separations that are invisible in the default Axis 1 vs Axis 2 view.
-    """
-    plt.rcParams.update(STYLE_PARAMS)
-    axis_cols = [f"Axis{i+1}" for i in range(n_axes) if f"Axis{i+1}" in coa_coords.columns]
-    n = len(axis_cols)
-    if n < 2:
-        return
-
-    genes = coa_coords["gene"].values
-    V = coa_coords[axis_cols].values
-    n_clusters = int(labels.max()) + 1
-    cmap = plt.cm.get_cmap("tab20", max(n_clusters, 2))
-
-    fig, axes = plt.subplots(n, n, figsize=(3 * n, 3 * n))
-    if n == 2:
-        axes = np.array(axes).reshape(n, n)
-
-    rp_idx = np.array([i for i, g in enumerate(genes) if g in rp_gene_ids])
-
-    for row in range(n):
-        for col in range(n):
-            ax = axes[row, col]
-            if row == col:
-                # Diagonal: per-cluster density
-                for k in range(n_clusters):
-                    mask = labels == k
-                    ax.hist(
-                        V[mask, row], bins=30, alpha=0.4,
-                        color=cmap(k), density=True,
-                        edgecolor="none",
-                    )
-                ax.set_ylabel("Density" if col == 0 else "")
-            else:
-                # Off-diagonal: scatter
-                colors = [cmap(l) for l in labels]
-                ax.scatter(
-                    V[:, col], V[:, row],
-                    c=colors, alpha=0.25, s=6, edgecolors="none", rasterized=True,
-                )
-                # Highlight RP cluster
-                rp_mask = labels == rp_cluster
-                ax.scatter(
-                    V[rp_mask, col], V[rp_mask, row],
-                    c=[cmap(rp_cluster)] * rp_mask.sum(),
-                    alpha=0.6, s=10, edgecolors="none",
-                )
-                # Mark RPs
-                if len(rp_idx) > 0:
-                    ax.scatter(
-                        V[rp_idx, col], V[rp_idx, row],
-                        facecolors="none", edgecolors="black",
-                        s=20, linewidths=0.5, zorder=5,
-                    )
-
-            if row == n - 1:
-                ax.set_xlabel(axis_cols[col])
-            else:
-                ax.set_xticklabels([])
-            if col == 0 and row != col:
-                ax.set_ylabel(axis_cols[row])
-            elif col != 0:
-                ax.set_yticklabels([])
-
-    fig.suptitle(
-        f"{sample_id}: pairwise COA axes (k={n_clusters})",
-        fontsize=14, y=1.01,
-    )
-    fig.tight_layout()
-    for fmt in FORMATS:
-        fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_silhouette(
-    labels: np.ndarray,
-    rp_cluster: int,
-    sample_silhouettes: np.ndarray,
-    mean_score: float,
-    output_path: Path,
-    sample_id: str,
-) -> None:
-    """Per-cluster silhouette coefficient plot.
-
-    Each cluster is shown as a horizontal bar of sorted per-gene silhouette
-    values, coloured by cluster.  The RP cluster is annotated.
-    """
-    plt.rcParams.update(STYLE_PARAMS)
-    n_clusters = int(labels.max()) + 1
-
-    fig, ax = plt.subplots(figsize=(7, max(4, 0.5 * n_clusters)))
-    cmap = plt.cm.get_cmap("tab20", max(n_clusters, 2))
-
-    y_lower = 0
-    for k in range(n_clusters):
-        k_silhouettes = sample_silhouettes[labels == k]
-        k_silhouettes.sort()
-        n_k = len(k_silhouettes)
-        y_upper = y_lower + n_k
-
-        color = cmap(k)
-        ax.fill_betweenx(
-            np.arange(y_lower, y_upper),
-            0, k_silhouettes,
-            facecolor=color, edgecolor=color, alpha=0.7,
-        )
-
-        # Cluster label
-        label = f"C{k}"
-        if k == rp_cluster:
-            label += " (RP)"
-        ax.text(-0.05, y_lower + 0.5 * n_k, label, fontsize=7, va="center", ha="right")
-        y_lower = y_upper + 2  # gap between clusters
-
-    ax.axvline(mean_score, color="#d7191c", linestyle="--", linewidth=1, alpha=0.7)
-    ax.set_xlabel("Silhouette coefficient")
-    ax.set_ylabel("Genes (sorted within cluster)")
-    ax.set_title(
-        f"{sample_id}: silhouette analysis (mean={mean_score:.3f}, k={n_clusters})"
-    )
-    ax.set_yticks([])
-
-    for fmt in FORMATS:
-        fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_coa_3d(
-    coa_coords: pd.DataFrame,
-    labels: np.ndarray,
-    rp_cluster: int,
-    rp_gene_ids: set[str],
-    output_path: Path,
-    sample_id: str,
-    inertia_pcts: tuple[float, float, float] = (0.0, 0.0, 0.0),
-) -> None:
-    """3-D scatter of COA axes 1, 2, 3 coloured by GMM cluster.
-
-    Provides depth context that the 2-D Axis 1 vs 2 plot misses, which is
-    relevant when axis 3 carries meaningful compositional signal (strand
-    bias, amino acid content).
-    """
-    plt.rcParams.update(STYLE_PARAMS)
-    axis_cols = ["Axis1", "Axis2", "Axis3"]
-    if not all(c in coa_coords.columns for c in axis_cols):
-        return
-
-    fig = plt.figure(figsize=(8, 6.5))
-    ax = fig.add_subplot(111, projection="3d")
-
-    genes = coa_coords["gene"].values
-    V = coa_coords[axis_cols].values
-
-    n_clusters = int(labels.max()) + 1
-    cmap = plt.cm.get_cmap("tab20", max(n_clusters, 2))
-    colors = [cmap(l) for l in labels]
-
-    ax.scatter(V[:, 0], V[:, 1], V[:, 2], c=colors, alpha=0.25, s=8, depthshade=True)
-
-    # RP cluster overlay
-    rp_mask = labels == rp_cluster
-    ax.scatter(
-        V[rp_mask, 0], V[rp_mask, 1], V[rp_mask, 2],
-        c=[cmap(rp_cluster)] * rp_mask.sum(),
-        alpha=0.6, s=14, depthshade=True,
-        label=f"Cluster {rp_cluster} (RP)",
-    )
-
-    # Mark RP genes
-    rp_idx = [i for i, g in enumerate(genes) if g in rp_gene_ids]
-    if rp_idx:
-        ax.scatter(
-            V[rp_idx, 0], V[rp_idx, 1], V[rp_idx, 2],
-            facecolors="none", edgecolors="black", s=30, linewidths=0.6,
-            label=f"RPs (n={len(rp_idx)})", depthshade=False,
-        )
-
-    pct1, pct2, pct3 = inertia_pcts
-    ax.set_xlabel(f"Axis 1 ({pct1:.1f}%)", labelpad=8)
-    ax.set_ylabel(f"Axis 2 ({pct2:.1f}%)", labelpad=8)
-    ax.set_zlabel(f"Axis 3 ({pct3:.1f}%)", labelpad=8)
-    ax.set_title(f"{sample_id}: 3-D COA space (k={n_clusters})")
-    ax.legend(fontsize=7, loc="upper left")
-    ax.view_init(elev=25, azim=135)
-
-    for fmt in FORMATS:
-        fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _compute_umap_embedding(
-    X: np.ndarray,
-    n_components: int = 2,
-    random_state: int = 42,
-    n_neighbors: int = 30,
-    min_dist: float = 0.3,
-) -> np.ndarray | None:
-    """Compute UMAP embedding on the COA coordinate matrix.
-
-    Returns None if umap-learn is not installed.
-    """
-    if not _HAS_UMAP:
-        logger.warning("umap-learn not installed; skipping UMAP plots")
-        return None
-
-    reducer = umap.UMAP(
-        n_components=n_components,
-        random_state=random_state,
-        n_neighbors=min(n_neighbors, X.shape[0] - 1),
-        min_dist=min_dist,
-        metric="euclidean",
-    )
-    return reducer.fit_transform(X)
-
-
-def _plot_umap_2d(
-    embedding: np.ndarray,
-    labels: np.ndarray,
-    rp_cluster: int,
-    gene_ids: list[str],
-    rp_gene_ids: set[str],
-    output_path: Path,
-    sample_id: str,
-) -> None:
-    """2-D UMAP embedding coloured by GMM cluster.
-
-    UMAP preserves local neighbourhood structure, making cluster boundaries
-    visible even when linear projections (COA axes) show heavy overlap.
-    """
-    plt.rcParams.update(STYLE_PARAMS)
-    fig, ax = plt.subplots(figsize=(7, 5.5))
-
-    n_clusters = int(labels.max()) + 1
-    cmap = plt.cm.get_cmap("tab20", max(n_clusters, 2))
-    colors = [cmap(l) for l in labels]
-
-    ax.scatter(
-        embedding[:, 0], embedding[:, 1],
-        c=colors, alpha=0.35, s=12, edgecolors="none", rasterized=True,
-    )
-
-    # RP cluster overlay
-    rp_mask = labels == rp_cluster
-    ax.scatter(
-        embedding[rp_mask, 0], embedding[rp_mask, 1],
-        c=[cmap(rp_cluster)] * rp_mask.sum(),
-        alpha=0.7, s=18, edgecolors="none",
-        label=f"Cluster {rp_cluster} (RP cluster)",
-    )
-
-    # Mark RP genes
-    rp_idx = [i for i, g in enumerate(gene_ids) if g in rp_gene_ids]
-    if rp_idx:
-        ax.scatter(
-            embedding[rp_idx, 0], embedding[rp_idx, 1],
-            facecolors="none", edgecolors="black", s=40, linewidths=0.8,
-            label=f"Ribosomal proteins (n={len(rp_idx)})", zorder=5,
-        )
-
-    ax.set_xlabel("UMAP 1")
-    ax.set_ylabel("UMAP 2")
-    ax.set_title(f"{sample_id}: UMAP of COA space (k={n_clusters})")
-    ax.legend(fontsize=8, framealpha=0.7)
-
-    for fmt in FORMATS:
-        fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_umap_3d(
-    embedding_3d: np.ndarray,
-    labels: np.ndarray,
-    rp_cluster: int,
-    gene_ids: list[str],
-    rp_gene_ids: set[str],
-    output_path: Path,
-    sample_id: str,
-) -> None:
-    """3-D UMAP embedding coloured by GMM cluster.
-
-    Adds depth to the UMAP visualisation for clusters that sit behind each
-    other in the 2-D projection.
-    """
-    plt.rcParams.update(STYLE_PARAMS)
-    fig = plt.figure(figsize=(8, 6.5))
-    ax = fig.add_subplot(111, projection="3d")
-
-    n_clusters = int(labels.max()) + 1
-    cmap = plt.cm.get_cmap("tab20", max(n_clusters, 2))
-    colors = [cmap(l) for l in labels]
-
-    ax.scatter(
-        embedding_3d[:, 0], embedding_3d[:, 1], embedding_3d[:, 2],
-        c=colors, alpha=0.25, s=8, depthshade=True,
-    )
-
-    rp_mask = labels == rp_cluster
-    ax.scatter(
-        embedding_3d[rp_mask, 0], embedding_3d[rp_mask, 1], embedding_3d[rp_mask, 2],
-        c=[cmap(rp_cluster)] * rp_mask.sum(),
-        alpha=0.6, s=14, depthshade=True,
-        label=f"Cluster {rp_cluster} (RP)",
-    )
-
-    rp_idx = [i for i, g in enumerate(gene_ids) if g in rp_gene_ids]
-    if rp_idx:
-        ax.scatter(
-            embedding_3d[rp_idx, 0], embedding_3d[rp_idx, 1], embedding_3d[rp_idx, 2],
-            facecolors="none", edgecolors="black", s=30, linewidths=0.6,
-            label=f"RPs (n={len(rp_idx)})", depthshade=False,
-        )
-
-    ax.set_xlabel("UMAP 1", labelpad=8)
-    ax.set_ylabel("UMAP 2", labelpad=8)
-    ax.set_zlabel("UMAP 3", labelpad=8)
-    ax.set_title(f"{sample_id}: 3-D UMAP of COA space (k={n_clusters})")
-    ax.legend(fontsize=7, loc="upper left")
-    ax.view_init(elev=25, azim=135)
-
-    for fmt in FORMATS:
-        fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# Amino-acid property grouping (shared with plots.py, duplicated here to keep
-# the module self-contained and avoid circular imports)
+# Amino-acid property grouping (used by _plot_gmm_cluster_rscu_heatmap)
 # ---------------------------------------------------------------------------
 
 _THREE_TO_ONE = {
@@ -835,68 +318,240 @@ _AA_ORDER = list("ARNDC QEGHILKMFPSTWYV".replace(" ", ""))
 _AA_NAMES = {v: k for k, v in _THREE_TO_ONE.items() if len(k) == 3}
 
 
+# ---------------------------------------------------------------------------
+# Diagnostic plots
+# ---------------------------------------------------------------------------
+
+def _plot_coa_mahalanobis(
+    coa_coords: pd.DataFrame,
+    distances: np.ndarray,
+    gene_ids: list[str],
+    rp_gene_ids: set[str],
+    rp_indices: np.ndarray,
+    rp_outlier_mask: np.ndarray,
+    threshold: float,
+    centroid: np.ndarray,
+    cov: np.ndarray,
+    output_path: Path,
+    sample_id: str,
+    inertia_pcts: tuple[float, float] = (0.0, 0.0),
+) -> None:
+    """Plot COA axes 1 & 2 colored by Mahalanobis distance, with threshold ellipse."""
+    plt.rcParams.update(STYLE_PARAMS)
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    x = coa_coords["Axis1"].values
+    y = coa_coords["Axis2"].values
+
+    # Color all genes by distance
+    vmax = min(np.percentile(distances, 95), threshold * 3)
+    norm = mcolors.Normalize(vmin=0, vmax=vmax)
+    sc = ax.scatter(
+        x, y, c=distances, cmap="viridis_r", norm=norm,
+        alpha=0.5, s=10, edgecolors="none", rasterized=True,
+    )
+    fig.colorbar(sc, ax=ax, label="Mahalanobis distance", shrink=0.8)
+
+    # Highlight optimized genes (within threshold)
+    opt_mask = distances <= threshold
+    ax.scatter(
+        x[opt_mask], y[opt_mask],
+        facecolors="none", edgecolors="#2c7bb6", s=14, linewidths=0.4,
+        alpha=0.4, label=f"Optimized set (n={opt_mask.sum()})",
+    )
+
+    # Mark RP genes
+    rp_idx = [i for i, g in enumerate(gene_ids) if g in rp_gene_ids]
+    if rp_idx:
+        ax.scatter(
+            x[rp_idx], y[rp_idx],
+            facecolors="none", edgecolors="black", s=40, linewidths=0.8,
+            label=f"Ribosomal proteins (n={len(rp_idx)})", zorder=5,
+        )
+
+    # Mark RP outliers in red
+    rp_idx_arr = np.array(rp_idx)
+    if rp_outlier_mask.any() and len(rp_idx_arr) == len(rp_outlier_mask):
+        outlier_idx = rp_idx_arr[rp_outlier_mask]
+        if len(outlier_idx) > 0:
+            ax.scatter(
+                x[outlier_idx], y[outlier_idx],
+                marker="x", color="#d7191c", s=50, linewidths=1.5,
+                label=f"RP outliers (n={len(outlier_idx)})", zorder=6,
+            )
+
+    # Draw threshold ellipse on axes 1 & 2
+    try:
+        cov_2d = cov[:2, :2]
+        eigvals, eigvecs = np.linalg.eigh(cov_2d)
+        if np.all(eigvals > 0):
+            angle = np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1]))
+            width = 2 * threshold * np.sqrt(eigvals[1])
+            height = 2 * threshold * np.sqrt(eigvals[0])
+            ellipse = mpatches.Ellipse(
+                (centroid[0], centroid[1]), width, height, angle=angle,
+                linewidth=1.5, edgecolor="#d7191c", facecolor="none",
+                linestyle="--", alpha=0.7, label=f"Threshold (d={threshold:.1f})",
+            )
+            ax.add_patch(ellipse)
+    except Exception:
+        pass
+
+    # RP centroid
+    ax.scatter(
+        centroid[0], centroid[1], marker="*", s=200,
+        color="#d7191c", edgecolors="black", linewidths=0.5,
+        zorder=7, label="RP centroid",
+    )
+
+    pct1, pct2 = inertia_pcts
+    ax.set_xlabel(f"COA Axis 1 ({pct1:.1f}% inertia)")
+    ax.set_ylabel(f"COA Axis 2 ({pct2:.1f}% inertia)")
+    ax.set_title(f"{sample_id}: RP-anchored Mahalanobis distance")
+    ax.legend(fontsize=7, framealpha=0.7, loc="best")
+
+    for fmt in FORMATS:
+        fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_distance_histogram(
+    distances: np.ndarray,
+    rp_distances: np.ndarray,
+    threshold: float,
+    output_path: Path,
+    sample_id: str,
+) -> None:
+    """Histogram of Mahalanobis distances for all genes and RP subset."""
+    plt.rcParams.update(STYLE_PARAMS)
+    fig, ax = plt.subplots(figsize=(6, 4))
+
+    bins = np.linspace(0, min(np.percentile(distances, 99), threshold * 4), 60)
+    ax.hist(distances, bins=bins, color="#2c7bb6", alpha=0.5, label="All genes")
+    ax.hist(rp_distances, bins=bins, color="#d7191c", alpha=0.6, label="RP genes")
+    ax.axvline(threshold, color="#fdae61", linewidth=2, linestyle="--",
+               label=f"Threshold (d={threshold:.2f})")
+    ax.axvline(np.median(rp_distances), color="#abd9e9", linewidth=1.5,
+               linestyle=":", label=f"Median RP (d={np.median(rp_distances):.2f})")
+
+    n_opt = (distances <= threshold).sum()
+    ax.set_xlabel("Mahalanobis distance from RP centroid")
+    ax.set_ylabel("Number of genes")
+    ax.set_title(f"{sample_id}: distance distribution ({n_opt} genes in optimized set)")
+    ax.legend(fontsize=8, framealpha=0.7)
+
+    for fmt in FORMATS:
+        fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_rp_outlier_detection(
+    coa_coords: pd.DataFrame,
+    rp_gene_ids: set[str],
+    gene_ids: list[str],
+    rp_outlier_mask: np.ndarray,
+    rp_indices: np.ndarray,
+    chi2_crit: float,
+    output_path: Path,
+    sample_id: str,
+) -> None:
+    """Scatter of RP genes in COA space with outliers highlighted."""
+    plt.rcParams.update(STYLE_PARAMS)
+    fig, ax = plt.subplots(figsize=(6, 5))
+
+    x = coa_coords["Axis1"].values
+    y = coa_coords["Axis2"].values
+
+    # All genes, pale background
+    ax.scatter(x, y, c="#cccccc", alpha=0.15, s=6, edgecolors="none", rasterized=True)
+
+    # RP genes
+    rp_idx = np.array([i for i, g in enumerate(gene_ids) if g in rp_gene_ids])
+    if len(rp_idx) == 0:
+        plt.close(fig)
+        return
+
+    non_outlier_rp = rp_idx[~rp_outlier_mask] if len(rp_idx) == len(rp_outlier_mask) else rp_idx
+    outlier_rp = rp_idx[rp_outlier_mask] if len(rp_idx) == len(rp_outlier_mask) else np.array([])
+
+    ax.scatter(
+        x[non_outlier_rp], y[non_outlier_rp],
+        c="#2c7bb6", s=30, alpha=0.8, edgecolors="black", linewidths=0.5,
+        label=f"RP non-outlier (n={len(non_outlier_rp)})",
+    )
+    if len(outlier_rp) > 0:
+        ax.scatter(
+            x[outlier_rp], y[outlier_rp],
+            marker="x", c="#d7191c", s=60, linewidths=1.5,
+            label=f"RP outlier (n={len(outlier_rp)})", zorder=5,
+        )
+
+    ax.set_xlabel("COA Axis 1")
+    ax.set_ylabel("COA Axis 2")
+    ax.set_title(
+        f"{sample_id}: RP outlier detection "
+        f"(chi2 crit={chi2_crit:.2f}, alpha={_RP_OUTLIER_ALPHA})"
+    )
+    ax.legend(fontsize=8, framealpha=0.7)
+
+    for fmt in FORMATS:
+        fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _plot_gmm_cluster_rscu_heatmap(
     cluster_rscu: pd.Series,
     output_path: Path,
     sample_id: str,
-    cluster_label: int,
-    n_genes: int,
+    cluster_label: int = 0,
+    n_genes: int = 0,
 ) -> None:
-    """Rounded-cell RSCU heatmap of the GMM cluster's pooled codon usage.
+    """Rounded-cell RSCU heatmap for the optimized gene set.
 
-    Mirrors the visual style of ``plot_rscu_heatmap_rounded`` in plots.py
-    but shows only the GMM RP-cluster reference RSCU (concatenated pooling).
-    Amino acids are grouped by biochemical property; each cell shows the
-    codon triplet and its RSCU value.
+    Signature kept identical to the original GMM version so that
+    plots.py can import and call it without changes.
     """
+    import matplotlib.gridspec as gridspec
+    from matplotlib.patches import FancyBboxPatch
+    import matplotlib.patheffects as pe
+
     plt.rcParams.update(STYLE_PARAMS)
 
-    if cluster_rscu is None or cluster_rscu.empty:
+    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in cluster_rscu.index]
+    if not rscu_cols:
         return
 
-    # Build a dataframe from the RSCU series (index = "AminoAcid-Codon")
+    # Build data: for each AA, list the codons and their RSCU
     rows = []
-    for label, rscu in cluster_rscu.items():
-        if "-" not in label:
-            continue
-        aa_name, codon = label.rsplit("-", 1)
-        one_letter = _THREE_TO_ONE.get(aa_name)
-        if one_letter is None or one_letter in ("M", "W"):
-            continue
-        rows.append({"amino_acid": aa_name, "AA": one_letter, "codon": codon, "rscu": rscu})
-
+    for col in rscu_cols:
+        parts = col.split("-")
+        if len(parts) == 2:
+            aa_str, codon = parts
+            one_letter = _THREE_TO_ONE.get(aa_str, "?")
+            rows.append({"AA": one_letter, "aa_label": aa_str, "codon": codon, "rscu": cluster_rscu[col]})
     if not rows:
         return
     df = pd.DataFrame(rows)
 
-    # Order amino acids by biochemical group
+    # Determine amino acid order
     group_order = ["Nonpolar", "Polar", "Positive", "Negative"]
-    present = set(df["AA"].unique())
-    aa_ordered = [aa for grp in group_order for aa in _AA_ORDER
-                  if _AA_TO_GROUP.get(aa) == grp and aa in present]
-    if not aa_ordered:
-        return
+    aa_in_data = set(df["AA"].unique())
+    aa_ordered = [a for a in _AA_ORDER if a in aa_in_data]
 
-    # Diverging colormap: blue (low) → white (1.0) → red (high)
-    max_rscu = df["rscu"].max()
-    vmax = min(max(max_rscu * 1.05, 3.0), 5.0)
-    colors_below = plt.cm.Blues_r(np.linspace(0.0, 0.7, 128))
-    colors_above = plt.cm.Reds(np.linspace(0.0, 0.75, 128))
-    cmap = mcolors.LinearSegmentedColormap.from_list(
-        "rscu_diverging", np.vstack([colors_below, colors_above]),
-    )
-    norm = mcolors.TwoSlopeNorm(vmin=0, vcenter=1.0, vmax=vmax)
-
-    fig = plt.figure(figsize=(10, 9))
-    gs = gridspec.GridSpec(1, 2, width_ratios=[30, 1], wspace=0.03)
+    # Layout
+    fig = plt.figure(figsize=(8, max(6, len(aa_ordered) * 0.65)))
+    gs = gridspec.GridSpec(1, 2, width_ratios=[20, 1], wspace=0.15)
     ax = fig.add_subplot(gs[0])
     cax = fig.add_subplot(gs[1])
 
-    cell_h, cell_w = 0.85, 0.85
-    y_pos = 0
+    cmap = plt.cm.RdYlBu_r
+    norm = mcolors.Normalize(vmin=0, vmax=4)
+    cell_w, cell_h = 0.85, 0.85
+
     y_positions = {}
-    group_boundaries = []
+    y_pos = 0.0
     current_group = None
+    group_boundaries = []
 
     for aa in aa_ordered:
         grp = _AA_TO_GROUP.get(aa, "")
@@ -970,7 +625,7 @@ def _plot_gmm_cluster_rscu_heatmap(
     ax.set_aspect("equal")
     ax.axis("off")
 
-    title = f"GMM Cluster {cluster_label} RSCU ({n_genes} genes, concatenated pooling)"
+    title = f"RP-Anchored Optimized Set RSCU ({n_genes} genes, concatenated pooling)"
     if sample_id:
         title += f"\n{sample_id}"
     ax.set_title(title, fontsize=12, fontweight="bold", pad=15)
@@ -991,93 +646,6 @@ def _plot_gmm_cluster_rscu_heatmap(
     plt.close(fig)
 
 
-def _plot_gmm_cluster_pergene_heatmap(
-    rscu_gene_df: pd.DataFrame,
-    cluster_gene_ids: set[str],
-    labels: np.ndarray,
-    gene_ids: list[str],
-    rp_gene_ids: set[str],
-    rp_cluster: int,
-    output_path: Path,
-    sample_id: str,
-) -> None:
-    """Clustered heatmap of per-gene RSCU for genes in the GMM RP cluster.
-
-    Rows = genes in the RP cluster (hierarchically clustered), columns =
-    codons (hierarchically clustered).  A colour sidebar marks ribosomal
-    proteins vs non-RP co-clustered genes.
-    """
-    plt.rcParams.update(STYLE_PARAMS)
-    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
-    if not rscu_cols:
-        return
-
-    # Filter to GMM cluster members only
-    cluster_df = rscu_gene_df[rscu_gene_df["gene"].isin(cluster_gene_ids)].copy()
-    if len(cluster_df) < 3:
-        logger.info("Too few genes in GMM cluster for per-gene heatmap (%d)", len(cluster_df))
-        return
-
-    gene_col = cluster_df["gene"].values
-    data = cluster_df[rscu_cols].values.copy()
-    data = np.nan_to_num(data, nan=0.0)
-
-    # Cap at 500 genes for readability
-    if len(data) > 500:
-        rng = np.random.RandomState(42)
-        idx = rng.choice(len(data), 500, replace=False)
-        data = data[idx]
-        gene_col = gene_col[idx]
-
-    # Row colour sidebar: RP genes vs non-RP
-    row_colors = pd.Series(
-        ["#D4726A" if g in rp_gene_ids else "#5B8DBE" for g in gene_col],
-        index=range(len(gene_col)),
-        name="Gene type",
-    )
-
-    codon_labels = [c.split("-")[-1] for c in rscu_cols]
-    data_df = pd.DataFrame(data, columns=codon_labels)
-
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="Clustering large matrix")
-        g = sns.clustermap(
-            data_df,
-            cmap="RdYlBu_r",
-            center=1.0,
-            row_cluster=True,
-            col_cluster=True,
-            method="average",
-            metric="euclidean",
-            linewidths=0,
-            xticklabels=True,
-            yticklabels=False,
-            row_colors=row_colors,
-            figsize=(14, min(10, max(5, len(data) // 30))),
-            cbar_kws={"label": "RSCU"},
-        )
-
-    # Legend for sidebar
-    from matplotlib.patches import Patch
-    legend_elements = [
-        Patch(facecolor="#D4726A", label="Ribosomal protein"),
-        Patch(facecolor="#5B8DBE", label="Non-RP co-clustered"),
-    ]
-    g.ax_heatmap.legend(
-        handles=legend_elements, loc="upper left",
-        bbox_to_anchor=(1.06, 1.0), fontsize=8, framealpha=0.7,
-    )
-
-    title = f"Per-Gene RSCU — GMM Cluster {rp_cluster} ({len(data)} genes)"
-    if sample_id:
-        title += f" — {sample_id}"
-    g.fig.suptitle(title, y=1.02, fontsize=12, fontweight="bold")
-
-    for fmt in FORMATS:
-        g.fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
-    plt.close(g.fig)
-
-
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -1093,16 +661,21 @@ def run_gmm_clustering(
     min_k: int = _MIN_K,
     max_k: int = _MAX_K,
 ) -> dict:
-    """Run GMM clustering on COA-projected per-gene RSCU.
+    """RP-anchored Mahalanobis distance clustering for translational optimization.
+
+    Replaces GMM-based clustering. Uses the known RP genes as an anchor to
+    define a Mahalanobis distance threshold in COA space, then classifies
+    all genes within that threshold as translationally optimized.
 
     Steps:
         1. Compute COA on per-gene RSCU (reuses advanced_analyses.compute_coa_on_rscu)
         2. Select top COA axes by cumulative inertia
-        3. Fit GMMs for k in [min_k, max_k], select best by BIC
-        4. Assign genes to clusters
-        5. Identify which cluster contains the ribosomal proteins
-        6. Compute mean RSCU from RP cluster
-        7. Export cluster gene IDs and diagnostic plots
+        3. Fit robust covariance on RP genes (MinCovDet + two-pass outlier removal)
+        4. Compute Mahalanobis distance from cleaned RP centroid to all genes
+        5. Set threshold at 2x median RP Mahalanobis distance
+        6. Define optimized gene set as all genes within threshold
+        7. Compute mean RSCU from optimized set via concatenated pooling
+        8. Export gene IDs and diagnostic plots
 
     Args:
         rscu_gene_df: Per-gene RSCU table (from compute_rscu_per_gene).
@@ -1113,23 +686,23 @@ def run_gmm_clustering(
         rp_rscu_df: Per-gene RSCU for ribosomal proteins (optional, for
             validation only).
         expr_df: Optional expression table (passed to COA for tier annotation).
-        min_k: Minimum GMM components to test.
-        max_k: Maximum GMM components to test.
+        min_k: Unused (kept for signature compatibility).
+        max_k: Unused (kept for signature compatibility).
 
     Returns:
         Dict with:
-            - 'gmm_cluster_gene_ids': set[str] — gene IDs in the RP cluster
-            - 'gmm_cluster_rscu': pd.Series — mean RSCU of RP cluster
-            - 'gmm_labels': np.ndarray — cluster label per gene
-            - 'gmm_probabilities': np.ndarray — posterior probabilities (n_genes, k)
-            - 'gmm_rp_cluster': int — which cluster is the RP cluster
-            - 'gmm_best_k': int — optimal number of components
-            - 'gmm_bic_scores': list[float] — BIC for each k tested
+            - 'gmm_cluster_gene_ids': set[str] — gene IDs in the optimized set
+            - 'gmm_cluster_rscu': pd.Series — pooled RSCU of optimized set
+            - 'gmm_labels': np.ndarray — binary labels (1=optimized, 0=not)
+            - 'gmm_probabilities': np.ndarray — (n_genes, 2) membership scores
+            - 'gmm_rp_cluster': int — always 1 (the optimized label)
+            - 'gmm_best_k': int — always 2 (optimized vs non-optimized)
+            - 'gmm_bic_scores': list[float] — empty (no BIC)
             - 'gmm_n_axes': int — number of COA axes used
             - 'gmm_coa_coords': pd.DataFrame — gene coordinates in COA space
             - 'gmm_rp_cosine_sim': float — cosine similarity between
-                  RP-cluster RSCU and RP-only RSCU (quality check)
-            - File paths for diagnostics and plots
+                  optimized-set RSCU and RP-only RSCU
+            - File paths for diagnostics and exports
     """
     gmm_dir = output_dir / "gmm_clustering"
     gmm_dir.mkdir(parents=True, exist_ok=True)
@@ -1146,7 +719,7 @@ def run_gmm_clustering(
     if not rp_gene_ids:
         logger.warning(
             "No ribosomal protein IDs available for %s; "
-            "GMM clustering cannot identify the RP cluster. Skipping.",
+            "RP-anchored clustering cannot proceed. Skipping.",
             sample_id,
         )
         return results
@@ -1155,17 +728,17 @@ def run_gmm_clustering(
     n_genes = len(rscu_gene_df)
     if n_genes < _MIN_GENES_FOR_GMM:
         logger.warning(
-            "Too few genes for GMM clustering (%d < %d) in %s. Skipping.",
+            "Too few genes for clustering (%d < %d) in %s. Skipping.",
             n_genes, _MIN_GENES_FOR_GMM, sample_id,
         )
         return results
 
     # ── Step 1: COA ───────────────────────────────────────────────────
-    logger.info("GMM clustering: computing COA on %d genes for %s", n_genes, sample_id)
+    logger.info("RP-anchored clustering: computing COA on %d genes for %s", n_genes, sample_id)
     coa_results = compute_coa_on_rscu(rscu_gene_df, expr_df=expr_df)
 
     if not coa_results or "coa_coords" not in coa_results:
-        logger.warning("COA failed for %s; skipping GMM clustering", sample_id)
+        logger.warning("COA failed for %s; skipping clustering", sample_id)
         return results
 
     coa_coords = coa_results["coa_coords"]
@@ -1177,13 +750,13 @@ def run_gmm_clustering(
     n_axes = len(axis_cols)
 
     if n_axes < _MIN_COA_AXES:
-        logger.warning("Insufficient COA axes (%d) for GMM clustering in %s", n_axes, sample_id)
+        logger.warning("Insufficient COA axes (%d) for clustering in %s", n_axes, sample_id)
         return results
 
-    X = coa_coords[axis_cols].values
     gene_ids = coa_coords["gene"].astype(str).tolist()
+    X = coa_coords[axis_cols].values
 
-    # Remove any rows with NaN
+    # Remove rows with NaN
     valid_mask = ~np.isnan(X).any(axis=1)
     if valid_mask.sum() < _MIN_GENES_FOR_GMM:
         logger.warning("Too few valid genes after NaN removal (%d) in %s", valid_mask.sum(), sample_id)
@@ -1192,286 +765,218 @@ def run_gmm_clustering(
     gene_ids = [g for g, v in zip(gene_ids, valid_mask) if v]
 
     logger.info(
-        "GMM clustering: using %d COA axes (%.1f%% cumulative inertia) for %d genes",
+        "Using %d COA axes (%.1f%% cumulative inertia) for %d genes",
         n_axes,
         coa_inertia["cum_pct"].iloc[n_axes - 1] if len(coa_inertia) >= n_axes else 0,
         len(gene_ids),
     )
     results["gmm_n_axes"] = n_axes
 
-    # ── Step 3: Fit GMM with BIC selection ────────────────────────────
-    gmm, best_k, bic_scores = _fit_gmm_bic(X, min_k=min_k, max_k=max_k)
-    labels = gmm.predict(X)
-    probabilities = gmm.predict_proba(X)
+    # ── Step 3: Extract RP gene coordinates ───────────────────────────
+    rp_indices = np.array([i for i, g in enumerate(gene_ids) if g in rp_gene_ids])
+    n_rp_found = len(rp_indices)
 
+    if n_rp_found < 3:
+        logger.warning(
+            "Only %d RP genes found in COA space for %s; need >= 3. Skipping.",
+            n_rp_found, sample_id,
+        )
+        return results
+
+    X_rp = X[rp_indices]
     logger.info(
-        "GMM model selection: best k=%d (BIC=%.1f) for %s",
-        best_k, gmm.bic(X), sample_id,
+        "Found %d/%d RP genes in COA space for %s",
+        n_rp_found, len(rp_gene_ids), sample_id,
     )
 
-    results["gmm_best_k"] = best_k
-    results["gmm_bic_scores"] = bic_scores
-    results["gmm_labels"] = labels
-    results["gmm_probabilities"] = probabilities
+    # ── Step 4: Fit robust RP reference ───────────────────────────────
+    centroid, cov, cov_inv, rp_outlier_mask = _fit_robust_rp_reference(
+        X_rp, n_axes,
+        alpha=_RP_OUTLIER_ALPHA,
+        min_rp=_MIN_RP_FOR_ROBUST,
+    )
 
-    # Cluster sizes
-    for k in range(best_k):
-        n_in_k = (labels == k).sum()
-        logger.info("  cluster %d: %d genes (%.1f%%)", k, n_in_k, 100 * n_in_k / len(labels))
+    # ── Step 5: Compute Mahalanobis distances for all genes ───────────
+    distances = _compute_mahalanobis_distances(X, centroid, cov_inv)
 
-    # ── Step 4: Identify RP cluster ───────────────────────────────────
-    rp_cluster = _identify_rp_cluster(gmm, labels, gene_ids, rp_gene_ids)
-    results["gmm_rp_cluster"] = rp_cluster
+    # Distances for non-outlier RP genes (for threshold computation)
+    rp_dists_all = distances[rp_indices]
+    rp_dists_clean = rp_dists_all[~rp_outlier_mask]
 
-    # Collect gene IDs in RP cluster
+    if len(rp_dists_clean) == 0:
+        rp_dists_clean = rp_dists_all
+
+    median_rp_dist = float(np.median(rp_dists_clean))
+    threshold = _DISTANCE_MULTIPLIER * median_rp_dist
+
+    logger.info(
+        "Mahalanobis threshold: %.2f x %.2f = %.2f",
+        _DISTANCE_MULTIPLIER, median_rp_dist, threshold,
+    )
+
+    # ── Step 6: Define optimized gene set ─────────────────────────────
+    optimized_mask = distances <= threshold
     cluster_gene_ids = {
-        gid for gid, lbl in zip(gene_ids, labels) if lbl == rp_cluster
+        gid for gid, opt in zip(gene_ids, optimized_mask) if opt
     }
-    results["gmm_cluster_gene_ids"] = cluster_gene_ids
 
     n_cluster = len(cluster_gene_ids)
     n_rp_in_cluster = len(cluster_gene_ids & rp_gene_ids)
+
     logger.info(
-        "RP cluster %d: %d total genes, %d are RPs, %d are non-RP co-clustered genes",
-        rp_cluster, n_cluster, n_rp_in_cluster, n_cluster - n_rp_in_cluster,
+        "Optimized set: %d total genes, %d are RPs, %d are non-RP co-selected genes",
+        n_cluster, n_rp_in_cluster, n_cluster - n_rp_in_cluster,
     )
 
     if n_cluster < _MIN_CLUSTER_SIZE:
         logger.warning(
-            "RP cluster is small (%d genes); expression scoring may be unreliable",
+            "Optimized set is small (%d genes); expression scoring may be unreliable",
             n_cluster,
         )
 
-    # ── Step 5: Compute RP-cluster RSCU (concatenated pooling) ──────
+    results["gmm_cluster_gene_ids"] = cluster_gene_ids
+    results["gmm_rp_cluster"] = 1  # optimized = label 1
+
+    # Labels: 1 for optimized, 0 for non-optimized
+    labels = optimized_mask.astype(int)
+    results["gmm_labels"] = labels
+    results["gmm_best_k"] = 2
+    results["gmm_bic_scores"] = []
+
+    # Soft membership via sigmoid on distance
+    probabilities = _distance_to_membership(distances, threshold)
+    results["gmm_probabilities"] = probabilities
+
+    # ── Step 7: Compute optimized-set RSCU (concatenated pooling) ─────
     if ffn_path and ffn_path.exists():
         cluster_rscu = _compute_cluster_rscu(ffn_path, cluster_gene_ids)
     else:
-        # Fallback: per-gene mean if FFN not available (less accurate)
-        logger.warning("FFN path not available; falling back to per-gene mean RSCU for cluster reference")
+        logger.warning("FFN path not available; falling back to per-gene mean RSCU")
         rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
         cluster_df = rscu_gene_df[rscu_gene_df["gene"].isin(cluster_gene_ids)]
         cluster_rscu = cluster_df[rscu_cols].mean() if not cluster_df.empty else pd.Series(dtype=float)
     results["gmm_cluster_rscu"] = cluster_rscu
 
-    # ── Step 6: Quality check — compare RP-cluster RSCU to RP-only RSCU ─
+    # ── Step 8: Quality check — cosine similarity ─────────────────────
     rp_cosine_sim = np.nan
     if rp_rscu_df is not None and not rp_rscu_df.empty:
         rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rp_rscu_df.columns and c in cluster_rscu.index]
         if rscu_cols:
             rp_only_rscu = rp_rscu_df[rscu_cols].mean()
-            # cosine_dist returns distance; similarity = 1 - distance
             rp_cosine_sim = 1.0 - cosine_dist(
                 cluster_rscu[rscu_cols].fillna(0).values,
                 rp_only_rscu.fillna(0).values,
             )
             logger.info(
-                "RP-cluster vs RP-only RSCU cosine similarity: %.4f "
-                "(>0.95 = cluster closely matches RP signal; "
-                "<0.85 = cluster has diverged, check results)",
+                "Optimized-set vs RP-only RSCU cosine similarity: %.4f "
+                "(>0.95 = closely matches RP signal; "
+                "<0.85 = has diverged, check results)",
                 rp_cosine_sim,
             )
     results["gmm_rp_cosine_sim"] = rp_cosine_sim
 
-    # ── Step 7: Save outputs ──────────────────────────────────────────
+    # ── Step 9: Save outputs ──────────────────────────────────────────
 
-    # Per-gene silhouette values (computed here so they go into the TSV)
-    per_gene_silhouette = np.full(len(labels), np.nan)
-    if best_k >= 2:
-        try:
-            per_gene_silhouette = silhouette_samples(X, labels)
-        except Exception:
-            pass
-
-    # Gene-level cluster assignments
+    # Gene-level assignments
     cluster_df = pd.DataFrame({
         "gene": gene_ids,
-        "gmm_cluster": labels,
-        "gmm_rp_cluster_prob": probabilities[:, rp_cluster],
-        "silhouette_score": per_gene_silhouette,
-        "in_rp_cluster": [gid in cluster_gene_ids for gid in gene_ids],
+        "mahalanobis_distance": distances,
+        "membership_score": probabilities[:, 1],
+        "in_optimized_set": [gid in cluster_gene_ids for gid in gene_ids],
         "is_ribosomal_protein": [gid in rp_gene_ids for gid in gene_ids],
     })
     cluster_path = gmm_dir / f"{sample_id}_gmm_clusters.tsv"
     cluster_df.to_csv(cluster_path, sep="\t", index=False)
     results["gmm_clusters_path"] = cluster_path
 
-    # RP-cluster RSCU reference
+    # Optimized-set RSCU reference
     rscu_path = gmm_dir / f"{sample_id}_gmm_cluster_rscu.tsv"
     cluster_rscu.to_frame("RSCU").to_csv(rscu_path, sep="\t")
     results["gmm_cluster_rscu_path"] = rscu_path
 
-    # RP-cluster gene IDs (one per line, for expression.py)
+    # Gene IDs (one per line, for expression.py)
     ids_path = gmm_dir / f"{sample_id}_gmm_cluster_ids.txt"
     ids_path.write_text("\n".join(sorted(cluster_gene_ids)) + "\n")
     results["gmm_cluster_ids_path"] = ids_path
-
-    # ── Step 7b: Compute silhouette score (before plots, for summary) ──
-    mean_silhouette_score = np.nan
-    if best_k >= 2:
-        try:
-            mean_silhouette_score = float(silhouette_score(X, labels))
-        except Exception:
-            pass
 
     # Summary stats
     summary = {
         "sample_id": sample_id,
         "n_genes": len(gene_ids),
         "n_coa_axes": n_axes,
-        "best_k": best_k,
-        "rp_cluster": rp_cluster,
+        "best_k": 2,
+        "rp_cluster": 1,
         "rp_cluster_size": n_cluster,
         "rp_genes_in_cluster": n_rp_in_cluster,
         "non_rp_in_cluster": n_cluster - n_rp_in_cluster,
         "total_rp_genes": len(rp_gene_ids),
+        "rp_outliers_removed": int(rp_outlier_mask.sum()),
+        "mahalanobis_threshold": round(threshold, 4),
+        "median_rp_distance": round(median_rp_dist, 4),
         "rp_cosine_similarity": round(rp_cosine_sim, 4) if not np.isnan(rp_cosine_sim) else None,
-        "mean_silhouette_score": round(mean_silhouette_score, 4) if not np.isnan(mean_silhouette_score) else None,
     }
     summary_df = pd.DataFrame([summary])
     summary_path = gmm_dir / f"{sample_id}_gmm_summary.tsv"
     summary_df.to_csv(summary_path, sep="\t", index=False)
     results["gmm_summary_path"] = summary_path
 
-    # COA coordinates with cluster assignments
-    coa_with_clusters = coa_coords.copy()
-    # Only merge for genes that were clustered (valid_mask filtered)
-    cluster_merge = pd.DataFrame({"gene": gene_ids, "gmm_cluster": labels})
-    coa_with_clusters = coa_with_clusters.merge(cluster_merge, on="gene", how="left")
-    results["gmm_coa_coords"] = coa_with_clusters
+    # COA coordinates with assignments
+    coa_with_assignments = coa_coords.copy()
+    assign_merge = pd.DataFrame({
+        "gene": gene_ids,
+        "gmm_cluster": labels,
+        "mahalanobis_distance": distances,
+    })
+    coa_with_assignments = coa_with_assignments.merge(assign_merge, on="gene", how="left")
+    results["gmm_coa_coords"] = coa_with_assignments
 
-    # ── Step 8: Diagnostic plots ──────────────────────────────────────
+    # ── Step 10: Diagnostic plots ─────────────────────────────────────
     try:
         inertia_pcts_2 = (0.0, 0.0)
-        inertia_pcts_3 = (0.0, 0.0, 0.0)
         if len(coa_inertia) >= 2:
             inertia_pcts_2 = (
                 float(coa_inertia["pct_inertia"].iloc[0]),
                 float(coa_inertia["pct_inertia"].iloc[1]),
             )
-        if len(coa_inertia) >= 3:
-            inertia_pcts_3 = (
-                float(coa_inertia["pct_inertia"].iloc[0]),
-                float(coa_inertia["pct_inertia"].iloc[1]),
-                float(coa_inertia["pct_inertia"].iloc[2]),
-            )
 
         coa_filtered = coa_coords[coa_coords["gene"].isin(gene_ids)].reset_index(drop=True)
 
-        # BIC model selection curve
-        _plot_bic_selection(
-            bic_scores, best_k,
-            gmm_dir / f"{sample_id}_gmm_bic",
-            sample_id,
-        )
-        results["gmm_bic_plot"] = gmm_dir / f"{sample_id}_gmm_bic.png"
-
-        # COA Axis 1 vs 2 scatter
-        _plot_coa_clusters(
-            coa_filtered,
-            labels, rp_cluster, rp_gene_ids,
-            gmm_dir / f"{sample_id}_gmm_coa_clusters",
+        # COA scatter colored by Mahalanobis distance
+        _plot_coa_mahalanobis(
+            coa_filtered, distances, gene_ids, rp_gene_ids,
+            rp_indices, rp_outlier_mask,
+            threshold, centroid, cov,
+            gmm_dir / f"{sample_id}_gmm_coa_mahalanobis",
             sample_id,
             inertia_pcts=inertia_pcts_2,
         )
-        results["gmm_coa_plot"] = gmm_dir / f"{sample_id}_gmm_coa_clusters.png"
+        results["gmm_coa_plot"] = gmm_dir / f"{sample_id}_gmm_coa_mahalanobis.png"
 
-        # RP cluster posterior probability histogram
-        _plot_cluster_separation(
-            coa_coords, labels, probabilities, rp_cluster,
-            gmm_dir / f"{sample_id}_gmm_cluster_separation",
+        # Distance histogram
+        _plot_distance_histogram(
+            distances, rp_dists_all, threshold,
+            gmm_dir / f"{sample_id}_gmm_distance_histogram",
             sample_id,
         )
-        results["gmm_separation_plot"] = gmm_dir / f"{sample_id}_gmm_cluster_separation.png"
+        results["gmm_separation_plot"] = gmm_dir / f"{sample_id}_gmm_distance_histogram.png"
 
-        # Cosine-transformed COA scatter
-        _plot_coa_clusters_cosine(
-            coa_filtered, labels, rp_cluster, rp_gene_ids,
-            gmm_dir / f"{sample_id}_gmm_coa_cosine",
-            sample_id,
-            n_axes=n_axes,
-        )
-        results["gmm_coa_cosine_plot"] = gmm_dir / f"{sample_id}_gmm_coa_cosine.png"
-
-        # Z-score-standardised COA scatter
-        _plot_coa_clusters_zscore(
-            coa_filtered, labels, rp_cluster, rp_gene_ids,
-            gmm_dir / f"{sample_id}_gmm_coa_zscore",
-            sample_id,
-            n_axes=n_axes,
-        )
-        results["gmm_coa_zscore_plot"] = gmm_dir / f"{sample_id}_gmm_coa_zscore.png"
-
-        # Pairwise scatter matrix across all retained COA axes
-        _plot_pairwise_coa_matrix(
-            coa_filtered, labels, rp_cluster, rp_gene_ids, n_axes,
-            gmm_dir / f"{sample_id}_gmm_coa_pairwise",
+        # RP outlier detection plot
+        chi2_crit = np.sqrt(chi2.ppf(1 - _RP_OUTLIER_ALPHA, df=n_axes))
+        _plot_rp_outlier_detection(
+            coa_filtered, rp_gene_ids, gene_ids, rp_outlier_mask,
+            rp_indices, chi2_crit,
+            gmm_dir / f"{sample_id}_gmm_rp_outliers",
             sample_id,
         )
-        results["gmm_pairwise_plot"] = gmm_dir / f"{sample_id}_gmm_coa_pairwise.png"
-
-        # Silhouette analysis (quantitative cluster separation)
-        if best_k >= 2 and not np.all(np.isnan(per_gene_silhouette)):
-            _plot_silhouette(
-                labels, rp_cluster,
-                per_gene_silhouette, mean_silhouette_score,
-                gmm_dir / f"{sample_id}_gmm_silhouette",
-                sample_id,
-            )
-            results["gmm_silhouette_plot"] = gmm_dir / f"{sample_id}_gmm_silhouette.png"
-            results["gmm_mean_silhouette"] = mean_silhouette_score
-            logger.info("Mean silhouette score: %.3f", mean_silhouette_score)
-
-        # 3-D COA scatter (axes 1, 2, 3)
-        if n_axes >= 3:
-            _plot_coa_3d(
-                coa_filtered, labels, rp_cluster, rp_gene_ids,
-                gmm_dir / f"{sample_id}_gmm_coa_3d",
-                sample_id,
-                inertia_pcts=inertia_pcts_3,
-            )
-            results["gmm_coa_3d_plot"] = gmm_dir / f"{sample_id}_gmm_coa_3d.png"
-
-        # UMAP embeddings (2-D and 3-D)
-        if _HAS_UMAP and len(gene_ids) > 30:
-            logger.info("Computing UMAP embeddings for %s", sample_id)
-
-            emb_2d = _compute_umap_embedding(X, n_components=2)
-            if emb_2d is not None:
-                _plot_umap_2d(
-                    emb_2d, labels, rp_cluster, gene_ids, rp_gene_ids,
-                    gmm_dir / f"{sample_id}_gmm_umap_2d",
-                    sample_id,
-                )
-                results["gmm_umap_2d_plot"] = gmm_dir / f"{sample_id}_gmm_umap_2d.png"
-
-            emb_3d = _compute_umap_embedding(X, n_components=3)
-            if emb_3d is not None:
-                _plot_umap_3d(
-                    emb_3d, labels, rp_cluster, gene_ids, rp_gene_ids,
-                    gmm_dir / f"{sample_id}_gmm_umap_3d",
-                    sample_id,
-                )
-                results["gmm_umap_3d_plot"] = gmm_dir / f"{sample_id}_gmm_umap_3d.png"
-        elif not _HAS_UMAP:
-            logger.info("umap-learn not installed; UMAP plots skipped")
-
-        # GMM cluster per-gene RSCU heatmap (genes × codons, cluster members only)
-        # Note: the rounded-cell RSCU heatmap for the GMM cluster is generated
-        # by generate_single_genome_plots() in the plots/ output directory so
-        # it sits alongside the genome-wide RSCU heatmap for comparison.
-        _plot_gmm_cluster_pergene_heatmap(
-            rscu_gene_df, cluster_gene_ids, labels, gene_ids, rp_gene_ids,
-            rp_cluster, gmm_dir / f"{sample_id}_gmm_cluster_pergene_heatmap",
-            sample_id,
-        )
-        results["gmm_cluster_pergene_heatmap"] = gmm_dir / f"{sample_id}_gmm_cluster_pergene_heatmap.png"
+        results["gmm_rp_outlier_plot"] = gmm_dir / f"{sample_id}_gmm_rp_outliers.png"
 
     except Exception as e:
-        logger.warning("GMM diagnostic plot generation failed: %s", e, exc_info=True)
+        logger.warning("Diagnostic plot generation failed: %s", e, exc_info=True)
 
     logger.info(
-        "GMM clustering complete for %s: k=%d, RP cluster=%d (%d genes)",
-        sample_id, best_k, rp_cluster, n_cluster,
+        "RP-anchored clustering complete for %s: "
+        "threshold=%.2f, optimized set=%d genes (%d RPs + %d non-RP)",
+        sample_id, threshold, n_cluster, n_rp_in_cluster, n_cluster - n_rp_in_cluster,
     )
 
     return results
