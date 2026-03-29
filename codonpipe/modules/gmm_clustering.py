@@ -44,10 +44,8 @@ from Bio import SeqIO
 
 from codonpipe.modules.advanced_analyses import compute_coa_on_rscu
 from codonpipe.modules.rscu import compute_rscu_from_counts, count_codons
-from codonpipe.utils.codon_tables import RSCU_COLUMN_NAMES
-
-# Minimum gene length (nt) to include in concatenated codon counts.
-_MIN_GENE_LENGTH = 240
+from codonpipe.plotting.utils import DPI, FORMATS, STYLE_PARAMS, apply_style, save_fig
+from codonpipe.utils.codon_tables import MIN_GENE_LENGTH, RSCU_COLUMN_NAMES
 
 logger = logging.getLogger("codonpipe")
 
@@ -62,26 +60,6 @@ _MIN_COA_AXES = 2             # Minimum COA axes required
 _MAX_COA_AXES = 8             # Maximum COA axes to use for clustering
 _CUMULATIVE_INERTIA_TARGET = 0.80  # Target cumulative inertia for axis selection
 _MIN_CLUSTER_SIZE = 10        # Warn if RP cluster has fewer genes than this
-
-# Plotting
-DPI = 300
-FORMATS = ["png", "svg"]
-
-STYLE_PARAMS = {
-    "font.family": "sans-serif",
-    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
-    "font.size": 10,
-    "axes.labelsize": 12,
-    "axes.titlesize": 13,
-    "xtick.labelsize": 9,
-    "ytick.labelsize": 9,
-    "legend.fontsize": 9,
-    "figure.dpi": 300,
-    "savefig.dpi": 300,
-    "savefig.bbox": "tight",
-    "savefig.pad_inches": 0.1,
-    "svg.fonttype": "none",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +181,7 @@ def _identify_rp_cluster(
 def _compute_cluster_rscu(
     ffn_path: Path,
     cluster_gene_ids: set[str],
-    min_length: int = _MIN_GENE_LENGTH,
+    min_length: int = MIN_GENE_LENGTH,
 ) -> pd.Series:
     """Compute RSCU by concatenated pooling of codon counts across cluster genes.
 
@@ -1477,14 +1455,10 @@ def run_gmm_clustering(
         elif not _HAS_UMAP:
             logger.info("umap-learn not installed; UMAP plots skipped")
 
-        # GMM cluster RSCU rounded heatmap (amino acids × codons)
-        _plot_gmm_cluster_rscu_heatmap(
-            cluster_rscu, gmm_dir / f"{sample_id}_gmm_cluster_rscu_heatmap",
-            sample_id, rp_cluster, n_cluster,
-        )
-        results["gmm_cluster_rscu_heatmap"] = gmm_dir / f"{sample_id}_gmm_cluster_rscu_heatmap.png"
-
         # GMM cluster per-gene RSCU heatmap (genes × codons, cluster members only)
+        # Note: the rounded-cell RSCU heatmap for the GMM cluster is generated
+        # by generate_single_genome_plots() in the plots/ output directory so
+        # it sits alongside the genome-wide RSCU heatmap for comparison.
         _plot_gmm_cluster_pergene_heatmap(
             rscu_gene_df, cluster_gene_ids, labels, gene_ids, rp_gene_ids,
             rp_cluster, gmm_dir / f"{sample_id}_gmm_cluster_pergene_heatmap",
