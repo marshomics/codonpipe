@@ -126,33 +126,43 @@ def detect_hgt_candidates(
     rscu_gene_df: pd.DataFrame,
     enc_df: pd.DataFrame,
     expr_df: pd.DataFrame | None = None,
+    sensitivity: str = "moderate",
+    expected_hgt_frac: float = 0.05,
 ) -> pd.DataFrame:
     """Detect horizontal gene transfer (HGT) candidates via Mahalanobis distance.
 
     Computes Mahalanobis distance of each gene's RSCU vector from the genome mean
     using robust covariance estimation (LedoitWolf shrinkage). Also computes per-gene
-    GC3 deviation from genome mean.
+    GC3 deviation from genome mean and a combined HGT flag using both signals.
 
     Args:
         rscu_gene_df: Per-gene RSCU table (from compute_rscu_per_gene).
         enc_df: ENC table with GC3 column.
         expr_df: Optional expression table with gene and expression_class columns.
+        sensitivity: HGT detection stringency. One of "conservative" (FDR < 0.001),
+            "moderate" (FDR < 0.01), or "sensitive" (FDR < 0.05).
+        expected_hgt_frac: Expected fraction of horizontally transferred genes
+            (default 0.05). Used to compute an adaptive Mahalanobis distance
+            threshold targeting this fraction.
 
     Returns:
         DataFrame with columns: gene, mahalanobis_dist, gc3_deviation, p_value,
-        hgt_flag, and optionally expression_class.
+        p_adjusted, hgt_flag_fdr, hgt_flag_adaptive, gc3_outlier, hgt_flag_combined,
+        and optionally expression_class.
     """
     if rscu_gene_df.empty or enc_df.empty:
         logger.warning("Empty RSCU or ENC DataFrame; skipping HGT detection")
         return pd.DataFrame(columns=[
-            "gene", "mahalanobis_dist", "gc3_deviation", "p_value", "hgt_flag"
+            "gene", "mahalanobis_dist", "gc3_deviation", "p_value", "p_adjusted",
+            "hgt_flag_fdr", "hgt_flag_adaptive", "gc3_outlier", "hgt_flag_combined",
         ])
 
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
     if not rscu_cols:
         logger.warning("No RSCU columns found; skipping HGT detection")
         return pd.DataFrame(columns=[
-            "gene", "mahalanobis_dist", "gc3_deviation", "p_value", "hgt_flag"
+            "gene", "mahalanobis_dist", "gc3_deviation", "p_value", "p_adjusted",
+            "hgt_flag_fdr", "hgt_flag_adaptive", "gc3_outlier", "hgt_flag_combined",
         ])
 
     # Extract RSCU matrix
@@ -236,8 +246,35 @@ def detect_hgt_candidates(
     else:
         p_adjusted = p_values.copy()
 
-    # Flag putative HGT: adjusted p < 0.001
-    hgt_flags = p_adjusted < 0.001
+    # ── FDR-based flag (sensitivity parameter) ──────────────────────────
+    fdr_thresholds = {"conservative": 0.001, "moderate": 0.01, "sensitive": 0.05}
+    fdr_alpha = fdr_thresholds.get(sensitivity, 0.01)
+    hgt_flags_fdr = p_adjusted < fdr_alpha
+    logger.info("HGT FDR threshold (sensitivity=%s): alpha=%.4f, flagged %d/%d genes",
+                sensitivity, fdr_alpha, hgt_flags_fdr.sum(), len(genes))
+
+    # ── Adaptive Mahalanobis threshold ────────────────────────────────
+    # Find the distance threshold that flags approximately expected_hgt_frac of genes.
+    # Use quantile of the Mahalanobis distribution: top expected_hgt_frac are outliers.
+    adaptive_cutoff = np.quantile(mahal_dists, 1.0 - expected_hgt_frac)
+    hgt_flags_adaptive = mahal_dists > adaptive_cutoff
+    logger.info("HGT adaptive threshold (expected_frac=%.2f): cutoff=%.3f, flagged %d/%d genes",
+                expected_hgt_frac, adaptive_cutoff, hgt_flags_adaptive.sum(), len(genes))
+
+    # ── GC3 outlier flag (#7) ─────────────────────────────────────────
+    # Flag genes whose GC3 deviates > 2 SD from the genome mean
+    gc3_valid = gc3_deviations[~np.isnan(gc3_deviations)]
+    if len(gc3_valid) > 5:
+        gc3_sd = np.std(gc3_valid)
+        gc3_outlier = np.abs(gc3_deviations) > 2 * gc3_sd
+    else:
+        gc3_outlier = np.full(len(gc3_deviations), False)
+    gc3_outlier = np.where(np.isnan(gc3_deviations), False, gc3_outlier)
+    logger.info("GC3 outlier flag: %d/%d genes beyond 2 SD",
+                gc3_outlier.sum(), len(genes))
+
+    # ── Combined flag: FDR OR GC3 outlier ─────────────────────────────
+    hgt_combined = hgt_flags_fdr | gc3_outlier
 
     # Build result DataFrame
     result = pd.DataFrame({
@@ -246,7 +283,14 @@ def detect_hgt_candidates(
         "gc3_deviation": gc3_deviations,
         "p_value": p_values,
         "p_adjusted": p_adjusted,
-        "hgt_flag": hgt_flags,
+        "hgt_flag_fdr": hgt_flags_fdr,
+        "hgt_flag_adaptive": hgt_flags_adaptive,
+        "gc3_outlier": gc3_outlier.astype(bool),
+        "hgt_flag_combined": hgt_combined,
+        "hgt_flag": hgt_combined,  # backward-compatible alias
+        "sensitivity": sensitivity,
+        "fdr_alpha": fdr_alpha,
+        "adaptive_cutoff": adaptive_cutoff,
     })
 
     # Merge expression class if available
@@ -256,8 +300,9 @@ def detect_hgt_candidates(
                 expr_df[["gene", "expression_class"]], on="gene", how="left"
             )
 
-    logger.info("HGT detection: flagged %d/%d genes as putative HGT",
-                hgt_flags.sum(), len(genes))
+    logger.info("HGT detection: %d FDR, %d adaptive, %d GC3-outlier, %d combined out of %d genes",
+                hgt_flags_fdr.sum(), hgt_flags_adaptive.sum(),
+                gc3_outlier.sum(), hgt_combined.sum(), len(genes))
 
     return result
 
@@ -317,6 +362,17 @@ def predict_growth_rate(
     b = -7.38
     predicted_doubling_time = np.exp(a + b * mean_cai_rp)
 
+    # Bootstrap 95% CI on the predicted doubling time
+    rng = np.random.default_rng(42)
+    n_boot = 1000
+    rp_vals = rp_cai.values
+    boot_dts = np.empty(n_boot)
+    for i in range(n_boot):
+        boot_sample = rng.choice(rp_vals, size=len(rp_vals), replace=True)
+        boot_dts[i] = np.exp(a + b * boot_sample.mean())
+    ci_lower = float(np.percentile(boot_dts, 2.5))
+    ci_upper = float(np.percentile(boot_dts, 97.5))
+
     # Growth class
     if predicted_doubling_time < 2.0:
         growth_class = "fast"
@@ -328,6 +384,8 @@ def predict_growth_rate(
     return {
         "mean_cai_rp": float(mean_cai_rp),
         "predicted_doubling_time_hours": float(predicted_doubling_time),
+        "ci_lower_hours": ci_lower,
+        "ci_upper_hours": ci_upper,
         "n_rp_genes": int(len(rp_cai)),
         "growth_class": growth_class,
         "caveat": "Coefficients from Vieira-Silva & Rocha (2010); validated primarily on proteobacteria. Interpret with caution for other lineages.",
