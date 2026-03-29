@@ -105,11 +105,11 @@ def collect_sample_metrics(
         # --- High-expression gene RSCU profile ---
         _read_high_expression_rscu(paths, row)
 
-        # --- ACE core gene RSCU profile ---
-        _read_ace_core_rscu(paths, row)
+        # --- GMM RP-cluster RSCU profile ---
+        _read_gmm_cluster_rscu(paths, row)
 
-        # --- ACE scores summary ---
-        _read_ace_scores_summary(paths, row)
+        # --- GMM clustering summary ---
+        _read_gmm_summary(paths, row)
 
         # --- Pathway enrichment summary ---
         _read_enrichment_summary(paths, row)
@@ -413,54 +413,45 @@ def _read_high_expression_rscu(paths: dict, row: dict) -> None:
             pass
 
 
-def _read_ace_core_rscu(paths: dict, row: dict) -> None:
-    """Read ACE core gene RSCU profile from codon tables."""
-    # Try the codon table format output (ace_core RSCU summary)
-    p = paths.get("ace_core_rscu")
+def _read_gmm_cluster_rscu(paths: dict, row: dict) -> None:
+    """Read GMM RP-cluster RSCU profile."""
+    for key in ("gmm_gmm_cluster_rscu_path", "gmm_cluster_rscu_path"):
+        p = paths.get(key)
+        if p and Path(p).exists():
+            try:
+                df = pd.read_csv(p, sep="\t", index_col=0)
+                for col_name in RSCU_COLUMN_NAMES:
+                    if col_name in df.index:
+                        row[f"gmm_{col_name}"] = df.loc[col_name, "RSCU"]
+                return
+            except Exception:
+                pass
+
+    # Fallback: try codon table format output
+    p = paths.get("gmm_cluster_rscu")
     if p and Path(p).exists():
         try:
             df = pd.read_csv(p, sep="\t")
             rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
             for c in rscu_cols:
-                row[f"ace_{c}"] = df[c].iloc[0] if len(df) > 0 else np.nan
-            return
+                row[f"gmm_{c}"] = df[c].iloc[0] if len(df) > 0 else np.nan
         except Exception:
             pass
 
-    # Fallback: read ACE weights table (long format with codon, rscu columns)
-    for key in ("ace_ace_weights", "ace_weights"):
+
+def _read_gmm_summary(paths: dict, row: dict) -> None:
+    """Read GMM clustering summary (best_k, cluster size, cosine similarity)."""
+    for key in ("gmm_gmm_summary_path", "gmm_summary_path"):
         p = paths.get(key)
         if p and Path(p).exists():
             try:
                 df = pd.read_csv(p, sep="\t")
-                if "codon_col" in df.columns and "rscu" in df.columns:
-                    for _, r in df.iterrows():
-                        col_name = r["codon_col"]
-                        if col_name in RSCU_COLUMN_NAMES:
-                            row[f"ace_{col_name}"] = r["rscu"]
-                return
-            except Exception:
-                pass
-
-
-def _read_ace_scores_summary(paths: dict, row: dict) -> None:
-    """Read ACE score summaries (genome-level medians for ace_melp, ace_cai)."""
-    for key in ("ace_ace_scores", "ace_scores"):
-        p = paths.get(key)
-        if p and Path(p).exists():
-            try:
-                df = pd.read_csv(p, sep="\t")
-                for metric in ("ace_melp", "ace_cai"):
-                    if metric in df.columns:
-                        row[f"median_{metric}"] = df[metric].median()
-                        row[f"mean_{metric}"] = df[metric].mean()
-                if "ace_MELP_class" in df.columns:
-                    high_n = (df["ace_MELP_class"] == "high").sum()
-                    low_n = (df["ace_MELP_class"] == "low").sum()
-                    row["ace_n_high_expr"] = int(high_n)
-                    row["ace_n_low_expr"] = int(low_n)
-                if "in_ace_core" in df.columns:
-                    row["ace_n_core_genes"] = int(df["in_ace_core"].sum())
+                if len(df) > 0:
+                    r = df.iloc[0]
+                    for col in ("best_k", "rp_cluster_size", "rp_genes_in_cluster",
+                                "non_rp_in_cluster", "rp_cosine_similarity"):
+                        if col in df.columns:
+                            row[f"gmm_{col}"] = r[col]
                 return
             except Exception:
                 pass
@@ -486,23 +477,6 @@ def _read_enrichment_summary(paths: dict, row: dict) -> None:
             except Exception:
                 pass
 
-    # ACE-tier enrichment
-    for tier in ("high", "low"):
-        key = f"ace_enrichment_ace_MELP_{tier}"
-        p = paths.get(key)
-        if p and Path(p).exists():
-            try:
-                df = pd.read_csv(p, sep="\t")
-                sig_col = "significant" if "significant" in df.columns else None
-                fdr_col = "fdr" if "fdr" in df.columns else None
-                if sig_col:
-                    row[f"n_enriched_ace_{tier}"] = int(df[sig_col].sum())
-                    row[f"n_pathways_ace_{tier}"] = len(df)
-                elif fdr_col:
-                    row[f"n_enriched_ace_{tier}"] = int((df[fdr_col] < 0.05).sum())
-                    row[f"n_pathways_ace_{tier}"] = len(df)
-            except Exception:
-                pass
 
 
 def _read_phage_mobile_summary(paths: dict, row: dict) -> None:
