@@ -14,6 +14,7 @@ from codonpipe.utils.codon_tables import (
     AA_CODON_GROUPS,
     AA_CODON_GROUPS_RSCU,
     CODON_TABLE_11,
+    MIN_GENE_LENGTH,
     RSCU_COLUMN_NAMES,
     SENSE_CODONS,
     codon_to_col_name,
@@ -21,9 +22,6 @@ from codonpipe.utils.codon_tables import (
 )
 
 logger = logging.getLogger("codonpipe")
-
-# Minimum gene length (nucleotides) to include in codon analysis
-MIN_GENE_LENGTH = 240
 
 
 def count_codons(sequence: str) -> Counter:
@@ -163,7 +161,7 @@ def compute_codon_frequency_table(ffn_path: Path, min_length: int = MIN_GENE_LEN
         count = total_counts.get(codon, 0)
         freq = count / total_codons if total_codons > 0 else 0
         per_thousand = freq * 1000
-        col_name = _codon_to_col_name(codon, aa) if aa not in ("*", "Met", "Trp") else f"{aa}-{codon}"
+        col_name = codon_to_col_name(codon, aa) if aa not in ("*", "Met", "Trp") else f"{aa}-{codon}"
         rscu_val = rscu_all.get(col_name, np.nan)
         # Extract the RSCU family name (e.g., Ser4, Leu2, Arg4) from the column name
         rscu_family = col_name.split("-")[0]
@@ -285,8 +283,6 @@ def _calculate_gc3(sequence: str) -> float:
     return gc3_count / total if total > 0 else 0.0
 
 
-# Alias for backward compatibility (canonical implementation in utils.codon_tables)
-_codon_to_col_name = codon_to_col_name
 
 
 def run_rscu_analysis(
