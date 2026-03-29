@@ -109,7 +109,13 @@ def parse_kofamscan(result_file: Path) -> pd.DataFrame:
     # Keep best hit per gene (highest score)
     if not df.empty:
         df["score"] = pd.to_numeric(df["score"], errors="coerce")
-        df = df.sort_values("score", ascending=False).drop_duplicates("gene_name", keep="first")
+        n_bad_scores = df["score"].isna().sum()
+        if n_bad_scores > 0:
+            logger.warning(
+                "%d/%d KofamScan hits had non-numeric scores in %s",
+                n_bad_scores, len(df), result_file,
+            )
+        df = df.sort_values("score", ascending=False, na_position="last").drop_duplicates("gene_name", keep="first")
 
     logger.info("Parsed %d significant KO annotations from %s", len(df), result_file)
     return df
