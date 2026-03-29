@@ -2009,6 +2009,240 @@ def plot_enrichment_comparison(
     _save_fig(fig, output_path)
 
 
+# ─── Ribosomal vs high-expression & MGE comparative plots ─────────────────
+
+
+def plot_rp_he_divergence_by_condition(
+    metrics_df: pd.DataFrame,
+    condition_col: str,
+    output_path: Path,
+):
+    """Show RP-vs-HE RSCU divergence per condition.
+
+    For each sample that has both ribosomal (rp_*) and high-expression (he_*)
+    RSCU columns, computes the Euclidean distance between the two profiles.
+    Violin + strip plot shows whether conditions differ in how much their
+    ribosomal and highly expressed genes diverge in codon preference.
+
+    Args:
+        metrics_df: Sample-level metrics table with rp_* and he_* RSCU columns.
+        condition_col: Column designating conditions.
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    rp_cols = sorted([c for c in metrics_df.columns if c.startswith("rp_")])
+    he_cols = sorted([c for c in metrics_df.columns if c.startswith("he_")])
+
+    if len(rp_cols) < 10 or len(he_cols) < 10:
+        return
+
+    # Match columns by codon name (rp_Phe-UUU ↔ he_Phe-UUU)
+    rp_suffix = {c[3:]: c for c in rp_cols}
+    he_suffix = {c[3:]: c for c in he_cols}
+    shared = sorted(set(rp_suffix) & set(he_suffix))
+    if len(shared) < 10:
+        return
+
+    # Compute per-sample Euclidean distance
+    dists = []
+    for _, row in metrics_df.iterrows():
+        rp_vec = np.array([row.get(rp_suffix[s], np.nan) for s in shared])
+        he_vec = np.array([row.get(he_suffix[s], np.nan) for s in shared])
+        mask = np.isfinite(rp_vec) & np.isfinite(he_vec)
+        if mask.sum() >= 10:
+            d = np.sqrt(np.sum((rp_vec[mask] - he_vec[mask]) ** 2))
+            dists.append(d)
+        else:
+            dists.append(np.nan)
+
+    plot_df = metrics_df[[condition_col, "sample_id"]].copy()
+    plot_df["rp_he_euclidean"] = dists
+    plot_df = plot_df.dropna(subset=["rp_he_euclidean"])
+
+    if plot_df.empty or plot_df[condition_col].nunique() < 2:
+        return
+
+    conditions = sorted(plot_df[condition_col].unique())
+    palette = _condition_colors(conditions)
+
+    fig, ax = plt.subplots(figsize=(max(5, len(conditions) * 1.5), 5))
+    sns.violinplot(
+        data=plot_df, x=condition_col, y="rp_he_euclidean",
+        order=conditions, palette=palette, inner=None, cut=0,
+        alpha=0.3, ax=ax,
+    )
+    sns.stripplot(
+        data=plot_df, x=condition_col, y="rp_he_euclidean",
+        order=conditions, palette=palette, size=5, alpha=0.7,
+        jitter=0.15, ax=ax,
+    )
+
+    # Kruskal-Wallis across conditions
+    groups = [g["rp_he_euclidean"].dropna().values for _, g in plot_df.groupby(condition_col)]
+    groups = [g for g in groups if len(g) >= 2]
+    if len(groups) >= 2:
+        stat, pval = sp_stats.kruskal(*groups)
+        ax.set_title(f"Kruskal-Wallis p = {pval:.3e}", fontsize=9, fontstyle="italic")
+
+    ax.set_ylabel("RP–HE RSCU Euclidean distance")
+    ax.set_xlabel("")
+    fig.suptitle("Ribosomal vs high-expression codon usage divergence", fontsize=12)
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_grodon2_by_condition(
+    metrics_df: pd.DataFrame,
+    condition_col: str,
+    output_path: Path,
+):
+    """Compare gRodon2 doubling times across conditions.
+
+    Two-panel figure:
+      Left: violin+strip of gRodon2 doubling time by condition
+      Right: scatter of CUBHE vs ConsistencyHE colored by condition
+
+    Args:
+        metrics_df: Combined metrics table with grodon2_* columns.
+        condition_col: Condition column name.
+        output_path: Base path for saving.
+    """
+    _apply_style()
+
+    has_d = "grodon2_doubling_time_hours" in metrics_df.columns
+    has_cubhe = "grodon2_CUBHE" in metrics_df.columns and "grodon2_ConsistencyHE" in metrics_df.columns
+
+    if not has_d:
+        return
+
+    df = metrics_df.dropna(subset=["grodon2_doubling_time_hours"])
+    if df.empty:
+        return
+
+    n_panels = 2 if has_cubhe else 1
+    fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5))
+    if n_panels == 1:
+        axes = [axes]
+
+    conditions = df[condition_col].unique()
+    palette = sns.color_palette("Set2", len(conditions))
+
+    # Panel 1: doubling time violin + strip
+    ax = axes[0]
+    sns.violinplot(data=df, x=condition_col, y="grodon2_doubling_time_hours",
+                   palette=palette, inner=None, alpha=0.4, ax=ax)
+    sns.stripplot(data=df, x=condition_col, y="grodon2_doubling_time_hours",
+                  palette=palette, size=6, edgecolor="black", linewidth=0.5, ax=ax)
+
+    ax.axhline(2, color="green", linestyle="--", alpha=0.4, linewidth=0.8)
+    ax.axhline(5, color="orange", linestyle="--", alpha=0.4, linewidth=0.8)
+
+    # Kruskal-Wallis if ≥2 conditions with ≥2 samples each
+    groups = [g["grodon2_doubling_time_hours"].dropna().values
+              for _, g in df.groupby(condition_col)
+              if len(g["grodon2_doubling_time_hours"].dropna()) >= 2]
+    if len(groups) >= 2:
+        from scipy.stats import kruskal
+        try:
+            stat, pval = kruskal(*groups)
+            ax.set_title(f"Kruskal-Wallis p = {pval:.3g}", fontsize=10)
+        except Exception:
+            pass
+
+    ax.set_ylabel("gRodon2 Doubling Time (h)", fontsize=10)
+    ax.set_xlabel("")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    # Panel 2: CUBHE vs ConsistencyHE
+    if has_cubhe and n_panels == 2:
+        ax2 = axes[1]
+        for i, cond in enumerate(conditions):
+            cond_df = df[df[condition_col] == cond]
+            ax2.scatter(cond_df["grodon2_CUBHE"], cond_df["grodon2_ConsistencyHE"],
+                        c=[palette[i]], label=cond, s=60, edgecolors="black", linewidth=0.5, zorder=3)
+        ax2.set_xlabel("CUBHE", fontsize=10)
+        ax2.set_ylabel("ConsistencyHE", fontsize=10)
+        ax2.set_title("CUB Landscape by Condition", fontsize=10)
+        ax2.legend(fontsize=8, frameon=True)
+        ax2.grid(True, alpha=0.3)
+
+    fig.suptitle("gRodon2 Growth Rate by Condition", fontsize=12, weight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    _save_fig(fig, output_path)
+
+
+def plot_mge_cu_deviation_by_condition(
+    metrics_df: pd.DataFrame,
+    condition_col: str,
+    output_path: Path,
+):
+    """Compare codon usage deviation of MGE/HGT genes across conditions.
+
+    Three-panel figure:
+    - Left: mean Mahalanobis distance per sample (genome heterogeneity)
+    - Center: fraction of HGT-flagged genes
+    - Right: count of mobilome/phage genes
+
+    Args:
+        metrics_df: Sample-level metrics with mean_mahalanobis_dist,
+            hgt_fraction, n_mobilome, n_phage columns.
+        condition_col: Column designating conditions.
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    panels = []
+    if "mean_mahalanobis_dist" in metrics_df.columns:
+        panels.append(("mean_mahalanobis_dist", "Mean Mahalanobis\ndistance"))
+    if "hgt_fraction" in metrics_df.columns:
+        panels.append(("hgt_fraction", "HGT gene fraction"))
+    if "n_mobilome" in metrics_df.columns:
+        panels.append(("n_mobilome", "Mobilome genes"))
+    if "n_phage" in metrics_df.columns:
+        panels.append(("n_phage", "Phage-related genes"))
+
+    if not panels or condition_col not in metrics_df.columns:
+        return
+
+    conditions = sorted(metrics_df[condition_col].dropna().unique())
+    if len(conditions) < 2:
+        return
+
+    palette = _condition_colors(conditions)
+    n_panels = min(len(panels), 4)
+    fig, axes = plt.subplots(1, n_panels, figsize=(3.5 * n_panels, 5))
+    if n_panels == 1:
+        axes = [axes]
+
+    for ax, (col, label) in zip(axes, panels[:n_panels]):
+        plot_data = metrics_df.dropna(subset=[col, condition_col])
+        if plot_data.empty:
+            ax.set_visible(False)
+            continue
+
+        sns.boxplot(
+            data=plot_data, x=condition_col, y=col, order=conditions,
+            palette=palette, ax=ax, linewidth=0.8, fliersize=3,
+        )
+        sns.stripplot(
+            data=plot_data, x=condition_col, y=col, order=conditions,
+            color="black", size=4, alpha=0.5, jitter=0.15, ax=ax,
+        )
+        ax.set_ylabel(label)
+        ax.set_xlabel("")
+        ax.tick_params(axis="x", rotation=30)
+
+        # Kruskal-Wallis
+        groups = [g[col].dropna().values for _, g in plot_data.groupby(condition_col)]
+        groups = [g for g in groups if len(g) >= 2]
+        if len(groups) >= 2:
+            _, pval = sp_stats.kruskal(*groups)
+            ax.set_title(f"p = {pval:.3e}", fontsize=8, fontstyle="italic")
+
+    fig.suptitle("MGE / HGT codon usage deviation by condition", fontsize=12, y=1.02)
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2267,6 +2501,31 @@ def generate_comparative_plots(
                 outputs["enrichment_comparison"] = p.with_suffix(".png")
             except Exception as e:
                 logger.warning("Failed: enrichment_comparison — %s", e)
+
+        # ── RP vs HE divergence by condition ─────────────────────────
+        try:
+            p = plot_dir / "rp_he_divergence_by_condition"
+            plot_rp_he_divergence_by_condition(metrics_df, condition_col, p)
+            outputs["rp_he_divergence_by_condition"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Failed: rp_he_divergence_by_condition — %s", e)
+
+        # ── gRodon2 by condition ────────────────────────────────────
+        if "grodon2_doubling_time_hours" in metrics_df.columns:
+            try:
+                p = plot_dir / "grodon2_by_condition"
+                plot_grodon2_by_condition(metrics_df, condition_col, p)
+                outputs["grodon2_by_condition"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Failed: grodon2_by_condition — %s", e)
+
+        # ── MGE codon usage deviation by condition ───────────────────
+        try:
+            p = plot_dir / "mge_cu_deviation_by_condition"
+            plot_mge_cu_deviation_by_condition(metrics_df, condition_col, p)
+            outputs["mge_cu_deviation_by_condition"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Failed: mge_cu_deviation_by_condition — %s", e)
 
     logger.info("Generated %d comparative plots", len(outputs))
     return outputs
