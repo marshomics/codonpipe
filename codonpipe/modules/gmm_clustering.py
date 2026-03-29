@@ -238,18 +238,26 @@ def _compute_cluster_rscu(
     ffn_path: Path,
     cluster_gene_ids: set[str],
     min_length: int = MIN_GENE_LENGTH,
+    gene_weights: dict[str, float] | None = None,
 ) -> pd.Series:
-    """Compute RSCU by concatenated pooling of codon counts across cluster genes.
+    """Compute RSCU by distance-weighted pooling of codon counts.
 
-    Pools raw codon counts from all genes in the cluster, then computes RSCU
-    from the pooled counts.  This is the Sharp & Li (1987) standard: longer
-    genes contribute proportionally more codons, which is correct because
-    their per-codon frequencies are more precisely estimated.
+    Each gene's raw codon counts are multiplied by its proximity weight
+    (1 − distance/threshold) before pooling, so genes closer to the RP
+    centroid contribute more to the final RSCU estimate.  Genes at the
+    centroid contribute their full codon counts; genes at the threshold
+    boundary contribute near-zero.
+
+    When *gene_weights* is None (e.g. called from external code that
+    doesn't have distances), all genes contribute equally (weight 1.0).
 
     Args:
         ffn_path: Path to the nucleotide CDS FASTA containing all genes.
         cluster_gene_ids: Set of gene IDs belonging to the target cluster.
         min_length: Minimum sequence length (nt) to include.
+        gene_weights: Dict mapping gene ID → weight in (0, 1].
+            Internally always provided by run_gmm_clustering.
+            External callers may omit for equal-weight fallback.
 
     Returns:
         Series indexed by RSCU column names (e.g. 'Phe-UUU') with pooled
@@ -264,7 +272,13 @@ def _compute_cluster_rscu(
         seq = str(rec.seq)
         if len(seq) < min_length:
             continue
-        total_counts += count_codons(seq)
+        gene_counts = count_codons(seq)
+        if gene_weights is not None:
+            w = gene_weights.get(rec.id, 0.0)
+            if w <= 0:
+                continue
+            gene_counts = Counter({k: v * w for k, v in gene_counts.items()})
+        total_counts += gene_counts
         n_included += 1
 
     if not total_counts:
@@ -275,9 +289,10 @@ def _compute_cluster_rscu(
         return pd.Series(dtype=float)
 
     rscu_dict = compute_rscu_from_counts(total_counts)
+    mode = "distance-weighted" if gene_weights is not None else "equal-weight"
     logger.info(
-        "Cluster RSCU computed by concatenated pooling (%d genes, %d total codons)",
-        n_included, sum(total_counts.values()),
+        "Cluster RSCU computed by %s pooling (%d genes, %.0f effective codons)",
+        mode, n_included, sum(total_counts.values()),
     )
 
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_dict]
@@ -336,29 +351,39 @@ def _plot_coa_mahalanobis(
     sample_id: str,
     inertia_pcts: tuple[float, float] = (0.0, 0.0),
 ) -> None:
-    """Plot COA axes 1 & 2 colored by Mahalanobis distance, with threshold ellipse."""
+    """COA scatter colored by RSCU weight (1 - d/threshold), with threshold ellipse.
+
+    Genes inside the threshold are colored on a blue-to-yellow gradient
+    representing their contribution weight to the pooled RSCU estimate
+    (1.0 at the centroid, 0.0 at the boundary).  Genes outside the
+    threshold are shown in pale gray.
+    """
     plt.rcParams.update(STYLE_PARAMS)
     fig, ax = plt.subplots(figsize=(8, 6))
 
     x = coa_coords["Axis1"].values
     y = coa_coords["Axis2"].values
 
-    # Color all genes by distance
-    vmax = min(np.percentile(distances, 95), threshold * 3)
-    norm = mcolors.Normalize(vmin=0, vmax=vmax)
-    sc = ax.scatter(
-        x, y, c=distances, cmap="viridis_r", norm=norm,
-        alpha=0.5, s=10, edgecolors="none", rasterized=True,
-    )
-    fig.colorbar(sc, ax=ax, label="Mahalanobis distance", shrink=0.8)
-
-    # Highlight optimized genes (within threshold)
+    # Compute per-gene weight: 1 - d/threshold, clipped to [0, 1]
+    weights = np.clip(1.0 - distances / threshold, 0.0, 1.0) if threshold > 0 else np.ones_like(distances)
     opt_mask = distances <= threshold
+
+    # Non-optimized genes in pale gray
     ax.scatter(
-        x[opt_mask], y[opt_mask],
-        facecolors="none", edgecolors="#2c7bb6", s=14, linewidths=0.4,
-        alpha=0.4, label=f"Optimized set (n={opt_mask.sum()})",
+        x[~opt_mask], y[~opt_mask],
+        c="#d0d0d0", alpha=0.25, s=8, edgecolors="none", rasterized=True,
+        label=f"Non-optimized (n={int((~opt_mask).sum())})",
     )
+
+    # Optimized genes colored by weight
+    norm = mcolors.Normalize(vmin=0, vmax=1)
+    sc = ax.scatter(
+        x[opt_mask], y[opt_mask],
+        c=weights[opt_mask], cmap="YlGnBu", norm=norm,
+        alpha=0.7, s=14, edgecolors="none", rasterized=True,
+    )
+    cbar = fig.colorbar(sc, ax=ax, shrink=0.8)
+    cbar.set_label("RSCU weight (1 − d/threshold)", fontsize=9)
 
     # Mark RP genes
     rp_idx = [i for i, g in enumerate(gene_ids) if g in rp_gene_ids]
@@ -407,7 +432,7 @@ def _plot_coa_mahalanobis(
     pct1, pct2 = inertia_pcts
     ax.set_xlabel(f"COA Axis 1 ({pct1:.1f}% inertia)")
     ax.set_ylabel(f"COA Axis 2 ({pct2:.1f}% inertia)")
-    ax.set_title(f"{sample_id}: RP-anchored Mahalanobis distance")
+    ax.set_title(f"{sample_id}: distance-weighted RSCU contribution")
     ax.legend(fontsize=7, framealpha=0.7, loc="best")
 
     for fmt in FORMATS:
@@ -422,13 +447,19 @@ def _plot_distance_histogram(
     output_path: Path,
     sample_id: str,
 ) -> None:
-    """Histogram of Mahalanobis distances for all genes and RP subset."""
-    plt.rcParams.update(STYLE_PARAMS)
-    fig, ax = plt.subplots(figsize=(6, 4))
+    """Histogram of Mahalanobis distances with weight function overlay.
 
-    bins = np.linspace(0, min(np.percentile(distances, 99), threshold * 4), 60)
-    ax.hist(distances, bins=bins, color="#2c7bb6", alpha=0.5, label="All genes")
-    ax.hist(rp_distances, bins=bins, color="#d7191c", alpha=0.6, label="RP genes")
+    Left y-axis: gene counts (all genes in blue, RP genes in red).
+    Right y-axis: RSCU weight curve (1 − d/threshold), showing how
+    much each gene contributes to the pooled RSCU at its distance.
+    """
+    plt.rcParams.update(STYLE_PARAMS)
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+
+    x_max = min(np.percentile(distances, 99), threshold * 4)
+    bins = np.linspace(0, x_max, 60)
+    ax.hist(distances, bins=bins, color="#2c7bb6", alpha=0.45, label="All genes")
+    ax.hist(rp_distances, bins=bins, color="#d7191c", alpha=0.55, label="RP genes")
     ax.axvline(threshold, color="#fdae61", linewidth=2, linestyle="--",
                label=f"Threshold (d={threshold:.2f})")
     ax.axvline(np.median(rp_distances), color="#abd9e9", linewidth=1.5,
@@ -437,8 +468,23 @@ def _plot_distance_histogram(
     n_opt = (distances <= threshold).sum()
     ax.set_xlabel("Mahalanobis distance from RP centroid")
     ax.set_ylabel("Number of genes")
+
+    # Weight function on secondary y-axis
+    ax2 = ax.twinx()
+    d_line = np.linspace(0, x_max, 300)
+    w_line = np.clip(1.0 - d_line / threshold, 0.0, 1.0) if threshold > 0 else np.ones_like(d_line)
+    ax2.plot(d_line, w_line, color="#2ca02c", linewidth=2, alpha=0.85, label="RSCU weight")
+    ax2.fill_between(d_line, 0, w_line, color="#2ca02c", alpha=0.08)
+    ax2.set_ylabel("RSCU weight (1 − d/threshold)", color="#2ca02c", fontsize=9)
+    ax2.tick_params(axis="y", labelcolor="#2ca02c")
+    ax2.set_ylim(-0.05, 1.1)
+
     ax.set_title(f"{sample_id}: distance distribution ({n_opt} genes in optimized set)")
-    ax.legend(fontsize=8, framealpha=0.7)
+
+    # Combined legend
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=7.5, framealpha=0.7, loc="upper right")
 
     for fmt in FORMATS:
         fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
@@ -847,14 +893,33 @@ def run_gmm_clustering(
     probabilities = _distance_to_membership(distances, threshold)
     results["gmm_probabilities"] = probabilities
 
-    # ── Step 7: Compute optimized-set RSCU (concatenated pooling) ─────
+    # ── Step 7: Compute distance-weighted RSCU for optimized set ───────
+    # Weight = 1 - (distance / threshold), clamped to (0, 1].
+    # Genes at the centroid contribute fully; genes at the boundary → ~0.
+    gene_weights = {}
+    for gid, d in zip(gene_ids, distances):
+        if gid in cluster_gene_ids:
+            w = max(1.0 - d / threshold, 0.0) if threshold > 0 else 1.0
+            if w > 0:
+                gene_weights[gid] = w
+
     if ffn_path and ffn_path.exists():
-        cluster_rscu = _compute_cluster_rscu(ffn_path, cluster_gene_ids)
+        cluster_rscu = _compute_cluster_rscu(
+            ffn_path, cluster_gene_ids, gene_weights=gene_weights,
+        )
     else:
-        logger.warning("FFN path not available; falling back to per-gene mean RSCU")
+        logger.warning("FFN path not available; falling back to weighted per-gene mean RSCU")
         rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
-        cluster_df = rscu_gene_df[rscu_gene_df["gene"].isin(cluster_gene_ids)]
-        cluster_rscu = cluster_df[rscu_cols].mean() if not cluster_df.empty else pd.Series(dtype=float)
+        cluster_df = rscu_gene_df[rscu_gene_df["gene"].isin(cluster_gene_ids)].copy()
+        if not cluster_df.empty:
+            w_arr = cluster_df["gene"].map(gene_weights).fillna(0.0).values
+            w_sum = w_arr.sum()
+            if w_sum > 0:
+                cluster_rscu = (cluster_df[rscu_cols].multiply(w_arr, axis=0).sum() / w_sum)
+            else:
+                cluster_rscu = cluster_df[rscu_cols].mean()
+        else:
+            cluster_rscu = pd.Series(dtype=float)
     results["gmm_cluster_rscu"] = cluster_rscu
 
     # ── Step 8: Quality check — cosine similarity ─────────────────────
@@ -900,6 +965,7 @@ def run_gmm_clustering(
     results["gmm_cluster_ids_path"] = ids_path
 
     # Summary stats
+    mean_weight = float(np.mean([w for w in gene_weights.values()]))
     summary = {
         "sample_id": sample_id,
         "n_genes": len(gene_ids),
@@ -913,6 +979,8 @@ def run_gmm_clustering(
         "rp_outliers_removed": int(rp_outlier_mask.sum()),
         "mahalanobis_threshold": round(threshold, 4),
         "median_rp_distance": round(median_rp_dist, 4),
+        "rscu_pooling": "distance-weighted",
+        "mean_rscu_weight": round(mean_weight, 4),
         "rp_cosine_similarity": round(rp_cosine_sim, 4) if not np.isnan(rp_cosine_sim) else None,
     }
     summary_df = pd.DataFrame([summary])
@@ -920,12 +988,14 @@ def run_gmm_clustering(
     summary_df.to_csv(summary_path, sep="\t", index=False)
     results["gmm_summary_path"] = summary_path
 
-    # COA coordinates with assignments
+    # COA coordinates with assignments and weights
+    rscu_weights = np.clip(1.0 - distances / threshold, 0.0, 1.0) if threshold > 0 else np.ones_like(distances)
     coa_with_assignments = coa_coords.copy()
     assign_merge = pd.DataFrame({
         "gene": gene_ids,
         "gmm_cluster": labels,
         "mahalanobis_distance": distances,
+        "rscu_weight": rscu_weights,
     })
     coa_with_assignments = coa_with_assignments.merge(assign_merge, on="gene", how="left")
     results["gmm_coa_coords"] = coa_with_assignments
