@@ -69,6 +69,9 @@ def collect_sample_metrics(
         # --- Growth rate prediction ---
         _read_growth_rate(paths, row)
 
+        # --- gRodon2 growth rate prediction ---
+        _read_grodon2(paths, row)
+
         # --- HGT prevalence ---
         _read_hgt_summary(paths, row)
 
@@ -170,6 +173,32 @@ def _read_growth_rate(paths: dict, row: dict) -> None:
                     row["mean_cai_rp"] = df["mean_cai_rp"].iloc[0]
                 if "growth_class" in df.columns:
                     row["growth_class"] = df["growth_class"].iloc[0]
+                return
+            except Exception:
+                pass
+
+
+def _read_grodon2(paths: dict, row: dict) -> None:
+    """Read gRodon2 growth rate prediction into the metrics row."""
+    for key in ("bio_grodon2_prediction_path", "bio_grodon2_prediction"):
+        p = paths.get(key)
+        if p and Path(p).exists():
+            try:
+                df = pd.read_csv(p, sep="\t")
+                if "predicted_doubling_time_hours" in df.columns:
+                    row["grodon2_doubling_time_hours"] = df["predicted_doubling_time_hours"].iloc[0]
+                if "lower_ci_hours" in df.columns:
+                    row["grodon2_lower_ci_hours"] = df["lower_ci_hours"].iloc[0]
+                if "upper_ci_hours" in df.columns:
+                    row["grodon2_upper_ci_hours"] = df["upper_ci_hours"].iloc[0]
+                if "CUBHE" in df.columns:
+                    row["grodon2_CUBHE"] = df["CUBHE"].iloc[0]
+                if "ConsistencyHE" in df.columns:
+                    row["grodon2_ConsistencyHE"] = df["ConsistencyHE"].iloc[0]
+                if "CPB" in df.columns:
+                    row["grodon2_CPB"] = df["CPB"].iloc[0]
+                if "growth_class" in df.columns:
+                    row["grodon2_growth_class"] = df["growth_class"].iloc[0]
                 return
             except Exception:
                 pass
@@ -281,11 +310,11 @@ def _read_translational_selection(paths: dict, row: dict) -> None:
             df = pd.read_csv(p_grad, sep="\t")
             if "quintile" in df.columns and "fop_mean" in df.columns:
                 # Linear regression of fop_mean vs quintile number
-                x = df["quintile"].dropna().values
-                y = df["fop_mean"].dropna().values
-                common = len(x)
-                if common > 2:
-                    slope, _, _, _, _ = sp_stats.linregress(x, y)
+                valid = df[["quintile", "fop_mean"]].dropna()
+                if len(valid) > 2:
+                    slope, _, _, _, _ = sp_stats.linregress(
+                        valid["quintile"].values, valid["fop_mean"].values
+                    )
                     row["fop_gradient_slope"] = slope
         except Exception:
             pass
