@@ -13,14 +13,13 @@ from pathlib import Path
 
 import pandas as pd
 
+from codonpipe.utils.codon_tables import MIN_GENE_LENGTH
 from codonpipe.utils.io import check_tool, run_cmd
 
 logger = logging.getLogger("codonpipe")
 
 
-# ── R script templates ───────────────────────────────────────────────────────
-
-_ENCPRIME_R_SCRIPT = r"""
+_CU_STATISTIC_R_TEMPLATE = r"""
 library(coRdon)
 library(Biostrings)
 library(IRanges)
@@ -30,63 +29,41 @@ fasta_file <- args[1]
 output_file <- args[2]
 min_len <- as.integer(args[3])
 
-tryCatch({{
+tryCatch({
     fasta <- readSet(file = fasta_file)
     # Strip FASTA headers to first word for consistent gene IDs
     names(fasta) <- sub(" .*", "", names(fasta))
     codons <- codonTable(fasta)
     codons@KO <- codons@ID
 
-    enc_prime <- ENCprime(codons, id_or_name2 = "11")
-    enc_prime_df <- as.data.frame(enc_prime)
+    scores <- __METRIC__(codons, id_or_name2 = "11")
+    scores_df <- as.data.frame(scores)
 
     names_df <- data.frame(gene = names(fasta))
     width_df <- data.frame(width = width(fasta))
 
-    result <- cbind(enc_prime_df, names_df, width_df)
+    result <- cbind(scores_df, names_df, width_df)
     result <- subset(result, width > min_len)
 
     write.table(result, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
-    cat("ENCprime analysis complete:", nrow(result), "genes\n")
-}}, error = function(e) {{
+    cat("__METRIC__ analysis complete:", nrow(result), "genes\n")
+}, error = function(e) {
     message("ERROR: ", e$message)
     quit(status = 1)
-}})
+})
 """
 
-_MILC_R_SCRIPT = r"""
-library(coRdon)
-library(Biostrings)
-library(IRanges)
 
-args <- commandArgs(trailingOnly = TRUE)
-fasta_file <- args[1]
-output_file <- args[2]
-min_len <- as.integer(args[3])
+def _cu_statistic_r_script(metric_func: str) -> str:
+    """Build an R script for a coRdon CU bias statistic.
 
-tryCatch({{
-    fasta <- readSet(file = fasta_file)
-    # Strip FASTA headers to first word for consistent gene IDs
-    names(fasta) <- sub(" .*", "", names(fasta))
-    codons <- codonTable(fasta)
-    codons@KO <- codons@ID
+    The template is shared between ENCprime and MILC; only the function
+    call differs.  Accepts a min_len argument from the command line.
 
-    milc <- MILC(codons, id_or_name2 = "11")
-    milc_df <- as.data.frame(milc)
-
-    names_df <- data.frame(gene = names(fasta))
-    width_df <- data.frame(width = width(fasta))
-
-    result <- cbind(milc_df, names_df, width_df)
-    result <- subset(result, width > min_len)
-
-    write.table(result, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
-    cat("MILC analysis complete:", nrow(result), "genes\n")
-}}, error = function(e) {{
-    message("ERROR: ", e$message)
-    quit(status = 1)
-}})
-"""
+    Args:
+        metric_func: coRdon function name — "ENCprime" or "MILC".
+    """
+    return _CU_STATISTIC_R_TEMPLATE.replace("__METRIC__", metric_func)
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -96,7 +73,7 @@ def run_cu_statistics(
     output_dir: Path,
     sample_id: str,
     force: bool = False,
-    min_length: int = 240,
+    min_length: int = MIN_GENE_LENGTH,
 ) -> dict[str, Path]:
     """Compute R-based codon usage bias statistics (ENCprime, MILC).
 
@@ -119,25 +96,16 @@ def run_cu_statistics(
     stats_dir.mkdir(parents=True, exist_ok=True)
     outputs = {}
 
-    # ENCprime
-    encprime_out = stats_dir / f"{sample_id}_encprime.tsv"
-    if not encprime_out.exists() or force:
-        logger.info("Computing ENCprime (GC-corrected ENC) for %s", sample_id)
-        _run_r_statistic(
-            _ENCPRIME_R_SCRIPT, ffn_path, encprime_out, "ENCprime", sample_id,
-            min_length=min_length,
-        )
-    outputs["encprime"] = encprime_out
-
-    # MILC
-    milc_out = stats_dir / f"{sample_id}_milc.tsv"
-    if not milc_out.exists() or force:
-        logger.info("Computing MILC for %s", sample_id)
-        _run_r_statistic(
-            _MILC_R_SCRIPT, ffn_path, milc_out, "MILC", sample_id,
-            min_length=min_length,
-        )
-    outputs["milc"] = milc_out
+    for metric, outname in [("ENCprime", "encprime"), ("MILC", "milc")]:
+        out_path = stats_dir / f"{sample_id}_{outname}.tsv"
+        if not out_path.exists() or force:
+            logger.info("Computing %s for %s", metric, sample_id)
+            _run_r_statistic(
+                _cu_statistic_r_script(metric),
+                ffn_path, out_path, metric, sample_id,
+                min_length=min_length,
+            )
+        outputs[outname] = out_path
 
     return outputs
 
@@ -148,7 +116,7 @@ def _run_r_statistic(
     output_file: Path,
     method_name: str,
     sample_id: str,
-    min_length: int = 240,
+    min_length: int = MIN_GENE_LENGTH,
 ) -> None:
     """Execute an R CU statistics script (no reference set needed)."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".R", delete=False) as tmp:
