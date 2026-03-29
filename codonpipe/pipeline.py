@@ -23,7 +23,7 @@ from codonpipe.modules.expression import run_expression_analysis
 from codonpipe.modules.cu_statistics import run_cu_statistics
 from codonpipe.modules.enrichment import run_enrichment_analysis
 from codonpipe.modules.advanced_analyses import run_advanced_analyses
-from codonpipe.modules.ace_convergence import run_ace_convergence
+from codonpipe.modules.gmm_clustering import run_gmm_clustering
 from codonpipe.modules.bio_ecology import run_bio_ecology_analyses
 from codonpipe.modules.codon_table_formats import generate_all_codon_tables
 from codonpipe.modules.statistics import run_batch_statistics
@@ -75,8 +75,9 @@ def run_single_genome(
     skip_kofamscan: bool = False,
     kofam_results_file: Path | None = None,
     skip_expression: bool = False,
-    skip_ace: bool = False,
-    ace_top_pct: float = 5.0,
+    skip_gmm: bool = False,
+    gmm_min_k: int = 2,
+    gmm_max_k: int = 8,
     kegg_ko_pathway: Path | None = None,
     gff_file: Path | None = None,
     force: bool = False,
@@ -94,16 +95,15 @@ def run_single_genome(
         8. Advanced analyses (COA, S-value, neutrality, PR2, delta RSCU,
            tRNA-codon correlation, COG enrichment, gene length vs bias,
            ENC-ENC' difference)
-        9. ACE convergence — adaptive codon enrichment via iterative
-           multi-seed convergence to derive a genome-specific optimal
-           codon usage table
+        9. GMM clustering — COA-based Gaussian Mixture Model clustering
+           to identify the translationally optimised gene cluster, using
+           ribosomal proteins as anchor
        10. Biological/ecological analyses (HGT detection, growth rate
            prediction, translational selection, phage detection, strand
            asymmetry, operon co-adaptation)
        11. Codon usage tables in all standard formats (RSCU, counts,
            per-thousand, W values, adaptation weights, CBI) plus
-           ACE-specific tables (ACE weights, w-values, adaptation
-           weights, optimal codons, per-gene ACE CAI)
+           GMM-cluster-specific tables
        12. Publication-ready plots
 
     Args:
@@ -125,8 +125,9 @@ def run_single_genome(
             When provided, KofamScan execution is skipped and this file is
             parsed directly. Overrides skip_kofamscan.
         skip_expression: Skip R-based expression analysis.
-        skip_ace: Skip ACE iterative convergence analysis.
-        ace_top_pct: Percentage of genes to select each ACE iteration (default 5).
+        skip_gmm: Skip GMM codon usage clustering.
+        gmm_min_k: Minimum GMM components to test (default 2).
+        gmm_max_k: Maximum GMM components to test (default 8).
         kegg_ko_pathway: User-supplied KO-to-pathway mapping TSV for offline use.
         gff_file: GFF3 annotation file for tRNA extraction (auto-detected from
             Prokka output if omitted).
@@ -358,16 +359,12 @@ def run_single_genome(
     if not advanced_results:
         logger.info("SKIPPED: advanced analyses produced no results")
 
-    # ── Step 9: ACE convergence ─────────────────────────────────────────
-    ace_results = {}
-    ace_cai_df = None
-    if not skip_ace:
-        logger.info("[Step 9/12] Running ACE iterative convergence")
+    # ── Step 9: GMM clustering on COA space ──────────────────────────────
+    gmm_results = {}
+    gmm_cluster_gene_ids = None
+    if not skip_gmm:
+        logger.info("[Step 9/12] Running GMM clustering on COA-projected RSCU")
         try:
-            # Pass the per-gene RSCU DataFrame from step 4 (already computed
-            # by compute_rscu_per_gene).  Also pass ribosomal-protein per-gene
-            # RSCU for the RP seed.  The RP RSCU needs a "gene" column so the
-            # seed builder can identify individual RP genes.
             rp_rscu_df = None
             if rp_ffn and rp_ffn.exists():
                 try:
@@ -375,129 +372,171 @@ def run_single_genome(
                 except Exception:
                     pass
 
-            ace_out = run_ace_convergence(
+            gmm_out = run_gmm_clustering(
                 rscu_gene_df=rscu_gene_df,
                 output_dir=output_dir,
                 sample_id=sample_id,
-                enc_df=enc_df,
-                encprime_df=encprime_df,
-                rscu_rp=rp_rscu_df,
+                rp_ids_file=rp_ids_file,
+                rp_rscu_df=rp_rscu_df,
                 expr_df=expr_df,
-                advanced_results=advanced_results,
-                top_pct=ace_top_pct,
+                min_k=gmm_min_k,
+                max_k=gmm_max_k,
             )
 
-            # Separate file paths from in-memory objects
-            for key, val in ace_out.items():
+            # Separate file paths from in-memory objects, but keep
+            # everything in gmm_results too so downstream steps can
+            # access paths like gmm_cluster_ids_path directly.
+            for key, val in gmm_out.items():
+                gmm_results[key] = val
                 if isinstance(val, Path):
-                    all_outputs[f"ace_{key}"] = val
-                else:
-                    ace_results[key] = val
+                    all_outputs[f"gmm_{key}"] = val
 
-            ace_scores_df = ace_results.get("ace_scores_df")
+            gmm_cluster_gene_ids = gmm_results.get("gmm_cluster_gene_ids")
 
-            # Merge ACE scores into expression table and promote ACE-MELP
-            # as the primary expression metric.  The convergence loop uses
-            # cosine similarity (composition-independent), so ace_melp
-            # doesn't degrade in high-GC organisms the way CAI does.
-            # expression_class is reclassified from ace_MELP_class when ACE
-            # is available; the RP-based class is preserved as
-            # expression_class_rp for comparison.
-            if ace_scores_df is not None and expr_df is not None and not expr_df.empty:
+            # Annotate expression table with GMM cluster membership
+            if gmm_cluster_gene_ids and expr_df is not None and not expr_df.empty:
                 try:
-                    # Preserve the original RP-based expression_class
-                    if "expression_class" in expr_df.columns:
-                        expr_df = expr_df.rename(
-                            columns={"expression_class": "expression_class_rp"}
-                        )
-
-                    expr_df = expr_df.merge(
-                        ace_scores_df[["gene", "ace_melp", "ace_cai",
-                                       "ace_MELP_class", "in_ace_core"]],
-                        on="gene", how="left",
+                    expr_df["in_gmm_cluster"] = expr_df["gene"].isin(gmm_cluster_gene_ids)
+                    logger.info(
+                        "Annotated expression table with GMM cluster membership "
+                        "(%d genes in RP cluster)",
+                        expr_df["in_gmm_cluster"].sum(),
                     )
-
-                    # Promote ACE-MELP classification as the primary
-                    expr_df["expression_class"] = expr_df["ace_MELP_class"].fillna(
-                        expr_df.get("expression_class_rp", "unknown")
-                    )
-
-                    # Re-save the updated expression table
-                    expr_combined_path = all_outputs.get("expression_combined")
-                    if expr_combined_path and expr_combined_path.exists():
-                        expr_df.to_csv(expr_combined_path, sep="\t", index=False)
-                        logger.info(
-                            "Merged ACE scores into expression table; "
-                            "expression_class now derived from ACE-MELP"
-                        )
                 except Exception as e:
-                    logger.warning("Could not merge ACE scores into expression table: %s", e)
+                    logger.warning("Could not annotate expression table with GMM clusters: %s", e)
         except Exception as e:
-            logger.warning("ACE convergence failed: %s. Continuing.", e, exc_info=True)
+            logger.warning("GMM clustering failed: %s. Continuing.", e, exc_info=True)
     else:
-        logger.info("[Step 9/12] Skipping ACE convergence (--skip-ace)")
+        logger.info("[Step 9/12] Skipping GMM clustering (--skip-gmm)")
 
-    # ── Step 9b: Re-run pathway enrichment on ACE-derived tiers ─────────
-    # The step-7 enrichment used RP-based expression tiers.  Now that ACE
-    # has reclassified genes, run enrichment again against the ACE-MELP
-    # tiers so downstream consumers get the composition-independent view.
+    # ── Step 9b: Re-run expression scoring with GMM cluster as reference ─
+    # Step 6 scored genes against RP-only IDs.  The GMM cluster provides a
+    # broader, biologically grounded reference set (RP + co-clustered genes).
+    # Re-run MELP/CAI/Fop via coRdon using GMM cluster gene IDs, then
+    # promote the GMM-based classification as the primary expression_class.
+    gmm_cluster_ids_path = gmm_results.get("gmm_cluster_ids_path")
     if (
-        not skip_ace
+        gmm_cluster_gene_ids
+        and gmm_cluster_ids_path
+        and not skip_expression
+    ):
+        logger.info(
+            "[Step 9b/12] Re-running expression analysis with GMM cluster "
+            "(%d genes) as reference",
+            len(gmm_cluster_gene_ids),
+        )
+        try:
+            gmm_expr_outputs = run_expression_analysis(
+                ffn_path, gmm_cluster_ids_path, output_dir, sample_id,
+                force=True,  # overwrite the RP-based expression files
+            )
+            all_outputs.update(gmm_expr_outputs)
+
+            if "expression_combined" in gmm_expr_outputs:
+                gmm_expr_df = pd.read_csv(gmm_expr_outputs["expression_combined"], sep="\t")
+
+                # Preserve RP-based scores as secondary columns
+                if expr_df is not None and not expr_df.empty:
+                    rp_cols_to_keep = {}
+                    for col in ("MELP", "CAI", "Fop", "MELP_class", "CAI_class",
+                                "Fop_class", "expression_class"):
+                        if col in expr_df.columns:
+                            rp_cols_to_keep[col] = f"rp_{col}"
+
+                    rp_backup = expr_df[["gene"] + list(rp_cols_to_keep.keys())].rename(
+                        columns=rp_cols_to_keep
+                    )
+                    gmm_expr_df = gmm_expr_df.merge(rp_backup, on="gene", how="left")
+
+                # Add GMM cluster membership flag
+                gmm_expr_df["in_gmm_cluster"] = gmm_expr_df["gene"].isin(gmm_cluster_gene_ids)
+
+                # Merge ENC' residual if available
+                if enc_df is not None and encprime_df is not None:
+                    try:
+                        from codonpipe.modules.advanced_analyses import compute_enc_diff
+                        enc_diff_df = compute_enc_diff(enc_df, encprime_df)
+                        if not enc_diff_df.empty and "gene" in enc_diff_df.columns:
+                            gmm_expr_df = gmm_expr_df.merge(
+                                enc_diff_df[["gene", "ENC_diff"]].rename(
+                                    columns={"ENC_diff": "ENCprime_residual"}
+                                ),
+                                on="gene", how="left",
+                            )
+                    except Exception as e:
+                        logger.warning("Could not merge ENC' residual: %s", e)
+
+                # Annotate with KofamScan
+                if kofam_df is not None and not kofam_df.empty:
+                    expr_ann = annotate_with_kofam(gmm_expr_df, kofam_df)
+                    expr_ann_path = output_dir / "expression" / f"{sample_id}_expression_annotated.tsv"
+                    expr_ann.to_csv(expr_ann_path, sep="\t", index=False)
+                    all_outputs["expression_annotated"] = expr_ann_path
+
+                # Save and promote
+                gmm_expr_df.to_csv(gmm_expr_outputs["expression_combined"], sep="\t", index=False)
+                expr_df = gmm_expr_df
+                logger.info(
+                    "Expression analysis re-scored with GMM cluster reference "
+                    "(%d genes); expression_class now GMM-based",
+                    len(expr_df),
+                )
+        except (FileNotFoundError, RuntimeError) as e:
+            logger.warning(
+                "GMM-based expression re-scoring failed: %s. "
+                "Keeping RP-based expression scores.", e, exc_info=True,
+            )
+
+    # ── Step 9c: Re-run pathway enrichment on GMM-based expression tiers ─
+    # Step 7 enrichment used RP-only expression tiers.  Now that genes are
+    # re-scored against the GMM cluster, re-run enrichment so downstream
+    # plots and tables reflect the GMM-derived view.
+    if (
+        gmm_cluster_gene_ids
         and expr_df is not None
-        and "ace_MELP_class" in (expr_df.columns if expr_df is not None else [])
         and kofam_df is not None
         and not kofam_df.empty
     ):
-        logger.info("[Step 9b/12] Re-running pathway enrichment on ACE-MELP expression tiers")
+        logger.info("[Step 9c/12] Re-running pathway enrichment on GMM-based expression tiers")
         try:
-            ace_enrich_outputs = run_enrichment_analysis(
+            gmm_enrich_outputs = run_enrichment_analysis(
                 expr_df, kofam_df, output_dir, sample_id,
                 kegg_ko_pathway_file=kegg_ko_pathway,
-                metrics=["ace_MELP"],
-                output_subdir="enrichment_ace",
+                output_subdir="enrichment_gmm",
             )
             all_outputs.update({
-                f"ace_{k}": v for k, v in ace_enrich_outputs.items()
+                f"gmm_{k}": v for k, v in gmm_enrich_outputs.items()
             })
-            # Load ACE enrichment results for plotting.  The enrichment
-            # module produces keys like "enrichment_ace_MELP_high";
-            # prefix with "ace_" for plotting so filenames read
-            # "ace_enrichment_MELP_high", paralleling "rp_enrichment_MELP_high".
-            for key, path in ace_enrich_outputs.items():
+            # Load GMM enrichment results for plotting, prefixed with "gmm_"
+            for key, path in gmm_enrich_outputs.items():
                 if key.startswith("enrichment_") and path.exists():
-                    # Strip the "ace_" from within the metric name to avoid
-                    # double-prefixing: enrichment_ace_MELP_high → enrichment_MELP_high
-                    clean_key = key.replace("enrichment_ace_MELP_",
-                                           "enrichment_MELP_")
-                    enrichment_results[f"ace_{clean_key}"] = pd.read_csv(path, sep="\t")
+                    enrichment_results[f"gmm_{key}"] = pd.read_csv(path, sep="\t")
         except Exception as e:
-            logger.warning("ACE-tier pathway enrichment failed: %s. Continuing.", e, exc_info=True)
+            logger.warning("GMM-tier pathway enrichment failed: %s. Continuing.", e, exc_info=True)
 
-    # ── Step 9c: Re-compute ACE-aware advanced metrics ──────────────────
-    # Step 8 ran S-value against ribosomal proteins and delta RSCU against
-    # RP-based tiers.  Now that ACE has converged and reclassified genes,
-    # recompute with the composition-independent reference and tiers.
-    if ace_results.get("ace_weights_array") is not None and ace_results.get("ace_codon_cols"):
+    # ── Step 9d: Recompute S-value against GMM-cluster RSCU ────────────
+    # Step 8 computed S-value against ribosomal proteins.  The GMM cluster
+    # provides a broader reference (RP + co-clustered genes).  Recompute
+    # S-value and delta RSCU with the GMM-derived reference.
+    gmm_cluster_rscu = gmm_results.get("gmm_cluster_rscu")
+    if gmm_cluster_rscu is not None and not gmm_cluster_rscu.empty:
         try:
             from codonpipe.modules.advanced_analyses import compute_s_value, compute_delta_rscu
-            ace_weights = ace_results["ace_weights_array"]
-            ace_cols = ace_results["ace_codon_cols"]
-            rscu_ace_dict = dict(zip(ace_cols, ace_weights))
+            rscu_gmm_dict = gmm_cluster_rscu.to_dict()
             adv_dir = output_dir / "advanced"
 
-            # S-value against ACE consensus
-            logger.info("[Step 9c/12] Recomputing S-value and delta RSCU with ACE-derived values")
-            s_val_ace_df = compute_s_value(rscu_gene_df, rscu_rp, rscu_ace=rscu_ace_dict)
-            if not s_val_ace_df.empty:
+            logger.info("[Step 9d/12] Recomputing S-value with GMM-cluster RSCU reference")
+            s_val_gmm_df = compute_s_value(rscu_gene_df, rscu_rp, rscu_ace=rscu_gmm_dict)
+            if not s_val_gmm_df.empty:
                 s_val_path = adv_dir / f"{sample_id}_s_value.tsv"
-                s_val_ace_df.to_csv(s_val_path, sep="\t", index=False)
+                s_val_gmm_df.to_csv(s_val_path, sep="\t", index=False)
                 all_outputs["advanced_s_value_path"] = s_val_path
-                advanced_results["s_value"] = s_val_ace_df
-                logger.info("S-value recomputed against ACE consensus (%d genes)", len(s_val_ace_df))
+                advanced_results["s_value"] = s_val_gmm_df
+                logger.info("S-value recomputed against GMM-cluster reference (%d genes)", len(s_val_gmm_df))
 
-            # Delta RSCU with ACE expression tiers
+            # Delta RSCU with GMM-based expression tiers
             if expr_df is not None:
-                for class_col in ["expression_class", "ace_MELP_class"]:
+                for class_col in ["expression_class"]:
                     if class_col in expr_df.columns:
                         delta_df = compute_delta_rscu(rscu_gene_df, expr_df, class_col)
                         if not delta_df.empty:
@@ -507,7 +546,7 @@ def run_single_genome(
                             all_outputs[f"advanced_delta_rscu_{metric}_path"] = out_path
                             advanced_results[f"delta_rscu_{metric}"] = delta_df
         except Exception as e:
-            logger.warning("ACE-aware metric recomputation failed: %s. Keeping RP-based values.", e)
+            logger.warning("GMM-aware metric recomputation failed: %s. Keeping RP-based values.", e)
 
     # ── Step 10: Biological/ecological analyses ─────────────────────────
     logger.info("[Step 10/12] Running biological and ecological analyses")
@@ -557,7 +596,6 @@ def run_single_genome(
     logger.info("[Step 11/12] Generating codon usage tables in all standard formats")
     try:
         rp_ffn = rp_outputs.get("rp_ffn")
-        ace_core_genes = ace_results.get("ace_core_gene_set")
         table_outputs = generate_all_codon_tables(
             ffn_path=ffn_path,
             rp_ffn_path=rp_ffn,
@@ -565,7 +603,7 @@ def run_single_genome(
             sample_id=sample_id,
             expr_df=expr_df,
             rp_ids_file=rp_ids_file,
-            ace_core_gene_ids=ace_core_genes,
+            gmm_cluster_gene_ids=gmm_cluster_gene_ids,
         )
         all_outputs.update(table_outputs)
     except Exception as e:
