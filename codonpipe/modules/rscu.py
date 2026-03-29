@@ -16,6 +16,7 @@ from codonpipe.utils.codon_tables import (
     CODON_TABLE_11,
     RSCU_COLUMN_NAMES,
     SENSE_CODONS,
+    codon_to_col_name,
     dna_to_rna,
 )
 
@@ -240,8 +241,6 @@ def _calculate_enc(codon_counts: Counter) -> float:
 
         if k in f_values:
             f_values[k].append(f_hat)
-        elif k == 6:
-            f_values[6].append(f_hat)
 
     # ENC = number of aa families + K/F_avg for each degeneracy class
     # Wright (1990): Nc = 2 + 9/F̄₂ + 1/F̄₃ + 5/F̄₄ + 3/F̄₆
@@ -283,30 +282,8 @@ def _calculate_gc3(sequence: str) -> float:
     return gc3_count / total if total > 0 else 0.0
 
 
-def _codon_to_col_name(codon: str, aa: str) -> str:
-    """Convert a codon and amino acid to the RSCU column name convention.
-
-    Serine, Leucine, and Arginine are split into two families:
-        Ser4 (UCN) vs Ser2 (AGY), Leu4 (CUN) vs Leu2 (UUN),
-        Arg4 (CGN) vs Arg2 (AGR).
-    """
-    if aa == "Ser":
-        if codon.startswith("UC"):
-            return f"Ser4-{codon}"
-        else:
-            return f"Ser2-{codon}"
-    elif aa == "Leu":
-        if codon.startswith("CU"):
-            return f"Leu4-{codon}"
-        else:
-            return f"Leu2-{codon}"
-    elif aa == "Arg":
-        if codon.startswith("CG"):
-            return f"Arg4-{codon}"
-        else:
-            return f"Arg2-{codon}"
-    else:
-        return f"{aa}-{codon}"
+# Alias for backward compatibility (canonical implementation in utils.codon_tables)
+_codon_to_col_name = codon_to_col_name
 
 
 def run_rscu_analysis(
