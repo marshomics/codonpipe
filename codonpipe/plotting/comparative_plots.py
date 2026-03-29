@@ -2068,13 +2068,15 @@ def plot_rp_he_divergence_by_condition(
     fig, ax = plt.subplots(figsize=(max(5, len(conditions) * 1.5), 5))
     sns.violinplot(
         data=plot_df, x=condition_col, y="rp_he_euclidean",
+        hue=condition_col, hue_order=conditions,
         order=conditions, palette=palette, inner=None, cut=0,
-        alpha=0.3, ax=ax,
+        alpha=0.3, ax=ax, legend=False,
     )
     sns.stripplot(
         data=plot_df, x=condition_col, y="rp_he_euclidean",
+        hue=condition_col, hue_order=conditions,
         order=conditions, palette=palette, size=5, alpha=0.7,
-        jitter=0.15, ax=ax,
+        jitter=0.15, ax=ax, legend=False,
     )
 
     # Kruskal-Wallis across conditions
@@ -2130,9 +2132,11 @@ def plot_grodon2_by_condition(
     # Panel 1: doubling time violin + strip
     ax = axes[0]
     sns.violinplot(data=df, x=condition_col, y="grodon2_doubling_time_hours",
-                   palette=palette, inner=None, alpha=0.4, ax=ax)
+                   hue=condition_col, palette=palette, inner=None, alpha=0.4,
+                   ax=ax, legend=False)
     sns.stripplot(data=df, x=condition_col, y="grodon2_doubling_time_hours",
-                  palette=palette, size=6, edgecolor="black", linewidth=0.5, ax=ax)
+                  hue=condition_col, palette=palette, size=6, edgecolor="black",
+                  linewidth=0.5, ax=ax, legend=False)
 
     ax.axhline(2, color="green", linestyle="--", alpha=0.4, linewidth=0.8)
     ax.axhline(5, color="orange", linestyle="--", alpha=0.4, linewidth=0.8)
@@ -2221,7 +2225,8 @@ def plot_mge_cu_deviation_by_condition(
 
         sns.boxplot(
             data=plot_data, x=condition_col, y=col, order=conditions,
-            palette=palette, ax=ax, linewidth=0.8, fliersize=3,
+            hue=condition_col, hue_order=conditions, palette=palette,
+            ax=ax, linewidth=0.8, fliersize=3, legend=False,
         )
         sns.stripplot(
             data=plot_data, x=condition_col, y=col, order=conditions,
