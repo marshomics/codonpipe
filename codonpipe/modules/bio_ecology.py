@@ -1190,6 +1190,7 @@ def run_bio_ecology_analyses(
     gff_path: Path | None = None,
     gmm_cluster_rscu: dict[str, float] | pd.Series | None = None,
     gmm_cluster_gene_ids: list[str] | set[str] | None = None,
+    gmm_cluster_ids_path: Path | str | None = None,
 ) -> dict[str, pd.DataFrame | Path | dict]:
     """Run all biological and ecological analyses.
 
@@ -1213,6 +1214,11 @@ def run_bio_ecology_analyses(
         gmm_cluster_gene_ids: Optional gene IDs from the GMM optimal cluster.
             When provided, growth rate prediction uses these as the reference
             gene set instead of ribosomal proteins.
+        gmm_cluster_ids_path: Optional path to the Mahalanobis-defined
+            optimised gene IDs file (one ID per line).  When provided
+            alongside *expr_df* containing MELP-based expression_class,
+            gRodon2 uses the optimised set as the background and high-MELP
+            genes as the highly-expressed set.
 
     Returns:
         Dict of analysis names -> DataFrames/file paths. Includes nested dicts for
@@ -1272,22 +1278,74 @@ def run_bio_ecology_analyses(
         logger.warning("Growth rate prediction failed: %s", e)
 
     # 2b. gRodon2 growth rate prediction (requires R + gRodon2 package)
+    #
+    # When Mahalanobis outputs are available, gRodon2 uses:
+    #   - background: Mahalanobis-defined optimised gene set (gmm_cluster_ids_path)
+    #   - highly expressed: high-MELP-tier genes (expression_class == "high")
+    # This ensures CUBHE measures the bias of the most highly expressed genes
+    # relative to the optimised (RP-like) background, with both sets informed
+    # by the Mahalanobis classification.
     logger.info("Running gRodon2 growth rate prediction for %s", sample_id)
     try:
+        import tempfile as _tmpmod
         from codonpipe.modules.grodon import run_grodon
 
-        grodon_result = run_grodon(ffn_path, output_dir, sample_id,
-                                   rp_ids_file=rp_ids_file)
+        # Extract high-MELP gene IDs for the HE set when available
+        he_ids_path = None
+        if (
+            expr_df is not None
+            and not expr_df.empty
+            and "expression_class" in expr_df.columns
+            and "gene" in expr_df.columns
+        ):
+            high_melp_genes = expr_df.loc[
+                expr_df["expression_class"] == "high", "gene"
+            ].dropna().tolist()
+            if high_melp_genes:
+                he_tmp = _tmpmod.NamedTemporaryFile(
+                    mode="w", suffix="_he_ids.txt", delete=False,
+                    dir=eco_dir,
+                )
+                he_tmp.write("\n".join(high_melp_genes) + "\n")
+                he_tmp.close()
+                he_ids_path = Path(he_tmp.name)
+                logger.info(
+                    "gRodon2: using %d high-MELP genes as HE set",
+                    len(high_melp_genes),
+                )
+
+        # Resolve background IDs path
+        bg_ids_path = None
+        if gmm_cluster_ids_path is not None and Path(gmm_cluster_ids_path).exists():
+            bg_ids_path = Path(gmm_cluster_ids_path)
+            logger.info(
+                "gRodon2: using Mahalanobis-defined gene set as background"
+            )
+
+        grodon_result = run_grodon(
+            ffn_path, output_dir, sample_id,
+            rp_ids_file=rp_ids_file,
+            he_ids_file=he_ids_path,
+            background_ids_file=bg_ids_path,
+        )
+
+        # Clean up temp HE IDs file
+        if he_ids_path is not None:
+            he_ids_path.unlink(missing_ok=True)
+
         if grodon_result is not None:
             grodon_path = grodon_result.pop("path", None)
             outputs["grodon2_prediction"] = grodon_result
             if grodon_path is not None:
                 outputs["grodon2_prediction_path"] = grodon_path
             logger.info(
-                "gRodon2 complete: %.2f h [%.2f, %.2f]",
+                "gRodon2 complete: %.2f h [%.2f, %.2f] (ref: %s, %d HE / %d bg)",
                 grodon_result["predicted_doubling_time_hours"],
                 grodon_result["lower_ci_hours"],
                 grodon_result["upper_ci_hours"],
+                grodon_result.get("reference_mode", "unknown"),
+                grodon_result.get("n_highly_expressed", 0),
+                grodon_result.get("n_background", 0),
             )
         else:
             logger.info("SKIPPED: gRodon2 prediction (R or gRodon2 not available)")
