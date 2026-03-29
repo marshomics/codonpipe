@@ -308,12 +308,12 @@ def _read_translational_selection(paths: dict, row: dict) -> None:
     if p_grad and Path(p_grad).exists():
         try:
             df = pd.read_csv(p_grad, sep="\t")
-            if "quintile" in df.columns and "fop_mean" in df.columns:
-                # Linear regression of fop_mean vs quintile number
-                valid = df[["quintile", "fop_mean"]].dropna()
+            if "quintile" in df.columns and "mean_fop" in df.columns:
+                # Linear regression of mean_fop vs quintile number
+                valid = df[["quintile", "mean_fop"]].dropna()
                 if len(valid) > 2:
                     slope, _, _, _, _ = sp_stats.linregress(
-                        valid["quintile"].values, valid["fop_mean"].values
+                        valid["quintile"].values, valid["mean_fop"].values
                     )
                     row["fop_gradient_slope"] = slope
         except Exception:
