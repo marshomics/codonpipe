@@ -1,8 +1,9 @@
 """Biological and ecological analyses for codon usage in CodonPipe.
 
 Includes HGT detection via Mahalanobis distance, growth rate prediction from
-ribosomal protein adaptation, translational selection quantification, phage/mobile
-element detection, strand asymmetry analysis, and operon-level codon coadaptation.
+ribosomal protein adaptation, gRodon2 growth rate prediction, translational
+selection quantification, phage/mobile element detection, strand asymmetry
+analysis, and operon-level codon coadaptation.
 """
 
 from __future__ import annotations
@@ -464,9 +465,7 @@ def quantify_translational_selection(
     fop_gradient_df = pd.DataFrame(fop_rows)
 
     # Also compute continuous Spearman correlation (CAI vs Fop)
-    if not optimal_codons_set and not merged.empty:
-        pass  # No optimal codons identified
-    elif not merged.empty and "CAI" in merged.columns:
+    if optimal_codons_set and not merged.empty and "CAI" in merged.columns:
         # Compute Fop for each gene directly
         all_fop_vals = []
         all_cai_vals = []
@@ -1111,6 +1110,28 @@ def run_bio_ecology_analyses(
             logger.info("SKIPPED: growth rate prediction (no expression data)")
     except Exception as e:
         logger.warning("Growth rate prediction failed: %s", e)
+
+    # 2b. gRodon2 growth rate prediction (requires R + gRodon2 package)
+    logger.info("Running gRodon2 growth rate prediction for %s", sample_id)
+    try:
+        from codonpipe.modules.grodon import run_grodon
+
+        grodon_result = run_grodon(ffn_path, output_dir, sample_id)
+        if grodon_result is not None:
+            grodon_path = grodon_result.pop("path", None)
+            outputs["grodon2_prediction"] = grodon_result
+            if grodon_path is not None:
+                outputs["grodon2_prediction_path"] = grodon_path
+            logger.info(
+                "gRodon2 complete: %.2f h [%.2f, %.2f]",
+                grodon_result["predicted_doubling_time_hours"],
+                grodon_result["lower_ci_hours"],
+                grodon_result["upper_ci_hours"],
+            )
+        else:
+            logger.info("SKIPPED: gRodon2 prediction (R or gRodon2 not available)")
+    except Exception as e:
+        logger.warning("gRodon2 prediction failed: %s", e)
 
     # 3. Translational selection
     logger.info("Quantifying translational selection for %s", sample_id)
