@@ -48,6 +48,10 @@ def main():
               help="Pre-computed KofamScan detail-tsv results file. When provided, KofamScan is skipped and this file is parsed directly.")
 @click.option("--skip-expression", is_flag=True,
               help="Skip all R-based analyses (MELP/CAI/Fop/ENCprime/MILC).")
+@click.option("--skip-ace", is_flag=True,
+              help="Skip ACE iterative convergence analysis.")
+@click.option("--ace-top-pct", type=float, default=5.0, show_default=True,
+              help="Percentage of genes to select each ACE iteration.")
 @click.option("--kegg-ko-pathway", type=click.Path(exists=True, path_type=Path), default=None,
               help="KO-to-pathway mapping TSV for offline enrichment (auto-downloaded from KEGG if omitted).")
 @click.option("--force", is_flag=True, help="Overwrite existing outputs.")
@@ -71,6 +75,8 @@ def run(
     skip_kofamscan: bool,
     kofam_results: Path | None,
     skip_expression: bool,
+    skip_ace: bool,
+    ace_top_pct: float,
     kegg_ko_pathway: Path | None,
     force: bool,
     verbose: bool,
@@ -118,6 +124,8 @@ def run(
             skip_kofamscan=skip_kofamscan,
             kofam_results_file=kofam_results,
             skip_expression=skip_expression,
+            skip_ace=skip_ace,
+            ace_top_pct=ace_top_pct,
             kegg_ko_pathway=kegg_ko_pathway,
             gff_file=gff_file,
             force=force,
@@ -152,6 +160,9 @@ def run(
 @click.option("--kofam-results", type=click.Path(exists=True, path_type=Path), default=None,
               help="Pre-computed KofamScan detail-tsv results file (applies to all samples). Per-sample files can also be specified via a 'kofam_results' column in the batch table.")
 @click.option("--skip-expression", is_flag=True, help="Skip R-based expression analysis.")
+@click.option("--skip-ace", is_flag=True, help="Skip ACE iterative convergence analysis.")
+@click.option("--ace-top-pct", type=float, default=5.0, show_default=True,
+              help="Percentage of genes to select each ACE iteration.")
 @click.option("--kegg-ko-pathway", type=click.Path(exists=True, path_type=Path), default=None,
               help="KO-to-pathway mapping TSV for offline enrichment.")
 @click.option("--gff", "gff_file", type=click.Path(exists=True, path_type=Path), default=None,
@@ -174,6 +185,8 @@ def batch(
     skip_kofamscan: bool,
     kofam_results: Path | None,
     skip_expression: bool,
+    skip_ace: bool,
+    ace_top_pct: float,
     kegg_ko_pathway: Path | None,
     gff_file: Path | None,
     force: bool,
@@ -226,6 +239,8 @@ def batch(
             skip_kofamscan=skip_kofamscan,
             kofam_results_file=kofam_results,
             skip_expression=skip_expression,
+            skip_ace=skip_ace,
+            ace_top_pct=ace_top_pct,
             kegg_ko_pathway=kegg_ko_pathway,
             gff_file=gff_file,
             force=force,
