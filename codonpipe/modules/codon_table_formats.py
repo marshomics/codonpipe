@@ -29,6 +29,7 @@ from codonpipe.utils.codon_tables import (
     AA_CODON_GROUPS_RSCU,
     CODON_TABLE_11,
     SENSE_CODONS,
+    codon_to_col_name,
     dna_to_rna,
 )
 from codonpipe.modules.rscu import count_codons, compute_rscu_from_counts
@@ -39,30 +40,8 @@ logger = logging.getLogger("codonpipe")
 MIN_GENE_LENGTH = 240
 
 
-def _codon_to_col_name(codon: str, aa: str) -> str:
-    """Convert a codon and amino acid to the RSCU column name convention.
-
-    Serine, Leucine, and Arginine are split into two families:
-        Ser4 (UCN) vs Ser2 (AGY), Leu4 (CUN) vs Leu2 (UUN),
-        Arg4 (CGN) vs Arg2 (AGR).
-    """
-    if aa == "Ser":
-        if codon.startswith("UC"):
-            return f"Ser4-{codon}"
-        else:
-            return f"Ser2-{codon}"
-    elif aa == "Leu":
-        if codon.startswith("CU"):
-            return f"Leu4-{codon}"
-        else:
-            return f"Leu2-{codon}"
-    elif aa == "Arg":
-        if codon.startswith("CG"):
-            return f"Arg4-{codon}"
-        else:
-            return f"Arg2-{codon}"
-    else:
-        return f"{aa}-{codon}"
+# Alias for backward compatibility (canonical implementation in utils.codon_tables)
+_codon_to_col_name = codon_to_col_name
 
 
 def _get_sequence_ids_from_file(ffn_path: Path) -> set[str]:
@@ -531,12 +510,22 @@ def generate_all_codon_tables(
                 logger.info("Saved %s to %s", fmt_name, out_path)
 
         # Create combined summary table (side-by-side all formats)
+        # Use explicit merge on 'codon' to avoid index-alignment issues
+        # between tables with different codon sets (e.g. 64 vs 59 codons).
         if not rscu_table.empty:
-            summary = rscu_table[["codon", "amino_acid"]].copy()
-            summary["abs_count"] = abs_counts.set_index("codon")["count"]
-            summary["freq_per_1000"] = freq_per_1k.set_index("codon")["per_thousand"]
-            summary["rscu"] = rscu_table.set_index("codon")["rscu"]
-            summary["w_value"] = w_values.set_index("codon")["w_value"]
+            summary = rscu_table[["codon", "amino_acid", "rscu"]].copy()
+            summary = summary.merge(
+                abs_counts[["codon", "count"]].rename(columns={"count": "abs_count"}),
+                on="codon", how="left",
+            )
+            summary = summary.merge(
+                freq_per_1k[["codon", "per_thousand"]].rename(columns={"per_thousand": "freq_per_1000"}),
+                on="codon", how="left",
+            )
+            summary = summary.merge(
+                w_values[["codon", "w_value"]],
+                on="codon", how="left",
+            )
 
             summary_path = codon_dir / f"{sample_id}_{geneset_name}_summary.tsv"
             summary.to_csv(summary_path, sep="\t", index=False)
