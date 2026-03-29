@@ -495,6 +495,16 @@ def run_grodon(
             growth_class = "fast"
             caveat = ""
 
+        # gRodon2 training range: Madin et al. (2020) dataset spans
+        # ~0.2 h to ~72 h doubling time; predictions outside this range
+        # are extrapolations and should be flagged.
+        training_min_hours = 0.2
+        training_max_hours = 72.0
+        if d is not None and d == d:  # not NaN
+            in_training_range = training_min_hours <= d <= training_max_hours
+        else:
+            in_training_range = False
+
         grodon_result = {
             "predicted_doubling_time_hours": float(d) if d is not None else None,
             "lower_ci_hours": float(lower_ci) if lower_ci is not None else None,
@@ -507,6 +517,8 @@ def run_grodon(
             "filtered_sequences": int(raw["filtered_sequences"]),
             "growth_class": growth_class,
             "model": "gRodon2_full_madin",
+            "in_training_range": in_training_range,
+            "training_range_hours": f"{training_min_hours}-{training_max_hours}",
             "caveat": caveat,
         }
 
