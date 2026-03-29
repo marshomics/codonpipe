@@ -29,6 +29,13 @@ dependencies:
   - bioconductor-cordon>=1.16
   - bioconductor-biostrings>=2.66
   - bioconductor-iranges>=2.32
+  - r-matrixstats>=1.0
+  - r-dplyr>=1.1
+  - r-jsonlite>=1.8
+  - r-remotes>=2.4
+
+  # gRodon2 (not available via conda — installed from GitHub at first run,
+  # or manually via: Rscript -e "remotes::install_github('jlw-ecoevo/gRodon2')")
 
   # Development (optional)
   - pytest>=7.0
