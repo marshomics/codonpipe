@@ -311,11 +311,17 @@ def is_grodon_available() -> bool:
 
 _R_SCRIPT = r"""
 # gRodon2 wrapper called by CodonPipe
-# Arguments: <cds_fasta> <output_json> [<rp_ids_file>]
+# Arguments: <cds_fasta> <output_json> [<he_ids_file>] [<background_ids_file>]
 #
-# If rp_ids_file is provided (one gene ID per line), those IDs are used
-# to mark highly-expressed genes.  Otherwise falls back to gRodon2's
-# built-in regex on FASTA headers.
+# he_ids_file (optional): Gene IDs (one per line) to mark as highly expressed.
+#   When provided these replace gRodon2's built-in RP regex. Typically the
+#   high-MELP tier genes scored against the Mahalanobis-defined reference.
+#
+# background_ids_file (optional): Gene IDs (one per line) that define the
+#   background gene set.  When provided the input FASTA is subsetted to only
+#   these genes BEFORE computing CUBHE and CPB, so the "genome average" that
+#   gRodon2 measures against is the Mahalanobis-defined optimised set rather
+#   than the full CDS complement.  The he_ids must be a subset of these.
 
 # Ensure user library is on the search path even when .Renviron is absent
 local({
@@ -332,22 +338,40 @@ suppressPackageStartupMessages({
 })
 
 args <- commandArgs(trailingOnly = TRUE)
-cds_fasta   <- args[1]
-output_json <- args[2]
-rp_ids_file <- if (length(args) >= 3) args[3] else NULL
+cds_fasta       <- args[1]
+output_json     <- args[2]
+he_ids_file     <- if (length(args) >= 3 && nchar(args[3]) > 0) args[3] else NULL
+bg_ids_file     <- if (length(args) >= 4 && nchar(args[4]) > 0) args[4] else NULL
 
 genes <- readDNAStringSet(cds_fasta)
 
 # Extract the gene ID (first whitespace-delimited token) from each FASTA header
 gene_ids <- sub("\\s.*", "", names(genes))
 
-if (!is.null(rp_ids_file) && file.exists(rp_ids_file)) {
-  # Use CodonPipe's COGclassifier-derived ribosomal protein IDs
-  rp_ids <- readLines(rp_ids_file)
-  rp_ids <- trimws(rp_ids[nchar(trimws(rp_ids)) > 0])
-  highly_expressed <- gene_ids %in% rp_ids
-  cat(sprintf("Using %d COGclassifier RP IDs; matched %d/%d CDS\n",
-              length(rp_ids), sum(highly_expressed), length(genes)))
+# ── Optional: subset to background (Mahalanobis-defined) gene set ──
+n_total <- length(genes)
+if (!is.null(bg_ids_file) && file.exists(bg_ids_file)) {
+  bg_ids <- readLines(bg_ids_file)
+  bg_ids <- trimws(bg_ids[nchar(trimws(bg_ids)) > 0])
+  keep <- gene_ids %in% bg_ids
+  if (sum(keep) < 10) {
+    cat(sprintf("WARNING: only %d/%d CDS matched background IDs; using full genome\n",
+                sum(keep), n_total))
+  } else {
+    genes    <- genes[keep]
+    gene_ids <- gene_ids[keep]
+    cat(sprintf("Subsetting to %d/%d Mahalanobis-defined background genes\n",
+                length(genes), n_total))
+  }
+}
+
+# ── Mark highly expressed genes ──
+if (!is.null(he_ids_file) && file.exists(he_ids_file)) {
+  he_ids <- readLines(he_ids_file)
+  he_ids <- trimws(he_ids[nchar(trimws(he_ids)) > 0])
+  highly_expressed <- gene_ids %in% he_ids
+  cat(sprintf("Using %d high-MELP gene IDs; matched %d/%d CDS\n",
+              length(he_ids), sum(highly_expressed), length(genes)))
 } else {
   # Fallback: gRodon2's own regex on FASTA headers
   highly_expressed <- grepl(
@@ -356,6 +380,8 @@ if (!is.null(rp_ids_file) && file.exists(rp_ids_file)) {
     ignore.case = TRUE,
     perl = TRUE
   )
+  cat(sprintf("Using gRodon2 header regex; matched %d/%d CDS\n",
+              sum(highly_expressed), length(genes)))
 }
 
 n_he <- sum(highly_expressed)
@@ -363,7 +389,8 @@ if (n_he < 1) {
   # Write a JSON indicating no HE genes
   result <- list(
     status = "no_highly_expressed_genes",
-    n_highly_expressed = 0
+    n_highly_expressed = 0,
+    n_background = length(genes)
   )
   writeLines(jsonlite::toJSON(result, auto_unbox = TRUE), output_json)
   quit(save = "no", status = 0)
@@ -383,6 +410,8 @@ tryCatch({
     CPB = pred$CPB,
     GC = pred$GC,
     n_highly_expressed = n_he,
+    n_background = length(genes),
+    n_total_cds = n_total,
     filtered_sequences = pred$FilteredSequences
   )
 
@@ -404,6 +433,8 @@ def run_grodon(
     output_dir: Path,
     sample_id: str,
     rp_ids_file: Path | str | None = None,
+    he_ids_file: Path | str | None = None,
+    background_ids_file: Path | str | None = None,
 ) -> dict | None:
     """Run gRodon2 growth rate prediction on a CDS FASTA file.
 
@@ -412,9 +443,17 @@ def run_grodon(
         output_dir: Directory to save the result TSV.
         sample_id: Sample identifier.
         rp_ids_file: Optional path to a file listing ribosomal protein gene
-            IDs (one per line), as identified by COGclassifier.  When
-            provided, these IDs are used to mark highly expressed genes
-            instead of relying on gRodon2's header regex.
+            IDs (one per line), as identified by COGclassifier.  Used as
+            the highly-expressed set when *he_ids_file* is not provided.
+        he_ids_file: Optional path to a file listing highly-expressed gene
+            IDs (one per line).  When provided, takes precedence over
+            *rp_ids_file* for marking the HE set.  Typically contains
+            high-MELP-tier genes scored against the Mahalanobis reference.
+        background_ids_file: Optional path to a file listing the background
+            gene set (one gene ID per line).  When provided, the input FASTA
+            is subsetted to only these genes before computing CUBHE and CPB,
+            so the "genome average" is the Mahalanobis-defined optimised set
+            rather than the full CDS complement.
 
     Returns:
         Dict with gRodon2 results (doubling time, CI, codon stats),
@@ -439,11 +478,23 @@ def run_grodon(
     json_out_path = json_out.name
     json_out.close()
 
+    # Resolve which file supplies the HE gene IDs: prefer explicit
+    # high-MELP IDs, fall back to RP IDs, then gRodon2's own regex.
+    effective_he = None
+    if he_ids_file is not None and Path(he_ids_file).exists():
+        effective_he = str(he_ids_file)
+    elif rp_ids_file is not None and Path(rp_ids_file).exists():
+        effective_he = str(rp_ids_file)
+
+    effective_bg = None
+    if background_ids_file is not None and Path(background_ids_file).exists():
+        effective_bg = str(background_ids_file)
+
     try:
         cmd = ["Rscript", "--no-save", "--no-restore", r_script_path,
-               str(ffn_path), json_out_path]
-        if rp_ids_file is not None and Path(rp_ids_file).exists():
-            cmd.append(str(rp_ids_file))
+               str(ffn_path), json_out_path,
+               effective_he or "",
+               effective_bg or ""]
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -460,15 +511,17 @@ def run_grodon(
             raw = json.load(f)
 
         if raw.get("status") == "no_highly_expressed_genes":
-            if rp_ids_file and Path(rp_ids_file).exists():
+            if effective_he:
                 logger.warning(
-                    "gRodon2: none of the %s RP IDs matched CDS headers in %s",
-                    rp_ids_file, ffn_path,
+                    "gRodon2: none of the HE IDs from %s matched CDS in %s "
+                    "(background: %s)",
+                    effective_he, ffn_path,
+                    effective_bg or "full genome",
                 )
             else:
                 logger.warning(
-                    "gRodon2: no ribosomal proteins identified in FASTA headers "
-                    "(no RP IDs file provided and header regex found no matches)"
+                    "gRodon2: no highly expressed genes identified "
+                    "(no HE IDs file provided and header regex found no matches)"
                 )
             return None
 
@@ -505,6 +558,16 @@ def run_grodon(
         else:
             in_training_range = False
 
+        # Determine the reference mode for provenance tracking
+        if effective_bg and effective_he:
+            ref_mode = "mahalanobis_melp"
+        elif effective_he:
+            ref_mode = "melp_he"
+        elif rp_ids_file and Path(rp_ids_file).exists():
+            ref_mode = "rp_ids"
+        else:
+            ref_mode = "header_regex"
+
         grodon_result = {
             "predicted_doubling_time_hours": float(d) if d is not None else None,
             "lower_ci_hours": float(lower_ci) if lower_ci is not None else None,
@@ -514,9 +577,12 @@ def run_grodon(
             "CPB": float(raw["CPB"]) if raw.get("CPB") is not None else None,
             "GC": float(raw["GC"]),
             "n_highly_expressed": int(raw["n_highly_expressed"]),
+            "n_background": int(raw.get("n_background", raw["n_highly_expressed"])),
+            "n_total_cds": int(raw.get("n_total_cds", 0)),
             "filtered_sequences": int(raw["filtered_sequences"]),
             "growth_class": growth_class,
             "model": "gRodon2_full_madin",
+            "reference_mode": ref_mode,
             "in_training_range": in_training_range,
             "training_range_hours": f"{training_min_hours}-{training_max_hours}",
             "caveat": caveat,
