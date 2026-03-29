@@ -2936,7 +2936,10 @@ def plot_genomic_cu_landscape(
         ax_top.legend(handles=legend_elements, loc="upper right", fontsize=8)
 
     ax_top.set_title(f"Codon usage landscape — {sample_id}", fontsize=12)
-    fig.tight_layout()
+    try:
+        fig.tight_layout()
+    except ValueError:
+        pass  # Mixed Axes types (e.g. polar + cartesian) are incompatible with tight_layout
     _save_fig(fig, output_path)
 
 
@@ -3033,7 +3036,8 @@ def plot_mge_vs_core_rscu(
 
         sns.violinplot(
             data=plot_data, x="gene_class", y=col, order=order,
-            palette=palette, ax=ax, inner="box", cut=0, linewidth=0.8,
+            hue="gene_class", hue_order=order, palette=palette,
+            ax=ax, inner="box", cut=0, linewidth=0.8, legend=False,
         )
         ax.set_xlabel("")
         ax.set_ylabel(label)
@@ -4268,7 +4272,8 @@ def plot_bio_ecology_comparison(
     for ax, (ptype, pdf) in zip(axes, panels):
         if ptype == "hgt":
             sns.violinplot(data=pdf, x="sample_id", y="mahalanobis_dist",
-                           palette=sid_colors, ax=ax, inner="box", cut=0, linewidth=0.8)
+                           hue="sample_id", palette=sid_colors, ax=ax,
+                           inner="box", cut=0, linewidth=0.8, legend=False)
             ax.set_ylabel("Mahalanobis distance")
             ax.set_xlabel("")
             ax.set_title("HGT detection\n(CU deviation)", fontsize=10)
@@ -4283,7 +4288,8 @@ def plot_bio_ecology_comparison(
             ax.set_title("Strand asymmetry", fontsize=10)
         elif ptype == "operon":
             sns.violinplot(data=pdf, x="sample_id", y="mean_rscu_distance",
-                           palette=sid_colors, ax=ax, inner="box", cut=0, linewidth=0.8)
+                           hue="sample_id", palette=sid_colors, ax=ax,
+                           inner="box", cut=0, linewidth=0.8, legend=False)
             ax.set_ylabel("Mean RSCU distance")
             ax.set_xlabel("")
             ax.set_title("Operon codon\ncoadaptation", fontsize=10)
@@ -4456,6 +4462,620 @@ def plot_rp_he_comparison_across_genomes(
     _save_fig(fig, output_path)
 
 
+# ─── Advanced comparative plots ─────────────────────────────────────────────
+
+
+def plot_codon_adaptation_fingerprint(
+    sample_data: dict[str, dict],
+    output_path: Path,
+):
+    """Per-amino-acid RSCU radar (spider) plots overlaying all genomes.
+
+    Each subplot is one amino acid family.  The vertices of the radar are the
+    synonymous codons.  Each genome is a polygon, so you can see at a glance
+    which genomes share codon preferences and where they diverge.
+
+    Scales from 2 to 10+ genomes via a shared color palette and legend.
+
+    Args:
+        sample_data: Per-sample data from _load_sample_data().
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    sids = sorted(sample_data.keys())
+
+    # Collect genome-wide RSCU profiles
+    profiles: dict[str, dict[str, float]] = {}
+    for sid in sids:
+        df = sample_data[sid].get("rscu_median")
+        if df is not None:
+            rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
+            if rscu_cols and len(df) > 0:
+                profiles[sid] = {c: df[c].iloc[0] for c in rscu_cols}
+
+    if len(profiles) < 2:
+        return
+
+    n_samples = len(profiles)
+    palette = sns.color_palette("Set2", n_samples)
+    sid_colors = {sid: palette[i] for i, sid in enumerate(sorted(profiles))}
+
+    # Only include amino acid families with ≥3 codons (radar needs ≥3 vertices)
+    aa_families = {aa: codons for aa, codons in AMINO_ACID_FAMILIES.items()
+                   if len(codons) >= 3}
+    # Also require all genomes to have data for these codons
+    valid_families = {}
+    for aa, codons in aa_families.items():
+        shared = [c for c in codons if all(c in p for p in profiles.values())]
+        if len(shared) >= 3:
+            valid_families[aa] = shared
+
+    if not valid_families:
+        return
+
+    n_aa = len(valid_families)
+    ncols = min(n_aa, 4)
+    nrows = (n_aa + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows),
+                             subplot_kw={"projection": "polar"})
+    if nrows == 1 and ncols == 1:
+        axes = np.array([[axes]])
+    elif nrows == 1 or ncols == 1:
+        axes = np.atleast_2d(axes)
+        if nrows == 1:
+            axes = axes.reshape(1, -1)
+        else:
+            axes = axes.reshape(-1, 1)
+
+    aa_list = sorted(valid_families.keys())
+
+    for idx, aa in enumerate(aa_list):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
+        codons = valid_families[aa]
+        n_codons = len(codons)
+        angles = np.linspace(0, 2 * np.pi, n_codons, endpoint=False).tolist()
+        angles += angles[:1]  # close the polygon
+
+        # Codon labels (just the triplet)
+        labels = [c.split("-")[-1] for c in codons]
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(labels, fontsize=7)
+
+        for sid in sorted(profiles):
+            vals = [profiles[sid].get(c, 0) for c in codons]
+            vals += vals[:1]  # close
+            ax.plot(angles, vals, linewidth=1.2, alpha=0.8,
+                    color=sid_colors[sid], label=sid)
+            ax.fill(angles, vals, alpha=0.08, color=sid_colors[sid])
+
+        # Reference circle at RSCU=1 (no bias)
+        ref = [1.0] * (n_codons + 1)
+        ax.plot(angles, ref, "k:", linewidth=0.6, alpha=0.4)
+
+        ax.set_title(aa, fontsize=10, pad=12)
+        ax.set_ylim(0, None)
+
+    # Turn off unused axes
+    for idx in range(n_aa, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].set_visible(False)
+
+    # Single shared legend
+    handles = [plt.Line2D([0], [0], color=sid_colors[s], linewidth=1.5) for s in sorted(profiles)]
+    fig.legend(handles, sorted(profiles), loc="lower center",
+               ncol=min(n_samples, 6), fontsize=7,
+               bbox_to_anchor=(0.5, -0.02))
+
+    fig.suptitle("Codon adaptation fingerprints by amino acid family",
+                 fontsize=13, y=1.02)
+    try:
+        fig.tight_layout(rect=[0, 0.04, 1, 0.98])
+    except (ValueError, UserWarning):
+        pass
+    _save_fig(fig, output_path)
+
+
+def plot_translational_selection_landscape(
+    sample_data: dict[str, dict],
+    output_path: Path,
+):
+    """Multi-panel translational selection landscape comparing genomes.
+
+    Panel 1: ENC vs GC3 scatter with Wright's expected curve per genome.
+             Points below the curve have stronger translational selection.
+    Panel 2: Fop/CAI/MELP box distributions across genomes.
+    Panel 3: Delta-RSCU heatmap — for each codon, the range (max-min) of
+             genome-wide RSCU across all samples, sorted by magnitude.
+
+    Args:
+        sample_data: Per-sample data from _load_sample_data().
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    sids = sorted(sample_data.keys())
+    n_samples = len(sids)
+    palette = sns.color_palette("Set2", n_samples)
+    sid_colors = dict(zip(sids, palette))
+
+    panels_present = []
+
+    # ── Data for Panel 1: ENC vs GC3 ────────────────────────────────
+    enc_frames = {}
+    for sid in sids:
+        enc = sample_data[sid].get("enc")
+        if enc is not None and "ENC" in enc.columns:
+            gc3_col = None
+            for candidate in ("GC3s", "GC3", "gc3s", "gc3"):
+                if candidate in enc.columns:
+                    gc3_col = candidate
+                    break
+            if gc3_col is not None:
+                sub = enc[["ENC", gc3_col]].dropna()
+                if len(sub) > 5:
+                    sub = sub.rename(columns={gc3_col: "GC3"})
+                    enc_frames[sid] = sub
+    if len(enc_frames) >= 2:
+        panels_present.append("enc_gc3")
+
+    # ── Data for Panel 2: expression metric distributions ────────────
+    expr_frames = {}
+    metric_cols = []
+    for sid in sids:
+        expr = sample_data[sid].get("expression")
+        if expr is not None:
+            available = [c for c in ("Fop", "CAI", "MELP") if c in expr.columns]
+            if available:
+                expr_frames[sid] = expr
+                metric_cols = list(set(metric_cols) | set(available))
+    if len(expr_frames) >= 2 and metric_cols:
+        panels_present.append("expr_dist")
+        metric_cols = sorted(set(metric_cols) & {"Fop", "CAI", "MELP"})
+
+    # ── Data for Panel 3: RSCU range heatmap ─────────────────────────
+    rscu_profiles: dict[str, dict[str, float]] = {}
+    for sid in sids:
+        df = sample_data[sid].get("rscu_median")
+        if df is not None:
+            cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
+            if cols and len(df) > 0:
+                rscu_profiles[sid] = {c: df[c].iloc[0] for c in cols}
+    if len(rscu_profiles) >= 2:
+        panels_present.append("rscu_range")
+
+    if not panels_present:
+        return
+
+    n_panels = len(panels_present)
+    fig_w = 5 * n_panels
+    fig, axes = plt.subplots(1, n_panels, figsize=(fig_w, 5.5))
+    if n_panels == 1:
+        axes = [axes]
+    panel_idx = 0
+
+    # ── Panel 1: ENC vs GC3 with Wright's curve ─────────────────────
+    if "enc_gc3" in panels_present:
+        ax = axes[panel_idx]
+        panel_idx += 1
+
+        # Wright's expected ENC curve: ENC = 2 + s + (29 / (s^2 + (1-s)^2))
+        # where s = GC3
+        gc3_range = np.linspace(0.01, 0.99, 200)
+        enc_expected = 2 + gc3_range + 29 / (gc3_range**2 + (1 - gc3_range)**2)
+        ax.plot(gc3_range, enc_expected, "k-", linewidth=1.5, alpha=0.6,
+                label="Wright's expectation")
+
+        for sid, sub in enc_frames.items():
+            # Subsample if too many genes for clarity
+            if len(sub) > 2000:
+                sub = sub.sample(2000, random_state=42)
+            ax.scatter(sub["GC3"], sub["ENC"], s=6, alpha=0.25,
+                       color=sid_colors[sid], label=sid, rasterized=True)
+
+        ax.set_xlabel("GC3s content")
+        ax.set_ylabel("Effective Number of Codons (ENC)")
+        ax.set_title("ENC vs GC3")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(20, 62)
+        ax.legend(fontsize=6, markerscale=2, loc="lower left")
+
+    # ── Panel 2: Expression metric distributions ─────────────────────
+    if "expr_dist" in panels_present:
+        ax = axes[panel_idx]
+        panel_idx += 1
+
+        melt_rows = []
+        for sid, expr_df in expr_frames.items():
+            for mc in metric_cols:
+                if mc in expr_df.columns:
+                    for v in expr_df[mc].dropna():
+                        melt_rows.append({"sample_id": sid, "metric": mc, "value": v})
+
+        if melt_rows:
+            melt_df = pd.DataFrame(melt_rows)
+            sns.boxplot(data=melt_df, x="metric", y="value", hue="sample_id",
+                        palette=sid_colors, ax=ax, linewidth=0.8,
+                        fliersize=1.5, showfliers=True)
+            ax.set_xlabel("")
+            ax.set_ylabel("Score")
+            ax.set_title("Translational selection metrics")
+            ax.legend(fontsize=6, loc="best", ncol=max(1, n_samples // 3))
+
+    # ── Panel 3: RSCU range heatmap ──────────────────────────────────
+    if "rscu_range" in panels_present:
+        ax = axes[panel_idx]
+        panel_idx += 1
+
+        common_cols = sorted(set.intersection(*[set(p.keys()) for p in rscu_profiles.values()]))
+        if len(common_cols) >= 10:
+            # Build matrix: rows = codons, columns = samples
+            mat = pd.DataFrame({sid: {c: rscu_profiles[sid].get(c, np.nan)
+                                       for c in common_cols}
+                                for sid in sorted(rscu_profiles)})
+            # Compute range per codon and sort by it
+            codon_range = mat.max(axis=1) - mat.min(axis=1)
+            top_codons = codon_range.sort_values(ascending=False).head(30).index.tolist()
+
+            if top_codons:
+                heatmap_data = mat.loc[top_codons]
+                sns.heatmap(heatmap_data, ax=ax, cmap="YlOrRd", linewidths=0.3,
+                            linecolor="white", cbar_kws={"label": "RSCU", "shrink": 0.7})
+                ax.set_title("Top 30 most variable codons")
+                ax.set_ylabel("")
+                ax.tick_params(axis="y", labelsize=7)
+                ax.tick_params(axis="x", labelsize=7, rotation=30)
+
+    fig.suptitle("Translational selection landscape", fontsize=13, y=1.02)
+    try:
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+    except (ValueError, UserWarning):
+        pass
+    _save_fig(fig, output_path)
+
+
+def plot_hgt_ecology_advanced(
+    sample_data: dict[str, dict],
+    output_path: Path,
+):
+    """Advanced HGT and mobile element ecology comparison.
+
+    Panel 1: Mahalanobis distance density curves overlaid per genome,
+             with vertical threshold lines.
+    Panel 2: Per-genome stacked bar of HGT fraction by source category
+             (HGT candidates, mobilome, phage) as proportion of total CDS.
+    Panel 3: Genome-vs-genome RSCU deviation scatter — for each gene flagged
+             as HGT in at least one genome, shows how its RSCU deviates
+             from the host genome average.
+
+    Args:
+        sample_data: Per-sample data from _load_sample_data().
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    sids = sorted(sample_data.keys())
+    n_samples = len(sids)
+    palette = sns.color_palette("Set2", n_samples)
+    sid_colors = dict(zip(sids, palette))
+
+    panels_present = []
+
+    # ── Data for Panel 1: Mahalanobis density ────────────────────────
+    maha_data: dict[str, np.ndarray] = {}
+    for sid in sids:
+        hgt = sample_data[sid].get("hgt")
+        if hgt is not None and "mahalanobis_dist" in hgt.columns:
+            vals = hgt["mahalanobis_dist"].dropna().values
+            if len(vals) > 10:
+                maha_data[sid] = vals
+    if len(maha_data) >= 2:
+        panels_present.append("maha_density")
+
+    # ── Data for Panel 2: Foreign DNA burden fractions ───────────────
+    burden_rows = []
+    for sid in sids:
+        enc_df = sample_data[sid].get("enc")
+        total_cds = len(enc_df) if enc_df is not None else 0
+        if total_cds == 0:
+            # Fallback: count genes in expression
+            expr = sample_data[sid].get("expression")
+            total_cds = len(expr) if expr is not None else 0
+        if total_cds == 0:
+            continue
+
+        n_hgt = 0
+        hgt = sample_data[sid].get("hgt")
+        if hgt is not None and "hgt_flag" in hgt.columns:
+            n_hgt = int(hgt["hgt_flag"].sum())
+
+        n_mobilome = 0
+        n_phage = 0
+        phage = sample_data[sid].get("phage_mobile")
+        if phage is not None:
+            for col in ("is_mobilome", "mobilome"):
+                if col in phage.columns:
+                    n_mobilome = int(phage[col].astype(bool).sum())
+                    break
+            for col in ("is_phage_related", "is_phage", "phage_related"):
+                if col in phage.columns:
+                    n_phage = int(phage[col].astype(bool).sum())
+                    break
+
+        if n_hgt + n_mobilome + n_phage > 0:
+            burden_rows.append({
+                "sample_id": sid,
+                "HGT": n_hgt / total_cds * 100,
+                "Mobilome": n_mobilome / total_cds * 100,
+                "Phage": n_phage / total_cds * 100,
+            })
+    if len(burden_rows) >= 2:
+        panels_present.append("burden_frac")
+
+    # ── Data for Panel 3: HGT gene RSCU deviation ───────────────────
+    hgt_deviation_data = []
+    for sid in sids:
+        hgt = sample_data[sid].get("hgt")
+        rscu_median_df = sample_data[sid].get("rscu_median")
+        if hgt is None or rscu_median_df is None:
+            continue
+        if "mahalanobis_dist" not in hgt.columns or "hgt_flag" not in hgt.columns:
+            continue
+        hgt_genes = hgt[hgt["hgt_flag"] == 1]
+        if len(hgt_genes) == 0:
+            continue
+        # Use Mahalanobis distance as the deviation metric
+        for _, row in hgt_genes.iterrows():
+            hgt_deviation_data.append({
+                "sample_id": sid,
+                "mahalanobis_dist": row["mahalanobis_dist"],
+                "gene": row.get("gene", ""),
+            })
+    if len(hgt_deviation_data) > 5:
+        panels_present.append("hgt_deviation")
+
+    if not panels_present:
+        return
+
+    n_panels = len(panels_present)
+    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 5))
+    if n_panels == 1:
+        axes = [axes]
+    panel_idx = 0
+
+    # ── Panel 1: Mahalanobis density curves ──────────────────────────
+    if "maha_density" in panels_present:
+        ax = axes[panel_idx]
+        panel_idx += 1
+        for sid, vals in maha_data.items():
+            sns.kdeplot(vals, ax=ax, color=sid_colors[sid], label=sid,
+                        linewidth=1.5, fill=True, alpha=0.15)
+        # Common thresholds
+        ax.axvline(3.0, color="orange", linestyle="--", linewidth=0.8, alpha=0.6)
+        ax.axvline(4.0, color="red", linestyle="--", linewidth=0.8, alpha=0.6)
+        ax.text(3.05, ax.get_ylim()[1] * 0.9, "3σ", fontsize=7, color="orange")
+        ax.text(4.05, ax.get_ylim()[1] * 0.9, "4σ", fontsize=7, color="red")
+        ax.set_xlabel("Mahalanobis distance")
+        ax.set_ylabel("Density")
+        ax.set_title("HGT detection\ndeviation landscape")
+        ax.legend(fontsize=6, loc="upper right")
+
+    # ── Panel 2: Foreign DNA burden stacked bars ─────────────────────
+    if "burden_frac" in panels_present:
+        ax = axes[panel_idx]
+        panel_idx += 1
+        bdf = pd.DataFrame(burden_rows)
+        x = np.arange(len(bdf))
+        cat_colors = {"HGT": "#d9a032", "Mobilome": "#e84040", "Phage": "#9467bd"}
+        bottom = np.zeros(len(bdf))
+        for cat in ("HGT", "Mobilome", "Phage"):
+            vals = bdf[cat].values
+            ax.bar(x, vals, bottom=bottom, label=cat, color=cat_colors[cat],
+                   edgecolor="white", linewidth=0.5, width=0.6)
+            bottom += vals
+        ax.set_xticks(x)
+        ax.set_xticklabels(bdf["sample_id"], rotation=30, ha="right", fontsize=8)
+        ax.set_ylabel("% of total CDS")
+        ax.set_title("Foreign DNA burden")
+        ax.legend(fontsize=7)
+
+    # ── Panel 3: HGT gene deviation scatter ──────────────────────────
+    if "hgt_deviation" in panels_present:
+        ax = axes[panel_idx]
+        panel_idx += 1
+        hgt_df = pd.DataFrame(hgt_deviation_data)
+        for sid in sids:
+            sub = hgt_df[hgt_df["sample_id"] == sid]
+            if sub.empty:
+                continue
+            jitter = np.random.default_rng(42).normal(0, 0.1, len(sub))
+            x_pos = list(sids).index(sid) + jitter
+            ax.scatter(x_pos, sub["mahalanobis_dist"], s=12, alpha=0.5,
+                       color=sid_colors[sid], edgecolors="none", rasterized=True)
+        ax.axhline(3.0, color="orange", linestyle="--", linewidth=0.8, alpha=0.6)
+        ax.axhline(4.0, color="red", linestyle="--", linewidth=0.8, alpha=0.6)
+        ax.set_xticks(range(len(sids)))
+        ax.set_xticklabels(sids, rotation=30, ha="right", fontsize=8)
+        ax.set_ylabel("Mahalanobis distance")
+        ax.set_title("HGT gene CU deviation\nper genome")
+
+    fig.suptitle("HGT & mobile element ecology", fontsize=13, y=1.02)
+    try:
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+    except (ValueError, UserWarning):
+        pass
+    _save_fig(fig, output_path)
+
+
+def plot_growth_cub_strategy(
+    sample_data: dict[str, dict],
+    output_path: Path,
+):
+    """Growth rate prediction and CUB strategy comparison across genomes.
+
+    Panel 1: gRodon2 predicted doubling time with CIs, color-coded by
+             growth class (fast/moderate/slow).
+    Panel 2: Ribosomal vs whole-genome RSCU divergence — Euclidean distance
+             between ribosomal protein RSCU and genome-wide median RSCU,
+             plotted against predicted doubling time.  Fast growers should
+             show larger divergence (stronger RP codon optimization).
+    Panel 3: Codon optimization index (Fop) distributions per genome.
+             Fast growers tend to have a longer right tail.
+
+    Args:
+        sample_data: Per-sample data from _load_sample_data().
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    sids = sorted(sample_data.keys())
+    n_samples = len(sids)
+    palette = sns.color_palette("Set2", n_samples)
+    sid_colors = dict(zip(sids, palette))
+    class_colors = {"fast": "#4CAF50", "moderate": "#FF9800", "slow": "#F44336", "very_slow": "#9E9E9E"}
+
+    panels_present = []
+
+    # ── Data for Panel 1: gRodon2 predictions ────────────────────────
+    grodon_rows = []
+    for sid in sids:
+        g2 = sample_data[sid].get("grodon2")
+        if isinstance(g2, dict) and g2.get("predicted_doubling_time_hours") is not None:
+            grodon_rows.append({
+                "sample_id": sid,
+                "d": g2["predicted_doubling_time_hours"],
+                "lo": g2.get("lower_ci_hours", g2["predicted_doubling_time_hours"]),
+                "hi": g2.get("upper_ci_hours", g2["predicted_doubling_time_hours"]),
+                "gc": g2.get("growth_class", "unknown"),
+                "CUBHE": g2.get("CUBHE", 0),
+                "ConsistencyHE": g2.get("ConsistencyHE", 0),
+            })
+    if len(grodon_rows) >= 2:
+        panels_present.append("grodon")
+
+    # ── Data for Panel 2: RP vs genome RSCU divergence ───────────────
+    rp_div_rows = []
+    for sid in sids:
+        rp_df = sample_data[sid].get("rscu_ribosomal")
+        gen_df = sample_data[sid].get("rscu_median")
+        if rp_df is None or gen_df is None:
+            continue
+        rp_cols = [c for c in RSCU_COLUMN_NAMES if c in rp_df.columns and c in gen_df.columns]
+        if len(rp_cols) < 10 or len(rp_df) == 0 or len(gen_df) == 0:
+            continue
+
+        rp_vals = np.array([rp_df[c].iloc[0] for c in rp_cols])
+        gen_vals = np.array([gen_df[c].iloc[0] for c in rp_cols])
+        mask = np.isfinite(rp_vals) & np.isfinite(gen_vals)
+        if mask.sum() < 10:
+            continue
+        dist = np.sqrt(np.sum((rp_vals[mask] - gen_vals[mask]) ** 2))
+
+        # Get doubling time if available
+        g2 = sample_data[sid].get("grodon2")
+        d_time = g2.get("predicted_doubling_time_hours") if isinstance(g2, dict) else None
+
+        rp_div_rows.append({
+            "sample_id": sid,
+            "rp_genome_dist": dist,
+            "doubling_time": d_time,
+        })
+    if len(rp_div_rows) >= 2:
+        panels_present.append("rp_divergence")
+
+    # ── Data for Panel 3: Fop distributions ──────────────────────────
+    fop_frames: dict[str, pd.Series] = {}
+    for sid in sids:
+        expr = sample_data[sid].get("expression")
+        if expr is not None and "Fop" in expr.columns:
+            vals = expr["Fop"].dropna()
+            if len(vals) > 10:
+                fop_frames[sid] = vals
+    if len(fop_frames) >= 2:
+        panels_present.append("fop_dist")
+
+    if not panels_present:
+        return
+
+    n_panels = len(panels_present)
+    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 5.5))
+    if n_panels == 1:
+        axes = [axes]
+    panel_idx = 0
+
+    # ── Panel 1: gRodon2 doubling time with CIs ─────────────────────
+    if "grodon" in panels_present:
+        ax = axes[panel_idx]
+        panel_idx += 1
+        gdf = pd.DataFrame(grodon_rows).sort_values("d", ascending=True)
+        y_pos = np.arange(len(gdf))
+        bar_colors = [class_colors.get(gc, "#9E9E9E") for gc in gdf["gc"]]
+        xerr_lo = gdf["d"].values - gdf["lo"].values
+        xerr_hi = gdf["hi"].values - gdf["d"].values
+
+        ax.barh(y_pos, gdf["d"].values, height=0.55, color=bar_colors,
+                alpha=0.85, edgecolor="black", linewidth=0.6)
+        ax.errorbar(gdf["d"].values, y_pos, xerr=[xerr_lo, xerr_hi],
+                    fmt="none", ecolor="black", capsize=3, capthick=0.8)
+        ax.axvline(2, color="green", linestyle="--", alpha=0.35, linewidth=0.8)
+        ax.axvline(5, color="orange", linestyle="--", alpha=0.35, linewidth=0.8)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(gdf["sample_id"], fontsize=8)
+        ax.set_xlabel("Predicted doubling time (h)")
+        ax.set_title("gRodon2 growth rate")
+
+    # ── Panel 2: RP divergence vs doubling time ──────────────────────
+    if "rp_divergence" in panels_present:
+        ax = axes[panel_idx]
+        panel_idx += 1
+        rpdf = pd.DataFrame(rp_div_rows)
+        has_dt = rpdf["doubling_time"].notna().sum() >= 2
+
+        if has_dt:
+            for _, row in rpdf.iterrows():
+                sid = row["sample_id"]
+                ax.scatter(row["doubling_time"], row["rp_genome_dist"],
+                           s=70, color=sid_colors.get(sid, "gray"),
+                           edgecolors="black", linewidth=0.6, zorder=3)
+                ax.annotate(sid, (row["doubling_time"], row["rp_genome_dist"]),
+                            fontsize=6, xytext=(4, 4), textcoords="offset points")
+            ax.set_xlabel("Predicted doubling time (h)")
+        else:
+            # No doubling time — just bar chart of divergence
+            for i, (_, row) in enumerate(rpdf.iterrows()):
+                sid = row["sample_id"]
+                ax.barh(i, row["rp_genome_dist"], height=0.5,
+                        color=sid_colors.get(sid, "gray"),
+                        edgecolor="black", linewidth=0.6)
+            ax.set_yticks(range(len(rpdf)))
+            ax.set_yticklabels(rpdf["sample_id"], fontsize=8)
+            ax.set_xlabel("Euclidean distance")
+
+        ax.set_ylabel("RP–genome RSCU distance")
+        ax.set_title("Ribosomal protein\ncodon optimization")
+
+    # ── Panel 3: Fop distributions ───────────────────────────────────
+    if "fop_dist" in panels_present:
+        ax = axes[panel_idx]
+        panel_idx += 1
+        fop_rows = []
+        for sid, vals in fop_frames.items():
+            for v in vals:
+                fop_rows.append({"sample_id": sid, "Fop": v})
+        fop_df = pd.DataFrame(fop_rows)
+        sns.violinplot(data=fop_df, x="sample_id", y="Fop",
+                       hue="sample_id", palette=sid_colors, ax=ax,
+                       inner="box", cut=0, linewidth=0.8, legend=False)
+        ax.set_xlabel("")
+        ax.set_ylabel("Fop (fraction optimal codons)")
+        ax.set_title("Codon optimization\ndistributions")
+        ax.tick_params(axis="x", rotation=30, labelsize=8)
+
+    fig.suptitle("Growth rate & codon usage strategy", fontsize=13, y=1.02)
+    try:
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+    except (ValueError, UserWarning):
+        pass
+    _save_fig(fig, output_path)
+
+
 def generate_pairwise_comparison_plots(
     sample_outputs: dict[str, dict[str, Path]],
     combined_rscu: pd.DataFrame,
@@ -4549,6 +5169,40 @@ def generate_pairwise_comparison_plots(
         outputs["rp_he_across_genomes"] = p.with_suffix(".png")
     except Exception as e:
         logger.warning("RP/HE comparison across genomes failed: %s", e)
+
+    # ── Advanced comparative plots ──────────────────────────────────
+
+    # Codon adaptation fingerprint radar
+    try:
+        p = plot_dir / "codon_adaptation_fingerprint"
+        plot_codon_adaptation_fingerprint(sample_data, p)
+        outputs["codon_adaptation_fingerprint"] = p.with_suffix(".png")
+    except Exception as e:
+        logger.warning("Codon adaptation fingerprint plot failed: %s", e, exc_info=True)
+
+    # Translational selection landscape
+    try:
+        p = plot_dir / "translational_selection_landscape"
+        plot_translational_selection_landscape(sample_data, p)
+        outputs["translational_selection_landscape"] = p.with_suffix(".png")
+    except Exception as e:
+        logger.warning("Translational selection landscape plot failed: %s", e, exc_info=True)
+
+    # HGT & mobile element ecology (advanced)
+    try:
+        p = plot_dir / "hgt_ecology_advanced"
+        plot_hgt_ecology_advanced(sample_data, p)
+        outputs["hgt_ecology_advanced"] = p.with_suffix(".png")
+    except Exception as e:
+        logger.warning("HGT ecology advanced plot failed: %s", e, exc_info=True)
+
+    # Growth rate & CUB strategy
+    try:
+        p = plot_dir / "growth_cub_strategy"
+        plot_growth_cub_strategy(sample_data, p)
+        outputs["growth_cub_strategy"] = p.with_suffix(".png")
+    except Exception as e:
+        logger.warning("Growth/CUB strategy plot failed: %s", e, exc_info=True)
 
     # gRodon2 batch comparison
     grodon_data = {
