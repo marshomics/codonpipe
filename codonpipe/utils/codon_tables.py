@@ -111,3 +111,20 @@ for _aa, _codons in AA_CODON_GROUPS.items():
 def dna_to_rna(seq: str) -> str:
     """Convert a DNA sequence to RNA."""
     return seq.upper().replace("T", "U")
+
+
+def codon_to_col_name(codon: str, aa: str) -> str:
+    """Convert a codon and amino acid to the RSCU column name convention.
+
+    Serine, Leucine, and Arginine are split into two families:
+        Ser4 (UCN) vs Ser2 (AGY), Leu4 (CUN) vs Leu2 (UUN),
+        Arg4 (CGN) vs Arg2 (AGR).
+    """
+    if aa == "Ser":
+        return f"Ser4-{codon}" if codon.startswith("UC") else f"Ser2-{codon}"
+    elif aa == "Leu":
+        return f"Leu4-{codon}" if codon.startswith("CU") else f"Leu2-{codon}"
+    elif aa == "Arg":
+        return f"Arg4-{codon}" if codon.startswith("CG") else f"Arg2-{codon}"
+    else:
+        return f"{aa}-{codon}"
