@@ -294,20 +294,22 @@ def run_single_genome(
     else:
         logger.info("[Step 6/12] Skipping expression analysis (no ribosomal proteins found)")
 
-    # ── Step 7: Pathway enrichment ───────────────────────────────────────
+    # ── Step 7: Pathway enrichment (RP-based tiers) ─────────────────────
     enrichment_results = {}
     if expr_df is not None and kofam_df is not None and not kofam_df.empty:
-        logger.info("[Step 7/12] Running pathway enrichment (hypergeometric test)")
+        logger.info("[Step 7/12] Running pathway enrichment (hypergeometric test, RP-based tiers)")
         try:
             enrich_outputs = run_enrichment_analysis(
                 expr_df, kofam_df, output_dir, sample_id,
                 kegg_ko_pathway_file=kegg_ko_pathway,
             )
             all_outputs.update(enrich_outputs)
-            # Load enrichment results for plotting
+            # Load enrichment results for plotting.  Prefix with "rp_" so
+            # filenames and titles clearly distinguish RP-based enrichment
+            # from ACE-based enrichment produced at step 9b.
             for key, path in enrich_outputs.items():
                 if key.startswith("enrichment_") and path.exists():
-                    enrichment_results[key] = pd.read_csv(path, sep="\t")
+                    enrichment_results[f"rp_{key}"] = pd.read_csv(path, sep="\t")
         except Exception as e:
             logger.warning("Pathway enrichment failed: %s. Continuing.", e, exc_info=True)
     else:
@@ -398,9 +400,9 @@ def run_single_genome(
             # as the primary expression metric.  The convergence loop uses
             # cosine similarity (composition-independent), so ace_melp
             # doesn't degrade in high-GC organisms the way CAI does.
-            # expression_class is reclassified from ace_expression_class
-            # when ACE is available; the ribosomal-reference MELP class
-            # is preserved as melp_rp_class for comparison.
+            # expression_class is reclassified from ace_MELP_class when ACE
+            # is available; the RP-based class is preserved as
+            # expression_class_rp for comparison.
             if ace_scores_df is not None and expr_df is not None and not expr_df.empty:
                 try:
                     # Preserve the original RP-based expression_class
@@ -411,12 +413,12 @@ def run_single_genome(
 
                     expr_df = expr_df.merge(
                         ace_scores_df[["gene", "ace_melp", "ace_cai",
-                                       "ace_expression_class", "in_ace_core"]],
+                                       "ace_MELP_class", "in_ace_core"]],
                         on="gene", how="left",
                     )
 
                     # Promote ACE-MELP classification as the primary
-                    expr_df["expression_class"] = expr_df["ace_expression_class"].fillna(
+                    expr_df["expression_class"] = expr_df["ace_MELP_class"].fillna(
                         expr_df.get("expression_class_rp", "unknown")
                     )
 
@@ -442,25 +444,32 @@ def run_single_genome(
     if (
         not skip_ace
         and expr_df is not None
-        and "ace_expression_class" in (expr_df.columns if expr_df is not None else [])
+        and "ace_MELP_class" in (expr_df.columns if expr_df is not None else [])
         and kofam_df is not None
         and not kofam_df.empty
     ):
-        logger.info("[Step 9b/12] Re-running pathway enrichment on ACE-derived expression tiers")
+        logger.info("[Step 9b/12] Re-running pathway enrichment on ACE-MELP expression tiers")
         try:
             ace_enrich_outputs = run_enrichment_analysis(
                 expr_df, kofam_df, output_dir, sample_id,
                 kegg_ko_pathway_file=kegg_ko_pathway,
-                metrics=["ace_expression"],
+                metrics=["ace_MELP"],
                 output_subdir="enrichment_ace",
             )
             all_outputs.update({
                 f"ace_{k}": v for k, v in ace_enrich_outputs.items()
             })
-            # Reload enrichment results for plotting
+            # Load ACE enrichment results for plotting.  The enrichment
+            # module produces keys like "enrichment_ace_MELP_high";
+            # prefix with "ace_" for plotting so filenames read
+            # "ace_enrichment_MELP_high", paralleling "rp_enrichment_MELP_high".
             for key, path in ace_enrich_outputs.items():
                 if key.startswith("enrichment_") and path.exists():
-                    enrichment_results[f"ace_{key}"] = pd.read_csv(path, sep="\t")
+                    # Strip the "ace_" from within the metric name to avoid
+                    # double-prefixing: enrichment_ace_MELP_high → enrichment_MELP_high
+                    clean_key = key.replace("enrichment_ace_MELP_",
+                                           "enrichment_MELP_")
+                    enrichment_results[f"ace_{clean_key}"] = pd.read_csv(path, sep="\t")
         except Exception as e:
             logger.warning("ACE-tier pathway enrichment failed: %s. Continuing.", e, exc_info=True)
 
@@ -488,7 +497,7 @@ def run_single_genome(
 
             # Delta RSCU with ACE expression tiers
             if expr_df is not None:
-                for class_col in ["expression_class", "ace_expression_class"]:
+                for class_col in ["expression_class", "ace_MELP_class"]:
                     if class_col in expr_df.columns:
                         delta_df = compute_delta_rscu(rscu_gene_df, expr_df, class_col)
                         if not delta_df.empty:
