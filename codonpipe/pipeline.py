@@ -601,6 +601,7 @@ def run_single_genome(
             gff_path=resolved_gff,
             gmm_cluster_rscu=gmm_cluster_rscu,
             gmm_cluster_gene_ids=gmm_cluster_gene_ids,
+            gmm_cluster_ids_path=gmm_cluster_ids_path,
         )
         # Normalize keys and flatten nested dicts for plotting compatibility
         _bio_key_map = {
