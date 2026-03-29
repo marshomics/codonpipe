@@ -15,9 +15,8 @@ Requirements:
   - R >= 4.0
   - R packages: gRodon (v2+), Biostrings, coRdon, matrixStats, dplyr
 
-If R is present but gRodon2 is not installed, the module will attempt to
-install gRodon2 and its dependencies automatically. If R itself is not
-available, predictions are silently skipped.
+If R or gRodon2 is not installed the module logs a warning and returns None.
+Run ``codonpipe install-grodon`` to install gRodon2 and its dependencies.
 """
 
 from __future__ import annotations
@@ -38,10 +37,11 @@ logger = logging.getLogger("codonpipe")
 _GRODON_AVAILABLE: bool | None = None  # cached after first probe
 
 # R script that installs gRodon2 and its Bioconductor dependencies.
-# Runs only when gRodon2 is missing but R is on PATH.
+# Invoked by ``codonpipe install-grodon`` (not at runtime).
 _INSTALL_R_SCRIPT = r"""
 # Install gRodon2 and dependencies for CodonPipe
-# Called automatically when gRodon2 is not found.
+# Run via:  codonpipe install-grodon
+#      or:  Rscript --no-save --no-restore <this_file>
 
 local({
   # 1. BiocManager (needed to install Bioconductor packages)
@@ -81,10 +81,15 @@ local({
 
 
 def _probe_grodon(rscript: str) -> str | None:
-    """Try to load gRodon2 in R. Returns the version string or None."""
+    """Try to load gRodon2 in R. Returns the version string or None.
+
+    Uses ``--no-save --no-restore`` instead of ``--vanilla`` so that
+    ``.Renviron`` and ``.Rprofile`` are still read — this is critical
+    for finding packages in user library paths (R_LIBS_USER).
+    """
     try:
         result = subprocess.run(
-            [rscript, "--vanilla", "-e",
+            [rscript, "--no-save", "--no-restore", "-e",
              "library(gRodon); cat(packageVersion('gRodon')[[1]], sep='.')"],
             capture_output=True,
             text=True,
@@ -104,6 +109,8 @@ def install_grodon(timeout: int = 600) -> bool:
     Biostrings, coRdon, matrixStats, dplyr, jsonlite, remotes,
     and gRodon2 from GitHub (jlw-ecoevo/gRodon2).
 
+    Called by ``codonpipe install-grodon``. Not called at runtime.
+
     Args:
         timeout: Maximum seconds to allow for the install process.
 
@@ -112,38 +119,50 @@ def install_grodon(timeout: int = 600) -> bool:
     """
     rscript = shutil.which("Rscript")
     if rscript is None:
-        logger.warning("gRodon2 install: Rscript not found on PATH")
+        logger.error("Rscript not found on PATH. Install R (>= 4.0) first.")
         return False
 
-    logger.info("gRodon2: package not found — attempting automatic installation")
+    logger.info("Installing gRodon2 and R dependencies...")
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".R", delete=False) as f:
         f.write(_INSTALL_R_SCRIPT)
         script_path = f.name
 
     try:
+        # Use --no-save --no-restore (not --vanilla) so .Renviron is read
+        # and R_LIBS_USER is respected for both install and later loading.
         result = subprocess.run(
-            [rscript, "--vanilla", script_path],
+            [rscript, "--no-save", "--no-restore", script_path],
             capture_output=True,
             text=True,
             timeout=timeout,
         )
         if result.returncode == 0:
-            logger.info("gRodon2: installation succeeded")
+            logger.info("gRodon2 installation succeeded")
             logger.debug("gRodon2 install stdout:\n%s", result.stdout)
-            return True
+            # Verify the install is loadable
+            version = _probe_grodon(rscript)
+            if version is not None:
+                logger.info("gRodon2 version %s is now available", version)
+                return True
+            else:
+                logger.error(
+                    "gRodon2 install script succeeded but the package "
+                    "could not be loaded. Check R library paths."
+                )
+                return False
         else:
-            logger.warning(
-                "gRodon2: installation failed (exit %d). stderr:\n%s",
+            logger.error(
+                "gRodon2 installation failed (exit %d).\nstderr:\n%s",
                 result.returncode,
-                result.stderr[:2000],
+                result.stderr[:3000],
             )
             return False
     except subprocess.TimeoutExpired:
-        logger.warning("gRodon2: installation timed out after %d s", timeout)
+        logger.error("gRodon2 installation timed out after %d s", timeout)
         return False
     except (FileNotFoundError, OSError) as e:
-        logger.warning("gRodon2: installation failed: %s", e)
+        logger.error("gRodon2 installation failed: %s", e)
         return False
     finally:
         Path(script_path).unlink(missing_ok=True)
@@ -152,9 +171,8 @@ def install_grodon(timeout: int = 600) -> bool:
 def is_grodon_available() -> bool:
     """Check whether R and gRodon2 are installed and loadable.
 
-    If R is present but gRodon2 is not, attempts to install gRodon2
-    automatically. The result is cached so the install is only
-    attempted once per process.
+    Does NOT attempt installation — run ``codonpipe install-grodon``
+    to set up gRodon2 before using the pipeline.
     """
     global _GRODON_AVAILABLE
     if _GRODON_AVAILABLE is not None:
@@ -166,23 +184,17 @@ def is_grodon_available() -> bool:
         _GRODON_AVAILABLE = False
         return False
 
-    # First, check if gRodon2 is already installed
     version = _probe_grodon(rscript)
     if version is not None:
         logger.info("gRodon2: found version %s", version)
         _GRODON_AVAILABLE = True
-        return True
+    else:
+        logger.info(
+            "gRodon2: R package not loadable; predictions will be skipped. "
+            "Run 'codonpipe install-grodon' to install it."
+        )
+        _GRODON_AVAILABLE = False
 
-    # R is available but gRodon2 is not — try to install it
-    if install_grodon():
-        version = _probe_grodon(rscript)
-        if version is not None:
-            logger.info("gRodon2: version %s now available after auto-install", version)
-            _GRODON_AVAILABLE = True
-            return True
-
-    logger.info("gRodon2: not available after installation attempt; predictions will be skipped")
-    _GRODON_AVAILABLE = False
     return _GRODON_AVAILABLE
 
 
@@ -288,7 +300,7 @@ def run_grodon(
 
     try:
         result = subprocess.run(
-            ["Rscript", "--vanilla", r_script_path, str(ffn_path), json_out_path],
+            ["Rscript", "--no-save", "--no-restore", r_script_path, str(ffn_path), json_out_path],
             capture_output=True,
             text=True,
             timeout=300,  # 5 min should be plenty for a single genome
