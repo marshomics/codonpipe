@@ -376,6 +376,7 @@ def run_single_genome(
                 rscu_gene_df=rscu_gene_df,
                 output_dir=output_dir,
                 sample_id=sample_id,
+                ffn_path=ffn_path,
                 rp_ids_file=rp_ids_file,
                 rp_rscu_df=rp_rscu_df,
                 expr_df=expr_df,
