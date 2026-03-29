@@ -25,6 +25,7 @@ from codonpipe.modules.rscu import count_codons, compute_rscu_from_counts
 from codonpipe.utils.codon_tables import (
     AA_CODON_GROUPS,
     CODON_TABLE_11,
+    MIN_GENE_LENGTH,
     RSCU_COLUMN_NAMES,
     RSCU_COL_TO_CODON,
     SENSE_CODONS,
@@ -33,8 +34,22 @@ from codonpipe.utils.codon_tables import (
 
 logger = logging.getLogger("codonpipe")
 
-# Minimum gene length (nucleotides) for analyses
-MIN_GENE_LENGTH = 240
+# Expression metric preference order — MELP accounts for both codon
+# adaptation and amino acid usage, making it more robust than CAI
+# (especially in high-GC genomes where CAI conflates mutational bias
+# with translational selection).
+_EXPR_METRIC_PREFERENCE = ("MELP", "CAI", "Fop")
+
+
+def _resolve_expression_metric(expr_df: pd.DataFrame) -> str | None:
+    """Return the best available expression metric column in *expr_df*.
+
+    Preference: MELP > CAI > Fop.  Returns ``None`` if none are present.
+    """
+    for col in _EXPR_METRIC_PREFERENCE:
+        if col in expr_df.columns and expr_df[col].notna().sum() > 0:
+            return col
+    return None
 
 # Prefixes commonly prepended to gene IDs in GFF3 ID= attributes
 _GFF_ID_PREFIXES = ("cds-", "gene-", "rna-", "mrna-", "CDS:", "gene:", "cds_", "gene_")
@@ -128,12 +143,17 @@ def detect_hgt_candidates(
     expr_df: pd.DataFrame | None = None,
     sensitivity: str = "moderate",
     expected_hgt_frac: float = 0.05,
+    reference_rscu: dict[str, float] | pd.Series | None = None,
 ) -> pd.DataFrame:
     """Detect horizontal gene transfer (HGT) candidates via Mahalanobis distance.
 
-    Computes Mahalanobis distance of each gene's RSCU vector from the genome mean
-    using robust covariance estimation (LedoitWolf shrinkage). Also computes per-gene
-    GC3 deviation from genome mean and a combined HGT flag using both signals.
+    Computes Mahalanobis distance of each gene's RSCU vector from a reference
+    centroid using robust covariance estimation (LedoitWolf shrinkage). Also
+    computes per-gene GC3 deviation from genome mean and a combined HGT flag.
+
+    When ``reference_rscu`` is provided (e.g. GMM cluster RSCU), distances are
+    measured from that reference instead of the genome mean, making HGT calls
+    relative to the translationally optimised gene pool.
 
     Args:
         rscu_gene_df: Per-gene RSCU table (from compute_rscu_per_gene).
@@ -144,6 +164,10 @@ def detect_hgt_candidates(
         expected_hgt_frac: Expected fraction of horizontally transferred genes
             (default 0.05). Used to compute an adaptive Mahalanobis distance
             threshold targeting this fraction.
+        reference_rscu: Optional reference RSCU centroid (dict or Series keyed by
+            RSCU column names). When provided, Mahalanobis distance is computed
+            from this reference instead of the genome mean. Typically the GMM
+            cluster RSCU from concatenated pooling.
 
     Returns:
         DataFrame with columns: gene, mahalanobis_dist, gc3_deviation, p_value,
@@ -198,8 +222,25 @@ def detect_hgt_candidates(
         cov = np.cov(X.T)
         cov_inv = np.linalg.pinv(cov)
 
-    # Genome mean RSCU
-    mean_rscu = X.mean(axis=0)
+    # Reference centroid: GMM cluster RSCU if provided, else genome mean
+    if reference_rscu is not None:
+        ref_series = pd.Series(reference_rscu) if isinstance(reference_rscu, dict) else reference_rscu
+        # Align to the same RSCU column order used in X
+        ref_vals = np.array([ref_series.get(c, np.nan) for c in rscu_cols])
+        if np.any(np.isnan(ref_vals)):
+            # Fill missing codons with genome mean for those positions
+            genome_mean = X.mean(axis=0)
+            nan_mask = np.isnan(ref_vals)
+            ref_vals[nan_mask] = genome_mean[nan_mask]
+        # If PCA was applied, project reference into PCA space
+        if n_genes < n_features:
+            # pca was fitted above; n_features was updated to PCA dimension
+            ref_vals = pca.transform(ref_vals.reshape(1, -1)).flatten()
+        mean_rscu = ref_vals
+        logger.info("HGT detection: using provided reference RSCU (e.g. GMM cluster) as centroid")
+    else:
+        mean_rscu = X.mean(axis=0)
+        logger.info("HGT detection: using genome mean RSCU as centroid")
 
     # Compute Mahalanobis distance for each gene
     mahal_dists = []
@@ -310,65 +351,96 @@ def detect_hgt_candidates(
 def predict_growth_rate(
     expr_df: pd.DataFrame,
     rp_ids_file: Path | str | None = None,
+    gmm_cluster_gene_ids: list[str] | set[str] | None = None,
 ) -> dict | None:
-    """Predict minimum doubling time from ribosomal protein codon adaptation.
+    """Predict minimum doubling time from codon adaptation of a reference gene set.
 
-    Based on Vieira-Silva & Rocha (2010): predicted doubling time = exp(a + b * mean_CAI_rp)
-    where a=7.15 and b=-7.38 (empirical coefficients from their paper, result in hours).
+    When *gmm_cluster_gene_ids* is provided (from GMM clustering), those genes
+    are used as the reference set.  Otherwise, falls back to ribosomal proteins
+    from *rp_ids_file* or a heuristic name match.
+
+    Uses the best available expression metric (MELP preferred, then CAI, then
+    Fop) and the Vieira-Silva & Rocha (2010) empirical model:
+    ``doubling_time = exp(a + b * mean_metric)``.
+
+    The coefficients (a=7.15, b=-7.38) were calibrated on CAI of ribosomal
+    proteins, but apply equally to MELP and to broader GMM-derived reference
+    sets because both metrics are normalised to [0, 1] with the same biological
+    interpretation (higher = more adapted).
 
     Args:
-        expr_df: Expression table with gene and CAI column.
+        expr_df: Expression table with gene and at least one of MELP, CAI,
+            or Fop columns.
         rp_ids_file: File with ribosomal protein gene IDs (one per line).
-                     If None, uses genes with "ribosomal" or "rp" in name.
+                     Fallback when gmm_cluster_gene_ids is not provided.
+        gmm_cluster_gene_ids: Gene IDs from the GMM optimal cluster (preferred
+                              reference set when available).
 
     Returns:
-        Dict with mean_cai_rp, predicted_doubling_time_hours, n_rp_genes, growth_class.
-        Returns None if no CAI data or RP genes found.
+        Dict with mean_metric, predicted_doubling_time_hours, n_reference_genes,
+        growth_class, expression_metric, reference_set.
+        Returns None if no expression data or reference genes found.
     """
-    if expr_df.empty or "CAI" not in expr_df.columns:
-        logger.warning("No CAI column in expression data; cannot predict growth rate")
+    if expr_df.empty:
+        logger.warning("Empty expression data; cannot predict growth rate")
         return None
 
-    # Identify RP genes
-    rp_genes = set()
-    if rp_ids_file is not None:
-        rp_path = Path(rp_ids_file)
-        if rp_path.exists():
-            with open(rp_path) as f:
-                rp_genes = set(line.strip() for line in f if line.strip())
+    metric = _resolve_expression_metric(expr_df)
+    if metric is None:
+        logger.warning("No expression metric column (MELP/CAI/Fop) in expression data; "
+                       "cannot predict growth rate")
+        return None
+
+    # Determine reference gene set: GMM cluster preferred, RP fallback
+    ref_genes = set()
+    ref_label = "unknown"
+    if gmm_cluster_gene_ids is not None and len(gmm_cluster_gene_ids) >= 3:
+        ref_genes = set(gmm_cluster_gene_ids)
+        ref_label = "gmm_cluster"
+        logger.info("Growth rate prediction using %s on GMM cluster (%d genes)",
+                     metric, len(ref_genes))
     else:
-        # Heuristic: match genes with "ribosomal" or "rp" in name
-        gene_names = expr_df["gene"].str.lower()
-        rp_genes = set(expr_df.loc[
-            gene_names.str.contains("ribosomal|rp", na=False), "gene"
-        ])
+        if rp_ids_file is not None:
+            rp_path = Path(rp_ids_file)
+            if rp_path.exists():
+                with open(rp_path) as f:
+                    ref_genes = set(line.strip() for line in f if line.strip())
+        if not ref_genes:
+            # Heuristic: match genes with "ribosomal" or "rp" in name
+            gene_names = expr_df["gene"].str.lower()
+            ref_genes = set(expr_df.loc[
+                gene_names.str.contains("ribosomal|rp", na=False), "gene"
+            ])
+        ref_label = "ribosomal_proteins"
+        logger.info("Growth rate prediction using %s on ribosomal proteins (%d genes)",
+                     metric, len(ref_genes))
 
-    if not rp_genes:
-        logger.warning("No ribosomal protein genes identified")
+    if not ref_genes:
+        logger.warning("No reference genes identified for growth rate prediction")
         return None
 
-    # Extract CAI for RP genes
-    rp_mask = expr_df["gene"].isin(rp_genes)
-    rp_cai = expr_df.loc[rp_mask, "CAI"].dropna()
+    ref_mask = expr_df["gene"].isin(ref_genes)
+    ref_vals_series = expr_df.loc[ref_mask, metric].dropna()
 
-    if len(rp_cai) < 3:
-        logger.warning("Too few ribosomal proteins with CAI values (%d); need at least 3", len(rp_cai))
+    if len(ref_vals_series) < 3:
+        logger.warning("Too few reference genes with %s values (%d); need at least 3",
+                       metric, len(ref_vals_series))
         return None
 
-    mean_cai_rp = rp_cai.mean()
+    mean_metric = ref_vals_series.mean()
 
     # Empirical coefficients from Vieira-Silva & Rocha (2010)
     a = 7.15
     b = -7.38
-    predicted_doubling_time = np.exp(a + b * mean_cai_rp)
+    predicted_doubling_time = np.exp(a + b * mean_metric)
 
     # Bootstrap 95% CI on the predicted doubling time
     rng = np.random.default_rng(42)
     n_boot = 1000
-    rp_vals = rp_cai.values
+    ref_vals = ref_vals_series.values
     boot_dts = np.empty(n_boot)
     for i in range(n_boot):
-        boot_sample = rng.choice(rp_vals, size=len(rp_vals), replace=True)
+        boot_sample = rng.choice(ref_vals, size=len(ref_vals), replace=True)
         boot_dts[i] = np.exp(a + b * boot_sample.mean())
     ci_lower = float(np.percentile(boot_dts, 2.5))
     ci_upper = float(np.percentile(boot_dts, 97.5))
@@ -382,13 +454,22 @@ def predict_growth_rate(
         growth_class = "slow"
 
     return {
-        "mean_cai_rp": float(mean_cai_rp),
+        "expression_metric": metric,
+        "reference_set": ref_label,
+        "mean_metric": float(mean_metric),
+        # Backward compatibility aliases
+        "mean_metric_rp": float(mean_metric),
         "predicted_doubling_time_hours": float(predicted_doubling_time),
         "ci_lower_hours": ci_lower,
         "ci_upper_hours": ci_upper,
-        "n_rp_genes": int(len(rp_cai)),
+        "n_reference_genes": int(len(ref_vals_series)),
+        "n_rp_genes": int(len(ref_vals_series)),  # backward compat
         "growth_class": growth_class,
-        "caveat": "Coefficients from Vieira-Silva & Rocha (2010); validated primarily on proteobacteria. Interpret with caution for other lineages.",
+        "caveat": (
+            f"Vieira-Silva & Rocha (2010) model using {metric} on "
+            f"{ref_label.replace('_', ' ')} ({len(ref_vals_series)} genes); "
+            "coefficients validated primarily on proteobacteria."
+        ),
     }
 
 
@@ -401,6 +482,9 @@ def quantify_translational_selection(
 ) -> dict[str, pd.DataFrame]:
     """Quantify translational selection via optimal codon identification and Fop analysis.
 
+    Uses the best available expression metric (MELP preferred over CAI)
+    to stratify genes by expression level.
+
     Three sub-analyses:
     1. Optimal codon identification per AA (most enriched in high-expression genes)
     2. Fop (frequency of optimal codons) across expression quintiles
@@ -409,41 +493,43 @@ def quantify_translational_selection(
     Args:
         rscu_gene_df: Per-gene RSCU table.
         enc_df: ENC table with gene column.
-        expr_df: Expression table with gene and CAI (or MELP/Fop) column.
+        expr_df: Expression table with gene and at least one of MELP, CAI,
+            or Fop columns.
         ffn_path: Path to CDS nucleotide FASTA.
 
     Returns:
         Dict with keys: "optimal_codons", "fop_gradient", "position_effects".
     """
+    empty_result = {
+        "optimal_codons": pd.DataFrame(),
+        "fop_gradient": pd.DataFrame(),
+        "position_effects": pd.DataFrame(),
+    }
+
     if rscu_gene_df.empty or expr_df.empty:
         logger.warning("Empty RSCU or expression data; skipping translational selection")
-        return {
-            "optimal_codons": pd.DataFrame(),
-            "fop_gradient": pd.DataFrame(),
-            "position_effects": pd.DataFrame(),
-        }
+        return empty_result
 
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
     if not rscu_cols:
-        return {
-            "optimal_codons": pd.DataFrame(),
-            "fop_gradient": pd.DataFrame(),
-            "position_effects": pd.DataFrame(),
-        }
+        return empty_result
+
+    metric = _resolve_expression_metric(expr_df)
+    if metric is None:
+        logger.warning("No expression metric (MELP/CAI/Fop) available; "
+                       "skipping translational selection")
+        return empty_result
+    logger.info("Translational selection analysis using %s", metric)
 
     # Merge RSCU with expression
-    merged = rscu_gene_df.merge(expr_df[["gene", "CAI"]], on="gene", how="inner")
+    merged = rscu_gene_df.merge(expr_df[["gene", metric]], on="gene", how="inner")
     if merged.empty:
         logger.info("SKIPPED: translational selection (no overlap between RSCU and expression genes)")
-        return {
-            "optimal_codons": pd.DataFrame(),
-            "fop_gradient": pd.DataFrame(),
-            "position_effects": pd.DataFrame(),
-        }
+        return empty_result
 
     # --- A. Optimal codon identification ---
     genome_avg_rscu = merged[rscu_cols].mean()
-    high_mask = merged["CAI"] >= merged["CAI"].quantile(optimal_percentile)
+    high_mask = merged[metric] >= merged[metric].quantile(optimal_percentile)
     if high_mask.sum() < 3:
         logger.info("SKIPPED: optimal codon identification (fewer than 3 high-expression genes)")
         optimal_df = pd.DataFrame()
@@ -463,6 +549,7 @@ def quantify_translational_selection(
                 "genome_avg_rscu": round(genome_avg_rscu[col], 4),
                 "high_expr_rscu": round(high_avg_rscu[col], 4),
                 "is_optimal": 1 if delta > 0.05 else 0,
+                "expression_metric": metric,
             })
         optimal_df = pd.DataFrame(optimal_rows)
 
@@ -474,7 +561,7 @@ def quantify_translational_selection(
                 optimal_df.loc[max_idx, "is_optimal"] = 2  # Mark as top optimal
 
     # --- B. Fop gradient across expression quintiles ---
-    merged_sorted = merged.sort_values("CAI")
+    merged_sorted = merged.sort_values(metric)
     n_genes = len(merged_sorted)
     q_size = n_genes // 5
     quintiles = []
@@ -522,11 +609,10 @@ def quantify_translational_selection(
 
     fop_gradient_df = pd.DataFrame(fop_rows)
 
-    # Also compute continuous Spearman correlation (CAI vs Fop)
-    if optimal_codons_set and not merged.empty and "CAI" in merged.columns:
-        # Compute Fop for each gene directly
+    # Continuous Spearman correlation (expression metric vs Fop)
+    if optimal_codons_set and not merged.empty:
         all_fop_vals = []
-        all_cai_vals = []
+        all_metric_vals = []
         for rec in SeqIO.parse(str(ffn_path), "fasta"):
             if rec.id not in merged["gene"].values:
                 continue
@@ -538,18 +624,20 @@ def quantify_translational_selection(
             n_total = sum(gene_counts.get(c, 0) for c in SENSE_CODONS)
             if n_total > 0:
                 all_fop_vals.append(n_opt / n_total)
-                cai_val = merged.loc[merged["gene"] == rec.id, "CAI"].values
-                if len(cai_val) > 0:
-                    all_cai_vals.append(cai_val[0])
+                metric_val = merged.loc[merged["gene"] == rec.id, metric].values
+                if len(metric_val) > 0:
+                    all_metric_vals.append(metric_val[0])
                 else:
                     all_fop_vals.pop()
 
         if len(all_fop_vals) >= 10:
             from scipy.stats import spearmanr
-            spearman_rho, spearman_p = spearmanr(all_cai_vals, all_fop_vals)
+            spearman_rho, spearman_p = spearmanr(all_metric_vals, all_fop_vals)
             fop_gradient_df.attrs["spearman_rho"] = round(spearman_rho, 4)
             fop_gradient_df.attrs["spearman_p"] = spearman_p
-            logger.info("CAI-Fop Spearman correlation: rho=%.4f, p=%.2e", spearman_rho, spearman_p)
+            fop_gradient_df.attrs["expression_metric"] = metric
+            logger.info("%s-Fop Spearman correlation: rho=%.4f, p=%.2e",
+                        metric, spearman_rho, spearman_p)
 
     # --- C. Within-gene codon position effects ---
     pos_rows = []
@@ -1100,6 +1188,8 @@ def run_bio_ecology_analyses(
     cog_result_tsv: Path | str | None = None,
     kofam_df: pd.DataFrame | None = None,
     gff_path: Path | None = None,
+    gmm_cluster_rscu: dict[str, float] | pd.Series | None = None,
+    gmm_cluster_gene_ids: list[str] | set[str] | None = None,
 ) -> dict[str, pd.DataFrame | Path | dict]:
     """Run all biological and ecological analyses.
 
@@ -1117,6 +1207,12 @@ def run_bio_ecology_analyses(
         cog_result_tsv: Optional COG result TSV.
         kofam_df: Optional KOFam annotation DataFrame.
         gff_path: Optional GFF3 annotation file.
+        gmm_cluster_rscu: Optional GMM cluster RSCU (dict or Series). When
+            provided, HGT detection uses this as the reference centroid
+            instead of the genome mean.
+        gmm_cluster_gene_ids: Optional gene IDs from the GMM optimal cluster.
+            When provided, growth rate prediction uses these as the reference
+            gene set instead of ribosomal proteins.
 
     Returns:
         Dict of analysis names -> DataFrames/file paths. Includes nested dicts for
@@ -1136,7 +1232,10 @@ def run_bio_ecology_analyses(
     # 1. HGT detection
     logger.info("Detecting HGT candidates for %s", sample_id)
     try:
-        hgt_df = detect_hgt_candidates(rscu_gene_df, enc_df, expr_df)
+        hgt_df = detect_hgt_candidates(
+            rscu_gene_df, enc_df, expr_df,
+            reference_rscu=gmm_cluster_rscu,
+        )
         if not hgt_df.empty:
             hgt_df = _annotate_df(hgt_df, ann_map, "gene")
             out_path = eco_dir / f"{sample_id}_hgt_candidates.tsv"
@@ -1151,7 +1250,10 @@ def run_bio_ecology_analyses(
     logger.info("Predicting growth rate for %s", sample_id)
     try:
         if expr_df is not None:
-            growth_result = predict_growth_rate(expr_df, rp_ids_file)
+            growth_result = predict_growth_rate(
+                expr_df, rp_ids_file,
+                gmm_cluster_gene_ids=gmm_cluster_gene_ids,
+            )
             if growth_result is not None:
                 outputs["growth_rate_prediction"] = growth_result
                 # Save as single-row TSV for comparative analysis reader
@@ -1163,7 +1265,7 @@ def run_bio_ecology_analyses(
                            growth_result["predicted_doubling_time_hours"],
                            growth_result["growth_class"])
             else:
-                logger.info("SKIPPED: growth rate prediction (no CAI data or ribosomal protein genes)")
+                logger.info("SKIPPED: growth rate prediction (no expression data or ribosomal protein genes)")
         else:
             logger.info("SKIPPED: growth rate prediction (no expression data)")
     except Exception as e:
@@ -1226,7 +1328,10 @@ def run_bio_ecology_analyses(
             hgt_df = outputs["hgt_candidates"]
         else:
             # Need HGT results first
-            hgt_df = detect_hgt_candidates(rscu_gene_df, enc_df, expr_df)
+            hgt_df = detect_hgt_candidates(
+                rscu_gene_df, enc_df, expr_df,
+                reference_rscu=gmm_cluster_rscu,
+            )
 
         if not hgt_df.empty:
             phage_df = detect_phage_mobile_elements(hgt_df, cog_result_tsv, kofam_df)
