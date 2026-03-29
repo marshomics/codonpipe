@@ -154,7 +154,7 @@ def compute_codon_frequency_table(ffn_path: Path, min_length: int = MIN_GENE_LEN
         total_codons += sum(gene_counts.values())
 
     if total_codons == 0:
-        return pd.DataFrame(columns=["codon", "amino_acid", "count", "frequency", "rscu", "per_thousand"])
+        return pd.DataFrame(columns=["codon", "amino_acid", "rscu_family", "count", "frequency", "rscu", "per_thousand"])
 
     rows = []
     rscu_all = compute_rscu_from_counts(total_counts)
@@ -165,10 +165,13 @@ def compute_codon_frequency_table(ffn_path: Path, min_length: int = MIN_GENE_LEN
         per_thousand = freq * 1000
         col_name = _codon_to_col_name(codon, aa) if aa not in ("*", "Met", "Trp") else f"{aa}-{codon}"
         rscu_val = rscu_all.get(col_name, np.nan)
+        # Extract the RSCU family name (e.g., Ser4, Leu2, Arg4) from the column name
+        rscu_family = col_name.split("-")[0]
 
         rows.append({
             "codon": codon,
             "amino_acid": aa,
+            "rscu_family": rscu_family,
             "count": count,
             "frequency": round(freq, 6),
             "rscu": round(rscu_val, 4) if not np.isnan(rscu_val) else np.nan,
