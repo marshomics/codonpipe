@@ -454,9 +454,9 @@ def _read_ace_scores_summary(paths: dict, row: dict) -> None:
                     if metric in df.columns:
                         row[f"median_{metric}"] = df[metric].median()
                         row[f"mean_{metric}"] = df[metric].mean()
-                if "ace_expression_class" in df.columns:
-                    high_n = (df["ace_expression_class"] == "high").sum()
-                    low_n = (df["ace_expression_class"] == "low").sum()
+                if "ace_MELP_class" in df.columns:
+                    high_n = (df["ace_MELP_class"] == "high").sum()
+                    low_n = (df["ace_MELP_class"] == "low").sum()
                     row["ace_n_high_expr"] = int(high_n)
                     row["ace_n_low_expr"] = int(low_n)
                 if "in_ace_core" in df.columns:
@@ -488,7 +488,7 @@ def _read_enrichment_summary(paths: dict, row: dict) -> None:
 
     # ACE-tier enrichment
     for tier in ("high", "low"):
-        key = f"ace_enrichment_ace_expression_{tier}"
+        key = f"ace_enrichment_ace_MELP_{tier}"
         p = paths.get(key)
         if p and Path(p).exists():
             try:
