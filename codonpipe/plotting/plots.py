@@ -3279,15 +3279,27 @@ def generate_single_genome_plots(
     # Enrichment plots
     if enrichment_results:
         # Per-comparison bar plots
+        # Keys are prefixed: "rp_enrichment_MELP_high" or "ace_enrichment_expression_high"
         for key, edf in enrichment_results.items():
             if edf.empty:
                 continue
-            # key is like "enrichment_CAI_high"
-            parts = key.replace("enrichment_", "").split("_", 1)
+            # Parse source (rp/ace) and metric/tier from the key
+            stripped = key
+            source = ""
+            if stripped.startswith("rp_"):
+                source = "RP-based "
+                stripped = stripped[3:]
+            elif stripped.startswith("ace_"):
+                source = "ACE-based "
+                stripped = stripped[4:]
+            parts = stripped.replace("enrichment_", "").split("_", 1)
             metric = parts[0] if parts else ""
             tier = parts[1] if len(parts) > 1 else ""
             p = plot_dir / f"{sample_id}_{key}"
-            plot_enrichment_bar(edf, p, title=f"{metric} {tier}-expression pathway enrichment — {sample_id}")
+            plot_enrichment_bar(
+                edf, p,
+                title=f"{source}{metric} {tier}-expression pathway enrichment — {sample_id}",
+            )
             outputs[f"plot_{key}"] = p.with_suffix(".png")
 
         # Additional enrichment summary plots
