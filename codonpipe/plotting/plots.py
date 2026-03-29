@@ -13,8 +13,11 @@ from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import matplotlib.gridspec as gridspec
+import matplotlib.patheffects as pe
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -74,6 +77,196 @@ def _save_fig(fig: plt.Figure, path: Path, formats: list[str] | None = None):
 
 
 # ─── Single-genome plots ────────────────────────────────────────────────────
+
+# Amino-acid property grouping for the rounded-cell RSCU heatmap
+_THREE_TO_ONE = {
+    "Ala": "A", "Arg": "R", "Asn": "N", "Asp": "D", "Cys": "C",
+    "Gln": "Q", "Glu": "E", "Gly": "G", "His": "H", "Ile": "I",
+    "Leu": "L", "Lys": "K", "Met": "M", "Phe": "F", "Pro": "P",
+    "Ser": "S", "Thr": "T", "Trp": "W", "Tyr": "Y", "Val": "V",
+}
+# Also handle split-family names (Ser4, Ser2, Leu4, Leu2, Arg4, Arg2)
+for _base, _letter in [("Ser", "S"), ("Leu", "L"), ("Arg", "R")]:
+    for _sfx in ("2", "4"):
+        _THREE_TO_ONE[f"{_base}{_sfx}"] = _letter
+
+_AA_GROUPS = {
+    "Nonpolar": ["G", "A", "V", "L", "I", "P", "F", "M", "W"],
+    "Polar":    ["S", "T", "C", "Y", "N", "Q"],
+    "Positive": ["K", "R", "H"],
+    "Negative": ["D", "E"],
+}
+_GROUP_COLORS = {
+    "Nonpolar": "#5B8DBE",
+    "Polar":    "#6AB187",
+    "Positive": "#D4726A",
+    "Negative": "#9B7FBF",
+}
+_AA_TO_GROUP = {}
+for _grp, _aas in _AA_GROUPS.items():
+    for _a in _aas:
+        _AA_TO_GROUP[_a] = _grp
+_AA_ORDER = list("ARNDC QEGHILKMFPSTWYV".replace(" ", ""))
+_AA_NAMES = {v: k for k, v in _THREE_TO_ONE.items() if len(k) == 3}
+
+
+def plot_rscu_heatmap_rounded(
+    freq_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+):
+    """Rounded-cell RSCU heatmap with blue→white→red diverging palette centred at 1.0.
+
+    Each amino acid is a row (grouped by biochemical property), each synonymous
+    codon is a rounded tile whose colour encodes the RSCU value.  Values and
+    codon labels are printed inside each cell.
+
+    Args:
+        freq_df: Output from ``compute_codon_frequency_table()`` with columns
+            ``codon``, ``amino_acid``, ``rscu``.
+        output_path: Base path for saving (extensions appended).
+        sample_id: Sample identifier for the title.
+    """
+    _apply_style()
+    if freq_df is None or freq_df.empty or "rscu" not in freq_df.columns:
+        return
+
+    # Exclude stop codons and single-codon families (Met, Trp)
+    df = freq_df.dropna(subset=["rscu"]).copy()
+    df = df[~df["amino_acid"].isin(("*", "Met", "Trp"))]
+    if df.empty:
+        return
+
+    # Map amino acid names to single-letter codes
+    df["AA"] = df["amino_acid"].map(_THREE_TO_ONE)
+    df = df.dropna(subset=["AA"])
+
+    # Order amino acids by biochemical group
+    group_order = ["Nonpolar", "Polar", "Positive", "Negative"]
+    aa_ordered = []
+    present = set(df["AA"].unique())
+    for grp in group_order:
+        aa_ordered.extend(aa for aa in _AA_ORDER if _AA_TO_GROUP.get(aa) == grp and aa in present)
+
+    if not aa_ordered:
+        return
+
+    # Diverging colormap: blue (low) → white (1.0) → red (high)
+    max_rscu = df["RSCU"].max() if "RSCU" in df.columns else df["rscu"].max()
+    rscu_col = "RSCU" if "RSCU" in df.columns else "rscu"
+    vmax = min(max(max_rscu * 1.05, 3.0), 5.0)
+    colors_below = plt.cm.Blues_r(np.linspace(0.0, 0.7, 128))
+    colors_above = plt.cm.Reds(np.linspace(0.0, 0.75, 128))
+    cmap = mcolors.LinearSegmentedColormap.from_list(
+        "rscu_diverging", np.vstack([colors_below, colors_above]),
+    )
+    norm = mcolors.TwoSlopeNorm(vmin=0, vcenter=1.0, vmax=vmax)
+
+    # Layout
+    fig = plt.figure(figsize=(10, 9))
+    gs = gridspec.GridSpec(1, 2, width_ratios=[30, 1], wspace=0.03)
+    ax = fig.add_subplot(gs[0])
+    cax = fig.add_subplot(gs[1])
+
+    cell_h, cell_w = 0.85, 0.85
+    y_pos = 0
+    y_positions = {}
+    group_boundaries = []
+    current_group = None
+
+    for aa in aa_ordered:
+        grp = _AA_TO_GROUP.get(aa, "")
+        if grp != current_group:
+            if current_group is not None:
+                group_boundaries.append(y_pos - 0.15)
+                y_pos += 0.3
+            current_group = grp
+        y_positions[aa] = y_pos
+        y_pos += 1.0
+
+    # Draw cells
+    for aa in aa_ordered:
+        sub = df[df["AA"] == aa].sort_values("codon")
+        y = y_positions[aa]
+        for j, (_, row) in enumerate(sub.iterrows()):
+            rscu = row[rscu_col]
+            color = cmap(norm(rscu))
+            rect = FancyBboxPatch(
+                (j * 1.0 + 0.075, y + 0.075), cell_w, cell_h,
+                boxstyle="round,pad=0.02",
+                facecolor=color, edgecolor="white", linewidth=1.2,
+            )
+            ax.add_patch(rect)
+
+            text_color = "white" if (rscu > 2.5 or rscu < 0.2) else "#333333"
+            pfx = [pe.withStroke(linewidth=0.3, foreground="white")] if rscu > 2.5 else []
+
+            ax.text(
+                j * 1.0 + 0.075 + cell_w / 2, y + 0.075 + cell_h * 0.62,
+                row["codon"], ha="center", va="center",
+                fontsize=8, fontweight="bold", fontfamily="monospace",
+                color=text_color, path_effects=pfx,
+            )
+            ax.text(
+                j * 1.0 + 0.075 + cell_w / 2, y + 0.075 + cell_h * 0.28,
+                f"{rscu:.2f}", ha="center", va="center",
+                fontsize=6.5, color=text_color, alpha=0.85,
+            )
+
+    # Y-axis labels
+    for aa in aa_ordered:
+        y = y_positions[aa]
+        grp = _AA_TO_GROUP.get(aa, "")
+        name = _AA_NAMES.get(aa, aa)
+        ax.text(
+            -0.3, y + 0.075 + cell_h / 2, f"{name} ({aa})",
+            ha="right", va="center", fontsize=8.5, fontweight="bold",
+            color=_GROUP_COLORS.get(grp, "#333333"),
+        )
+
+    # Group labels on far left
+    for grp in group_order:
+        aas_in_grp = [aa for aa in aa_ordered if _AA_TO_GROUP.get(aa) == grp]
+        if aas_in_grp:
+            y_start = y_positions[aas_in_grp[0]]
+            y_end = y_positions[aas_in_grp[-1]] + 1.0
+            y_mid = (y_start + y_end) / 2
+            ax.text(
+                -2.8, y_mid, grp, ha="center", va="center", fontsize=9,
+                fontweight="bold", color=_GROUP_COLORS[grp], rotation=90,
+            )
+            ax.plot(
+                [-2.2, -2.2], [y_start + 0.1, y_end - 0.1],
+                color=_GROUP_COLORS[grp], linewidth=1.5, alpha=0.6, clip_on=False,
+            )
+
+    for yb in group_boundaries:
+        ax.axhline(y=yb, color="#cccccc", linewidth=0.5, linestyle="-", alpha=0.5)
+
+    ax.set_xlim(-3.2, 6 * 1.0 + 0.2)
+    ax.set_ylim(-0.3, y_pos + 0.3)
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    title = "Relative Synonymous Codon Usage (RSCU)"
+    if sample_id:
+        title += f"\n{sample_id}"
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=15)
+
+    # Colorbar
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cb = fig.colorbar(sm, cax=cax, orientation="vertical")
+    cb.set_label("RSCU", fontsize=9)
+    cb.ax.tick_params(labelsize=8)
+    cb.ax.axhline(y=1.0, color="black", linewidth=0.8, linestyle="-")
+    cb.ax.text(
+        1.6, 1.0, "= 1.0\n(no bias)", transform=cb.ax.get_yaxis_transform(),
+        fontsize=7, va="center", ha="left", color="#555555",
+    )
+
+    _save_fig(fig, output_path)
 
 
 def plot_codon_frequency_bar(freq_df: pd.DataFrame, output_path: Path, sample_id: str = ""):
@@ -196,7 +389,11 @@ def plot_encprime_gc3(
     _apply_style()
 
     # Identify the ENCprime score column (first column that isn't gene/width)
-    score_col = [c for c in encprime_df.columns if c not in ("gene", "width")][0]
+    score_candidates = [c for c in encprime_df.columns if c not in ("gene", "width")]
+    if not score_candidates:
+        logger.warning("ENCprime DataFrame has no score column; skipping plot")
+        return
+    score_col = score_candidates[0]
 
     # Merge ENCprime with GC3 from enc_df
     merged = encprime_df[["gene", score_col]].merge(
@@ -240,7 +437,11 @@ def plot_milc_distribution(milc_df: pd.DataFrame, output_path: Path, sample_id: 
     """
     _apply_style()
 
-    score_col = [c for c in milc_df.columns if c not in ("gene", "width")][0]
+    score_candidates = [c for c in milc_df.columns if c not in ("gene", "width")]
+    if not score_candidates:
+        logger.warning("MILC DataFrame has no score column; skipping plot")
+        return
+    score_col = score_candidates[0]
     vals = milc_df[score_col].dropna()
     if vals.empty:
         return
@@ -735,8 +936,10 @@ def plot_coa(
     if len(coa_coords) < 3 or "Axis1" not in coa_coords.columns:
         return
 
-    pct1 = coa_inertia.loc[coa_inertia["axis"] == 1, "pct_inertia"].values[0] if len(coa_inertia) > 0 else 0
-    pct2 = coa_inertia.loc[coa_inertia["axis"] == 2, "pct_inertia"].values[0] if len(coa_inertia) > 1 else 0
+    _axis1 = coa_inertia.loc[coa_inertia["axis"] == 1, "pct_inertia"].values
+    _axis2 = coa_inertia.loc[coa_inertia["axis"] == 2, "pct_inertia"].values
+    pct1 = _axis1[0] if len(_axis1) > 0 else 0
+    pct2 = _axis2[0] if len(_axis2) > 0 else 0
 
     fig, ax = plt.subplots(figsize=(8, 7))
 
@@ -2118,6 +2321,797 @@ def plot_growth_rate_gauge(
     _save_fig(fig, output_path)
 
 
+# ─── gRodon2 growth prediction plots ────────────────────────────────────────
+
+
+def plot_grodon2_summary(
+    grodon_dict: dict,
+    cai_growth_dict: dict | None,
+    output_path: Path,
+    sample_id: str = "",
+):
+    """Summary figure comparing gRodon2 and CAI-based growth predictions.
+
+    Panel layout:
+      Top row: doubling time comparison bar + confidence interval
+      Bottom left: codon usage bias metrics (CUBHE, ConsistencyHE, CPB)
+      Bottom right: growth class and model metadata
+
+    Args:
+        grodon_dict: gRodon2 result dict (d, CIs, CUBHE, ConsistencyHE, CPB).
+        cai_growth_dict: Optional Vieira-Silva & Rocha result dict for comparison.
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+    """
+    _apply_style()
+    if not grodon_dict:
+        return
+
+    d = grodon_dict.get("predicted_doubling_time_hours", 0)
+    lo = grodon_dict.get("lower_ci_hours", d)
+    hi = grodon_dict.get("upper_ci_hours", d)
+    cubhe = grodon_dict.get("CUBHE", 0)
+    consistency = grodon_dict.get("ConsistencyHE", 0)
+    cpb = grodon_dict.get("CPB")
+    gc = grodon_dict.get("GC", 0)
+    n_he = grodon_dict.get("n_highly_expressed", 0)
+    growth_class = grodon_dict.get("growth_class", "unknown")
+
+    cai_d = None
+    if cai_growth_dict:
+        cai_d = cai_growth_dict.get("predicted_doubling_time_hours")
+
+    fig = plt.figure(figsize=(12, 7))
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.45, wspace=0.35)
+
+    # ── Top: doubling time comparison ────────────────────────────────
+    ax_top = fig.add_subplot(gs[0, :])
+
+    labels = []
+    vals = []
+    errs_lo = []
+    errs_hi = []
+    colors = []
+
+    # gRodon2
+    labels.append("gRodon2")
+    vals.append(d)
+    errs_lo.append(d - lo if lo else 0)
+    errs_hi.append(hi - d if hi else 0)
+    colors.append("#2196F3")
+
+    # CAI method
+    if cai_d is not None:
+        labels.append("CAI\n(Vieira-Silva)")
+        vals.append(cai_d)
+        errs_lo.append(0)
+        errs_hi.append(0)
+        colors.append("#FF9800")
+
+    y_pos = list(range(len(labels)))
+    ax_top.barh(y_pos, vals, height=0.4, color=colors, alpha=0.8, edgecolor="black", linewidth=1)
+
+    # CI whiskers for gRodon2
+    if lo and hi:
+        ax_top.errorbar(d, 0, xerr=[[d - lo], [hi - d]], fmt="none", ecolor="black",
+                        capsize=5, capthick=1.5, linewidth=1.5)
+
+    for i, v in enumerate(vals):
+        ax_top.text(v + 0.15, i, f"{v:.2f} h", va="center", fontsize=10, weight="bold")
+
+    # Zone shading
+    x_max = max(max(vals) * 1.5, 10)
+    ax_top.axvspan(0, 2, alpha=0.07, color="green")
+    ax_top.axvspan(2, min(8, x_max), alpha=0.07, color="orange")
+    if x_max > 8:
+        ax_top.axvspan(8, x_max, alpha=0.07, color="red")
+    ax_top.axvline(2, color="green", linestyle="--", alpha=0.4, linewidth=0.8)
+    ax_top.axvline(8, color="orange", linestyle="--", alpha=0.4, linewidth=0.8)
+
+    ax_top.set_xlim(0, x_max)
+    ax_top.set_yticks(y_pos)
+    ax_top.set_yticklabels(labels, fontsize=10)
+    ax_top.set_xlabel("Predicted Minimum Doubling Time (hours)", fontsize=10)
+    ax_top.set_title("Growth Rate Prediction Comparison", fontsize=11, weight="bold")
+    ax_top.grid(True, alpha=0.3, axis="x")
+
+    # ── Bottom left: CUB metrics ─────────────────────────────────────
+    ax_cub = fig.add_subplot(gs[1, 0])
+    metric_names = ["CUBHE", "Consistency\nHE"]
+    metric_vals = [cubhe, consistency]
+    bar_colors = ["#4CAF50", "#9C27B0"]
+
+    if cpb is not None:
+        metric_names.append("CPB")
+        metric_vals.append(cpb)
+        bar_colors.append("#E91E63")
+
+    x_pos = list(range(len(metric_names)))
+    bars = ax_cub.bar(x_pos, metric_vals, color=bar_colors, alpha=0.8, edgecolor="black", linewidth=0.8)
+    for bar, val in zip(bars, metric_vals):
+        ax_cub.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                    f"{val:.4f}", ha="center", va="bottom", fontsize=9, weight="bold")
+
+    ax_cub.set_xticks(x_pos)
+    ax_cub.set_xticklabels(metric_names, fontsize=9)
+    ax_cub.set_ylabel("Value", fontsize=10)
+    ax_cub.set_title("gRodon2 Codon Usage Metrics", fontsize=10, weight="bold")
+    ax_cub.grid(True, alpha=0.3, axis="y")
+
+    # ── Bottom right: info panel ─────────────────────────────────────
+    ax_info = fig.add_subplot(gs[1, 1])
+    ax_info.axis("off")
+
+    info_lines = [
+        f"Growth class: {growth_class.upper()}",
+        f"GC content: {gc:.3f}",
+        f"Ribosomal proteins: {n_he}",
+        f"95% CI: [{lo:.2f}, {hi:.2f}] h",
+        f"Model: full (Madin training set)",
+    ]
+    if grodon_dict.get("caveat"):
+        info_lines.append(f"\n{grodon_dict['caveat']}")
+
+    info_text = "\n".join(info_lines)
+    ax_info.text(0.05, 0.95, info_text, transform=ax_info.transAxes, fontsize=10,
+                 va="top", ha="left", linespacing=1.6,
+                 bbox=dict(boxstyle="round,pad=0.5", facecolor="#f5f5f5", edgecolor="#cccccc"))
+
+    title_str = "gRodon2 Growth Rate Analysis"
+    if sample_id:
+        title_str += f" — {sample_id}"
+    fig.suptitle(title_str, fontsize=13, weight="bold")
+    gs.tight_layout(fig, rect=[0, 0, 1, 0.95])
+    _save_fig(fig, output_path)
+
+
+def plot_grodon2_batch_comparison(
+    grodon_data: dict[str, dict],
+    cai_data: dict[str, dict] | None,
+    output_path: Path,
+):
+    """Compare gRodon2 predictions across multiple genomes.
+
+    Three-panel figure:
+      Left: horizontal bar chart of doubling times with CIs per genome
+      Middle: scatter of CUBHE vs ConsistencyHE, colored by growth class
+      Right: gRodon2 vs CAI predicted doubling time scatter (if CAI data present)
+
+    Args:
+        grodon_data: {sample_id: grodon2_result_dict}.
+        cai_data: Optional {sample_id: cai_growth_rate_dict}.
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    if not grodon_data:
+        return
+
+    sample_ids = sorted(grodon_data.keys())
+    n = len(sample_ids)
+
+    has_cai = cai_data is not None and len(cai_data) > 0
+    n_panels = 3 if has_cai else 2
+
+    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, max(4, n * 0.5 + 2)))
+    if n_panels == 1:
+        axes = [axes]
+
+    # Color by growth class
+    class_colors = {"fast": "#4CAF50", "moderate": "#FF9800", "slow": "#F44336", "very_slow": "#9E9E9E"}
+
+    # ── Panel 1: doubling time bars with CI ──────────────────────────
+    ax = axes[0]
+    y_pos = list(range(n))
+    d_vals = [grodon_data[s].get("predicted_doubling_time_hours", 0) for s in sample_ids]
+    lo_vals = [grodon_data[s].get("lower_ci_hours", d_vals[i]) for i, s in enumerate(sample_ids)]
+    hi_vals = [grodon_data[s].get("upper_ci_hours", d_vals[i]) for i, s in enumerate(sample_ids)]
+    gc_vals = [grodon_data[s].get("growth_class", "unknown") for s in sample_ids]
+    bar_colors = [class_colors.get(gc, "#9E9E9E") for gc in gc_vals]
+
+    xerr_lo = [d_vals[i] - lo_vals[i] for i in range(n)]
+    xerr_hi = [hi_vals[i] - d_vals[i] for i in range(n)]
+
+    ax.barh(y_pos, d_vals, height=0.6, color=bar_colors, alpha=0.8, edgecolor="black", linewidth=0.8)
+    ax.errorbar(d_vals, y_pos, xerr=[xerr_lo, xerr_hi], fmt="none", ecolor="black",
+                capsize=3, capthick=1, linewidth=1)
+
+    ax.axvline(2, color="green", linestyle="--", alpha=0.4, linewidth=0.8)
+    ax.axvline(5, color="orange", linestyle="--", alpha=0.4, linewidth=0.8)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(sample_ids, fontsize=9)
+    ax.set_xlabel("Predicted Doubling Time (h)", fontsize=10)
+    ax.set_title("gRodon2 Doubling Time", fontsize=10, weight="bold")
+    ax.grid(True, alpha=0.3, axis="x")
+
+    # ── Panel 2: CUBHE vs ConsistencyHE scatter ──────────────────────
+    ax2 = axes[1]
+    cubhe_vals = [grodon_data[s].get("CUBHE", 0) for s in sample_ids]
+    cons_vals = [grodon_data[s].get("ConsistencyHE", 0) for s in sample_ids]
+
+    for i, s in enumerate(sample_ids):
+        ax2.scatter(cubhe_vals[i], cons_vals[i], c=bar_colors[i], s=80,
+                    edgecolors="black", linewidth=0.8, zorder=3)
+        ax2.annotate(s, (cubhe_vals[i], cons_vals[i]), fontsize=7,
+                     xytext=(4, 4), textcoords="offset points")
+
+    ax2.set_xlabel("CUBHE (CUB of HE genes)", fontsize=10)
+    ax2.set_ylabel("ConsistencyHE", fontsize=10)
+    ax2.set_title("Codon Usage Bias Landscape", fontsize=10, weight="bold")
+    ax2.grid(True, alpha=0.3)
+
+    # ── Panel 3: gRodon2 vs CAI scatter (if CAI available) ───────────
+    if has_cai:
+        ax3 = axes[2]
+        grodon_d = []
+        cai_d = []
+        labels = []
+        scatter_colors = []
+        for s in sample_ids:
+            if s in cai_data and cai_data[s]:
+                gd = grodon_data[s].get("predicted_doubling_time_hours")
+                cd = cai_data[s].get("predicted_doubling_time_hours")
+                if gd is not None and cd is not None:
+                    grodon_d.append(gd)
+                    cai_d.append(cd)
+                    labels.append(s)
+                    scatter_colors.append(class_colors.get(
+                        grodon_data[s].get("growth_class", "unknown"), "#9E9E9E"))
+
+        if grodon_d:
+            ax3.scatter(cai_d, grodon_d, c=scatter_colors, s=80,
+                        edgecolors="black", linewidth=0.8, zorder=3)
+            for i, s in enumerate(labels):
+                ax3.annotate(s, (cai_d[i], grodon_d[i]), fontsize=7,
+                             xytext=(4, 4), textcoords="offset points")
+
+            # Diagonal
+            lim_max = max(max(grodon_d), max(cai_d)) * 1.2
+            ax3.plot([0, lim_max], [0, lim_max], "k--", alpha=0.3, linewidth=0.8)
+            ax3.set_xlim(0, lim_max)
+            ax3.set_ylim(0, lim_max)
+
+        ax3.set_xlabel("CAI-based Doubling Time (h)", fontsize=10)
+        ax3.set_ylabel("gRodon2 Doubling Time (h)", fontsize=10)
+        ax3.set_title("gRodon2 vs CAI Model", fontsize=10, weight="bold")
+        ax3.grid(True, alpha=0.3)
+
+    fig.suptitle("gRodon2 Growth Rate Comparison Across Genomes", fontsize=12, weight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    _save_fig(fig, output_path)
+
+
+# ─── Ribosomal vs high-expression codon usage plots ─────────────────────────
+
+
+def plot_rp_vs_he_rscu(
+    rscu_gene_df: pd.DataFrame,
+    rscu_rp: dict[str, float],
+    expr_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+):
+    """Grouped bar chart comparing RSCU across ribosomal, high-expression, and genome-average gene sets.
+
+    For each codon (grouped by amino acid family), three bars show:
+      - genome-wide median RSCU (gray)
+      - high-expression genes median RSCU (orange)
+      - ribosomal protein RSCU (blue)
+
+    This reveals which codons are differentially preferred by the
+    translational apparatus vs. other highly expressed genes.
+
+    Args:
+        rscu_gene_df: Per-gene RSCU table (gene + 59 RSCU columns).
+        rscu_rp: Dict of concatenated ribosomal protein RSCU values.
+        expr_df: Expression table with gene and CAI_class columns.
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+    """
+    _apply_style()
+    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns and c in rscu_rp]
+    if len(rscu_cols) < 10:
+        return
+
+    # Compute genome-wide median RSCU
+    genome_median = rscu_gene_df[rscu_cols].median()
+
+    # Compute high-expression gene median RSCU
+    he_genes = set()
+    for col in ("CAI_class", "MELP_class"):
+        if col in expr_df.columns:
+            he_genes |= set(expr_df.loc[expr_df[col] == "high", "gene"])
+    if not he_genes:
+        return
+
+    he_mask = rscu_gene_df["gene"].isin(he_genes)
+    if he_mask.sum() < 3:
+        return
+    he_median = rscu_gene_df.loc[he_mask, rscu_cols].median()
+
+    # Ribosomal RSCU
+    rp_vals = pd.Series({c: rscu_rp[c] for c in rscu_cols})
+
+    # Build grouped data
+    n = len(rscu_cols)
+    x = np.arange(n)
+    bar_w = 0.25
+
+    fig, ax = plt.subplots(figsize=(max(14, n * 0.35), 6))
+
+    ax.bar(x - bar_w, genome_median[rscu_cols].values, bar_w,
+           label="Genome average", color="#b0b0b0", edgecolor="white", linewidth=0.3)
+    ax.bar(x, he_median[rscu_cols].values, bar_w,
+           label="High-expression", color="#e8853d", edgecolor="white", linewidth=0.3)
+    ax.bar(x + bar_w, rp_vals[rscu_cols].values, bar_w,
+           label="Ribosomal proteins", color="#4a90d9", edgecolor="white", linewidth=0.3)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([c.split("-")[-1] for c in rscu_cols], rotation=90, fontsize=6)
+    ax.set_ylabel("RSCU")
+    ax.axhline(1.0, color="black", linestyle=":", linewidth=0.8, alpha=0.4)
+    ax.legend(fontsize=8, loc="upper right")
+    ax.set_title(f"Codon usage: ribosomal vs high-expression genes — {sample_id}")
+
+    # Add amino acid family separators
+    _add_aa_family_spans(ax, rscu_cols, n)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_rp_he_rscu_scatter(
+    rscu_gene_df: pd.DataFrame,
+    rscu_rp: dict[str, float],
+    expr_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+):
+    """Scatter of ribosomal vs high-expression RSCU per codon.
+
+    Each point is one codon.  The diagonal means identical preference.
+    Points off the diagonal highlight codons with divergent usage between
+    the two gene classes.  Colored by amino acid family.
+
+    Args:
+        rscu_gene_df: Per-gene RSCU table.
+        rscu_rp: Concatenated ribosomal RSCU dict.
+        expr_df: Expression table with CAI_class.
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+    """
+    _apply_style()
+    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns and c in rscu_rp]
+    if len(rscu_cols) < 10:
+        return
+
+    # High-expression gene median RSCU
+    he_genes = set()
+    for col in ("CAI_class", "MELP_class"):
+        if col in expr_df.columns:
+            he_genes |= set(expr_df.loc[expr_df[col] == "high", "gene"])
+    if not he_genes:
+        return
+    he_mask = rscu_gene_df["gene"].isin(he_genes)
+    if he_mask.sum() < 3:
+        return
+    he_median = rscu_gene_df.loc[he_mask, rscu_cols].median()
+    rp_vals = pd.Series({c: rscu_rp[c] for c in rscu_cols})
+
+    # Assign colors by amino acid family
+    aa_families = {}
+    for col in rscu_cols:
+        aa = col.rsplit("-", 1)[0]
+        aa_families.setdefault(aa, []).append(col)
+    family_names = sorted(aa_families.keys())
+    cmap = plt.cm.get_cmap("tab20", len(family_names))
+    col_to_color = {}
+    for i, fam in enumerate(family_names):
+        for c in aa_families[fam]:
+            col_to_color[c] = cmap(i)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    for c in rscu_cols:
+        ax.scatter(rp_vals[c], he_median[c], s=50, c=[col_to_color[c]],
+                   edgecolors="black", linewidth=0.3, zorder=3)
+
+    # Label outliers (codons where RP and HE differ most)
+    diffs = abs(rp_vals - he_median)
+    threshold = diffs.quantile(0.85)
+    for c in rscu_cols:
+        if diffs[c] >= threshold:
+            codon_label = c.split("-")[-1]
+            ax.annotate(codon_label, (rp_vals[c], he_median[c]),
+                        fontsize=7, ha="left", va="bottom",
+                        xytext=(3, 3), textcoords="offset points")
+
+    # Diagonal
+    lim_max = max(rp_vals.max(), he_median.max()) * 1.15
+    ax.plot([0, lim_max], [0, lim_max], "k--", linewidth=0.8, alpha=0.4)
+    ax.set_xlim(0, lim_max)
+    ax.set_ylim(0, lim_max)
+
+    ax.set_xlabel("Ribosomal protein RSCU")
+    ax.set_ylabel("High-expression gene RSCU")
+    ax.set_title(f"Ribosomal vs high-expression codon preference — {sample_id}")
+
+    # Spearman correlation
+    rho, pval = stats.spearmanr(rp_vals[rscu_cols], he_median[rscu_cols])
+    ax.text(0.05, 0.95, f"Spearman ρ = {rho:.3f}, p = {pval:.2e}",
+            transform=ax.transAxes, fontsize=9, va="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_rp_he_delta_heatmap(
+    rscu_gene_df: pd.DataFrame,
+    rscu_rp: dict[str, float],
+    expr_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+):
+    """Heatmap of ΔRSCU (deviation from genome average) for ribosomal and high-expression genes.
+
+    Two columns per amino acid family: one for ribosomal proteins, one for
+    high-expression genes.  Blue = underused relative to genome, red = overused.
+    Highlights codons under different selection pressures in each class.
+
+    Args:
+        rscu_gene_df: Per-gene RSCU table.
+        rscu_rp: Concatenated ribosomal RSCU dict.
+        expr_df: Expression table with CAI_class.
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+    """
+    _apply_style()
+    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns and c in rscu_rp]
+    if len(rscu_cols) < 10:
+        return
+
+    genome_median = rscu_gene_df[rscu_cols].median()
+
+    he_genes = set()
+    for col in ("CAI_class", "MELP_class"):
+        if col in expr_df.columns:
+            he_genes |= set(expr_df.loc[expr_df[col] == "high", "gene"])
+    if not he_genes:
+        return
+    he_mask = rscu_gene_df["gene"].isin(he_genes)
+    if he_mask.sum() < 3:
+        return
+    he_median = rscu_gene_df.loc[he_mask, rscu_cols].median()
+    rp_vals = pd.Series({c: rscu_rp[c] for c in rscu_cols})
+
+    delta_rp = rp_vals - genome_median
+    delta_he = he_median - genome_median
+
+    # Build matrix: rows = codons, columns = [RP, HE]
+    mat = pd.DataFrame({
+        "Ribosomal": delta_rp[rscu_cols].values,
+        "High-expression": delta_he[rscu_cols].values,
+    }, index=[c.split("-")[-1] for c in rscu_cols])
+
+    vmax = max(abs(mat.values.min()), abs(mat.values.max()), 0.5)
+    fig, ax = plt.subplots(figsize=(4, max(10, len(rscu_cols) * 0.22)))
+    sns.heatmap(
+        mat, ax=ax, cmap="RdBu_r", center=0, vmin=-vmax, vmax=vmax,
+        linewidths=0.3, linecolor="white",
+        cbar_kws={"label": "ΔRSCU (vs genome average)", "shrink": 0.6},
+        annot=True, fmt=".2f", annot_kws={"size": 6},
+    )
+    ax.set_ylabel("Codon")
+    ax.set_title(f"ΔRSCU from genome average — {sample_id}", fontsize=11)
+    ax.tick_params(axis="y", labelsize=7)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def _add_aa_family_spans(ax, rscu_cols: list[str], n: int):
+    """Add faint vertical spans to separate amino acid families on bar charts."""
+    prev_aa = None
+    span_start = 0
+    colors = ["#f0f0f0", "#e0e8f0"]
+    color_idx = 0
+    for i, col in enumerate(rscu_cols):
+        aa = col.rsplit("-", 1)[0]
+        if aa != prev_aa and prev_aa is not None:
+            ax.axvspan(span_start - 0.5, i - 0.5, color=colors[color_idx % 2], alpha=0.3, zorder=0)
+            color_idx += 1
+            span_start = i
+        prev_aa = aa
+    # Last family
+    ax.axvspan(span_start - 0.5, n - 0.5, color=colors[color_idx % 2], alpha=0.3, zorder=0)
+
+
+# ─── Genomic landscape and MGE codon usage plots ───────────────────────────
+
+
+def plot_genomic_cu_landscape(
+    rscu_gene_df: pd.DataFrame,
+    enc_df: pd.DataFrame,
+    hgt_df: pd.DataFrame | None,
+    phage_mobile_df: pd.DataFrame | None,
+    output_path: Path,
+    sample_id: str = "",
+    gff_path: Path | None = None,
+):
+    """Multi-track genomic landscape of codon usage variation.
+
+    Upper track: Mahalanobis distance (if HGT data available) or ENC per gene.
+    Lower track: GC3 content per gene.
+    MGE/phage genes are highlighted with colored vertical bands.
+    Gene positions come from GFF if available; otherwise gene order in the
+    RSCU table is used as a positional proxy (Prokka produces genes in
+    genome order).
+
+    Args:
+        rscu_gene_df: Per-gene RSCU table.
+        enc_df: ENC + GC3 per gene.
+        hgt_df: HGT detection DataFrame (optional).
+        phage_mobile_df: Phage/mobile element DataFrame (optional).
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+        gff_path: GFF3 annotation file for genomic coordinates (optional).
+    """
+    _apply_style()
+    if enc_df is None or enc_df.empty:
+        return
+
+    # Build positional index
+    gene_positions = _get_gene_positions(rscu_gene_df, enc_df, gff_path)
+    if gene_positions.empty:
+        return
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True,
+                             gridspec_kw={"height_ratios": [1.2, 1], "hspace": 0.08})
+    ax_top, ax_bot = axes
+
+    x = gene_positions["position"].values
+    genes = gene_positions["gene"].values
+
+    # --- Top track: codon usage deviation ---
+    if hgt_df is not None and "mahalanobis_dist" in hgt_df.columns:
+        merged = gene_positions.merge(hgt_df[["gene", "mahalanobis_dist"]], on="gene", how="left")
+        y_top = merged["mahalanobis_dist"].values
+        ax_top.set_ylabel("Mahalanobis\ndistance", fontsize=10)
+    else:
+        merged = gene_positions.merge(enc_df[["gene", "ENC"]], on="gene", how="left")
+        y_top = merged["ENC"].values
+        ax_top.set_ylabel("ENC", fontsize=10)
+
+    ax_top.fill_between(x, 0, y_top, color="#4a90d9", alpha=0.4, linewidth=0)
+    ax_top.plot(x, y_top, color="#2c5f8a", linewidth=0.5, alpha=0.7)
+
+    # --- Bottom track: GC3 ---
+    merged_gc3 = gene_positions.merge(enc_df[["gene", "GC3"]], on="gene", how="left")
+    y_gc3 = merged_gc3["GC3"].values
+    gc3_mean = np.nanmean(y_gc3)
+    ax_bot.fill_between(x, gc3_mean, y_gc3, where=y_gc3 >= gc3_mean,
+                        color="#e8853d", alpha=0.4, linewidth=0, interpolate=True)
+    ax_bot.fill_between(x, gc3_mean, y_gc3, where=y_gc3 < gc3_mean,
+                        color="#5fa85f", alpha=0.4, linewidth=0, interpolate=True)
+    ax_bot.plot(x, y_gc3, color="#444444", linewidth=0.5, alpha=0.7)
+    ax_bot.axhline(gc3_mean, color="black", linestyle=":", linewidth=0.8, alpha=0.5)
+    ax_bot.set_ylabel("GC3", fontsize=10)
+    ax_bot.set_xlabel("Gene position (index)" if gff_path is None else "Genome position (kb)")
+
+    # --- Highlight MGE/phage genes ---
+    mge_genes = set()
+    if phage_mobile_df is not None and not phage_mobile_df.empty:
+        mob_col = next((c for c in ("is_mobilome", "mobilome") if c in phage_mobile_df.columns), None)
+        phage_col = next((c for c in ("is_phage_related", "is_phage", "phage_related") if c in phage_mobile_df.columns), None)
+        if mob_col:
+            mge_genes |= set(phage_mobile_df.loc[phage_mobile_df[mob_col].astype(bool), "gene"])
+        if phage_col:
+            mge_genes |= set(phage_mobile_df.loc[phage_mobile_df[phage_col].astype(bool), "gene"])
+
+    hgt_genes = set()
+    if hgt_df is not None and "hgt_flag" in hgt_df.columns:
+        hgt_genes = set(hgt_df.loc[hgt_df["hgt_flag"], "gene"])
+
+    # Draw bands
+    gene_to_x = dict(zip(genes, x))
+    for g in mge_genes:
+        if g in gene_to_x:
+            xpos = gene_to_x[g]
+            for a in (ax_top, ax_bot):
+                a.axvline(xpos, color="#e84040", alpha=0.25, linewidth=1.5)
+    for g in hgt_genes - mge_genes:
+        if g in gene_to_x:
+            xpos = gene_to_x[g]
+            for a in (ax_top, ax_bot):
+                a.axvline(xpos, color="#d9a032", alpha=0.2, linewidth=1.0)
+
+    # Legend proxies
+    from matplotlib.patches import Patch
+    legend_elements = []
+    if mge_genes:
+        legend_elements.append(Patch(facecolor="#e84040", alpha=0.4, label="MGE/phage"))
+    if hgt_genes - mge_genes:
+        legend_elements.append(Patch(facecolor="#d9a032", alpha=0.4, label="HGT candidate"))
+    if legend_elements:
+        ax_top.legend(handles=legend_elements, loc="upper right", fontsize=8)
+
+    ax_top.set_title(f"Codon usage landscape — {sample_id}", fontsize=12)
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_mge_vs_core_rscu(
+    rscu_gene_df: pd.DataFrame,
+    enc_df: pd.DataFrame,
+    hgt_df: pd.DataFrame,
+    phage_mobile_df: pd.DataFrame | None,
+    expr_df: pd.DataFrame | None,
+    output_path: Path,
+    sample_id: str = "",
+):
+    """Violin plots comparing codon usage metrics between MGE-associated and core genome genes.
+
+    Four panels: ENC, GC3, Mahalanobis distance, and CAI (if available).
+    Genes are split into MGE (mobilome + phage), other HGT candidates, and
+    core genome.  Mann-Whitney p-values annotated.
+
+    Args:
+        rscu_gene_df: Per-gene RSCU table.
+        enc_df: ENC + GC3 per gene.
+        hgt_df: HGT detection DataFrame.
+        phage_mobile_df: Phage/mobile element DataFrame (optional).
+        expr_df: Expression table (optional, for CAI).
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+    """
+    _apply_style()
+    if hgt_df is None or hgt_df.empty:
+        return
+
+    # Classify genes
+    mge_genes = set()
+    if phage_mobile_df is not None and not phage_mobile_df.empty:
+        for col in ("is_mobilome", "is_phage_related", "is_phage", "phage_related", "mobilome"):
+            if col in phage_mobile_df.columns:
+                mge_genes |= set(phage_mobile_df.loc[phage_mobile_df[col].astype(bool), "gene"])
+
+    hgt_only_genes = set()
+    if "hgt_flag" in hgt_df.columns:
+        hgt_only_genes = set(hgt_df.loc[hgt_df["hgt_flag"], "gene"]) - mge_genes
+
+    all_genes = set(enc_df["gene"]) if "gene" in enc_df.columns else set()
+    core_genes = all_genes - mge_genes - hgt_only_genes
+
+    if not mge_genes and not hgt_only_genes:
+        return
+
+    # Build combined table
+    merged = enc_df.copy()
+    if "mahalanobis_dist" in hgt_df.columns:
+        merged = merged.merge(hgt_df[["gene", "mahalanobis_dist"]], on="gene", how="left")
+    if expr_df is not None and "CAI" in expr_df.columns:
+        merged = merged.merge(expr_df[["gene", "CAI"]], on="gene", how="left")
+
+    def _assign_class(gene):
+        if gene in mge_genes:
+            return "MGE/phage"
+        elif gene in hgt_only_genes:
+            return "HGT candidate"
+        else:
+            return "Core genome"
+
+    merged["gene_class"] = merged["gene"].apply(_assign_class)
+
+    # Determine panels
+    panels = []
+    if "ENC" in merged.columns:
+        panels.append(("ENC", "ENC"))
+    if "GC3" in merged.columns:
+        panels.append(("GC3", "GC3"))
+    if "mahalanobis_dist" in merged.columns:
+        panels.append(("mahalanobis_dist", "Mahalanobis distance"))
+    if "CAI" in merged.columns:
+        panels.append(("CAI", "CAI"))
+
+    if not panels:
+        return
+
+    n_panels = len(panels)
+    fig, axes = plt.subplots(1, n_panels, figsize=(3.5 * n_panels, 5))
+    if n_panels == 1:
+        axes = [axes]
+
+    order = ["Core genome", "HGT candidate", "MGE/phage"]
+    order = [o for o in order if o in merged["gene_class"].unique()]
+    palette = {"Core genome": "#b0b0b0", "HGT candidate": "#d9a032", "MGE/phage": "#e84040"}
+
+    for ax, (col, label) in zip(axes, panels):
+        plot_data = merged.dropna(subset=[col])
+        if plot_data.empty:
+            ax.set_visible(False)
+            continue
+
+        sns.violinplot(
+            data=plot_data, x="gene_class", y=col, order=order,
+            palette=palette, ax=ax, inner="box", cut=0, linewidth=0.8,
+        )
+        ax.set_xlabel("")
+        ax.set_ylabel(label)
+        ax.tick_params(axis="x", rotation=25)
+
+        # Mann-Whitney U: MGE/phage vs core
+        if "Core genome" in order and len(order) >= 2:
+            test_class = "MGE/phage" if "MGE/phage" in order else order[-1]
+            core_vals = plot_data.loc[plot_data["gene_class"] == "Core genome", col].dropna()
+            test_vals = plot_data.loc[plot_data["gene_class"] == test_class, col].dropna()
+            if len(core_vals) >= 3 and len(test_vals) >= 3:
+                _, pval = stats.mannwhitneyu(core_vals, test_vals, alternative="two-sided")
+                sig_str = f"p = {pval:.2e}"
+                ax.set_title(sig_str, fontsize=8, fontstyle="italic")
+
+    fig.suptitle(f"Codon usage: MGE vs core genome — {sample_id}", fontsize=12, y=1.02)
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def _get_gene_positions(
+    rscu_gene_df: pd.DataFrame,
+    enc_df: pd.DataFrame,
+    gff_path: Path | None = None,
+) -> pd.DataFrame:
+    """Get gene positions from GFF or fall back to gene order.
+
+    Returns DataFrame with columns: gene, position.
+    """
+    genes_ordered = rscu_gene_df["gene"].tolist() if "gene" in rscu_gene_df.columns else []
+
+    if gff_path is not None and Path(gff_path).exists():
+        try:
+            positions = []
+            with open(gff_path) as f:
+                for line in f:
+                    if line.startswith("#"):
+                        continue
+                    parts = line.strip().split("\t")
+                    if len(parts) < 9 or parts[2] != "CDS":
+                        continue
+                    start = int(parts[3])
+                    attrs = parts[8]
+                    gene_id = None
+                    for tag in ("ID=", "Name=", "locus_tag="):
+                        if tag in attrs:
+                            for field in attrs.split(";"):
+                                if field.startswith(tag):
+                                    gene_id = field.split("=", 1)[1]
+                                    # Strip common prefixes
+                                    for prefix in ("cds-", "cds_", "gene-", "gene_", "CDS:"):
+                                        if gene_id.startswith(prefix):
+                                            gene_id = gene_id[len(prefix):]
+                                    break
+                        if gene_id:
+                            break
+                    if gene_id:
+                        positions.append({"gene": gene_id, "position": start / 1000.0})
+
+            if positions:
+                pos_df = pd.DataFrame(positions).drop_duplicates(subset="gene")
+                # Only use genes present in our RSCU data
+                gene_set = set(genes_ordered)
+                pos_df = pos_df[pos_df["gene"].isin(gene_set)].sort_values("position")
+                if len(pos_df) > 10:
+                    return pos_df.reset_index(drop=True)
+        except Exception:
+            pass
+
+    # Fallback: gene order as position
+    if genes_ordered:
+        return pd.DataFrame({
+            "gene": genes_ordered,
+            "position": np.arange(len(genes_ordered)),
+        })
+    return pd.DataFrame()
+
+
 # ─── Master plot runner ──────────────────────────────────────────────────────
 
 
@@ -2135,6 +3129,7 @@ def generate_single_genome_plots(
     enrichment_results: dict[str, pd.DataFrame] | None = None,
     advanced_results: dict[str, pd.DataFrame] | None = None,
     bio_ecology_results: dict[str, pd.DataFrame | dict] | None = None,
+    gff_path: Path | None = None,
 ) -> dict[str, Path]:
     """Generate all single-genome plots.
 
@@ -2156,6 +3151,16 @@ def generate_single_genome_plots(
             logger.warning("Codon frequency bar plot failed: %s", e)
     else:
         logger.info("SKIPPED: codon frequency bar plot (no frequency data)")
+
+    if freq_df is not None and not freq_df.empty:
+        try:
+            p = plot_dir / f"{sample_id}_rscu_heatmap_rounded"
+            plot_rscu_heatmap_rounded(freq_df, p, sample_id)
+            outputs["rscu_heatmap_rounded"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Rounded RSCU heatmap failed: %s", e)
+    else:
+        logger.info("SKIPPED: rounded RSCU heatmap (no frequency data)")
 
     if rscu_all is not None:
         try:
@@ -2234,6 +3239,33 @@ def generate_single_genome_plots(
     else:
         logger.info("SKIPPED: expression distribution and tier plots (no expression data)")
 
+    # ── Ribosomal vs high-expression codon usage plots ──────────────
+    if (rscu_gene_df is not None and not rscu_gene_df.empty
+            and rscu_rp is not None
+            and expr_df is not None and not expr_df.empty):
+        try:
+            p = plot_dir / f"{sample_id}_rp_vs_he_rscu"
+            plot_rp_vs_he_rscu(rscu_gene_df, rscu_rp, expr_df, p, sample_id)
+            outputs["rp_vs_he_rscu"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("RP vs HE RSCU bar plot failed: %s", e)
+
+        try:
+            p = plot_dir / f"{sample_id}_rp_he_rscu_scatter"
+            plot_rp_he_rscu_scatter(rscu_gene_df, rscu_rp, expr_df, p, sample_id)
+            outputs["rp_he_rscu_scatter"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("RP vs HE RSCU scatter failed: %s", e)
+
+        try:
+            p = plot_dir / f"{sample_id}_rp_he_delta_heatmap"
+            plot_rp_he_delta_heatmap(rscu_gene_df, rscu_rp, expr_df, p, sample_id)
+            outputs["rp_he_delta_heatmap"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("RP/HE ΔRSCU heatmap failed: %s", e)
+    else:
+        logger.info("SKIPPED: ribosomal vs high-expression plots (missing RSCU, RP, or expression data)")
+
     # Enrichment plots
     if enrichment_results:
         # Per-comparison bar plots
@@ -2289,6 +3321,8 @@ def generate_single_genome_plots(
     if bio_ecology_results:
         _generate_bio_ecology_plots(
             bio_ecology_results, plot_dir, sample_id, outputs,
+            rscu_gene_df=rscu_gene_df, enc_df=enc_df,
+            expr_df=expr_df, gff_path=gff_path,
         )
     else:
         logger.info("SKIPPED: bio/ecology plots (no bio/ecology analysis data)")
@@ -2430,6 +3464,10 @@ def _generate_bio_ecology_plots(
     plot_dir: Path,
     sample_id: str,
     outputs: dict[str, Path],
+    rscu_gene_df: pd.DataFrame | None = None,
+    enc_df: pd.DataFrame | None = None,
+    expr_df: pd.DataFrame | None = None,
+    gff_path: Path | None = None,
 ):
     """Generate bio/ecology analysis plots from pre-computed data.
 
@@ -2512,6 +3550,49 @@ def _generate_bio_ecology_plots(
     else:
         logger.info("SKIPPED: growth rate gauge plot (no growth rate data)")
 
+    # gRodon2 summary
+    grodon_data = bio.get("grodon2_prediction")
+    if isinstance(grodon_data, dict) and grodon_data:
+        try:
+            cai_data = bio.get("growth_rate") if isinstance(bio.get("growth_rate"), dict) else None
+            p = plot_dir / f"{sample_id}_grodon2_summary"
+            plot_grodon2_summary(grodon_data, cai_data, p, sample_id)
+            outputs["grodon2_summary"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("gRodon2 summary plot failed: %s", e)
+    else:
+        logger.info("SKIPPED: gRodon2 summary plot (no gRodon2 data)")
+
+    # Genomic CU landscape
+    hgt_data = bio.get("hgt") if isinstance(bio.get("hgt"), pd.DataFrame) else None
+    phage_data = bio.get("phage_mobile") if isinstance(bio.get("phage_mobile"), pd.DataFrame) else None
+    if rscu_gene_df is not None and enc_df is not None:
+        try:
+            p = plot_dir / f"{sample_id}_genomic_cu_landscape"
+            plot_genomic_cu_landscape(
+                rscu_gene_df, enc_df, hgt_data, phage_data,
+                p, sample_id, gff_path=gff_path,
+            )
+            outputs["genomic_cu_landscape"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Genomic CU landscape plot failed: %s", e)
+    else:
+        logger.info("SKIPPED: genomic CU landscape plot (no RSCU/ENC data)")
+
+    # MGE vs core genome codon usage
+    if hgt_data is not None and not hgt_data.empty and rscu_gene_df is not None and enc_df is not None:
+        try:
+            p = plot_dir / f"{sample_id}_mge_vs_core_rscu"
+            plot_mge_vs_core_rscu(
+                rscu_gene_df, enc_df, hgt_data, phage_data, expr_df,
+                p, sample_id,
+            )
+            outputs["mge_vs_core_rscu"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("MGE vs core RSCU plot failed: %s", e)
+    else:
+        logger.info("SKIPPED: MGE vs core RSCU plot (no HGT data)")
+
 
 def generate_batch_plots(
     combined_df: pd.DataFrame,
@@ -2581,4 +3662,916 @@ def generate_batch_plots(
             plot_significance_heatmap(wdf, p, title=f"Significance: {key}")
             outputs[f"significance_{key}"] = p.with_suffix(".png")
 
+    return outputs
+
+
+# ─── Qualitative pairwise / small-batch comparison plots ───────────────────
+#
+# These plots work with any number of samples >= 2, without statistical tests.
+# They provide visual comparisons that are useful when sample sizes are too
+# small for formal hypothesis testing.
+
+
+def _load_sample_data(
+    sample_outputs: dict[str, dict[str, Path]],
+) -> dict[str, dict]:
+    """Load per-sample TSV data for pairwise comparison plots.
+
+    Returns a dict keyed by sample_id, each containing DataFrames and dicts
+    for the available analyses.
+    """
+    data: dict[str, dict] = {}
+    for sid, paths in sample_outputs.items():
+        entry: dict = {"sample_id": sid}
+
+        # RSCU median
+        p = paths.get("rscu_median")
+        if p and Path(p).exists():
+            try:
+                entry["rscu_median"] = pd.read_csv(p, sep="\t")
+            except Exception:
+                pass
+
+        # Ribosomal RSCU
+        p = paths.get("rscu_ribosomal")
+        if p and Path(p).exists():
+            try:
+                entry["rscu_ribosomal"] = pd.read_csv(p, sep="\t")
+            except Exception:
+                pass
+
+        # ENC
+        p = paths.get("enc")
+        if p and Path(p).exists():
+            try:
+                entry["enc"] = pd.read_csv(p, sep="\t")
+            except Exception:
+                pass
+
+        # Expression
+        p = paths.get("expression_combined")
+        if p and Path(p).exists():
+            try:
+                entry["expression"] = pd.read_csv(p, sep="\t")
+            except Exception:
+                pass
+
+        # Enrichment results
+        enrich = {}
+        for key, ep in paths.items():
+            if key.startswith("enrichment_") and ep and Path(ep).exists():
+                try:
+                    enrich[key] = pd.read_csv(ep, sep="\t")
+                except Exception:
+                    pass
+        if enrich:
+            entry["enrichment"] = enrich
+
+        # HGT candidates
+        for key in ("bio_hgt_candidates_path", "bio_hgt_candidates", "hgt_candidates"):
+            p = paths.get(key)
+            if p and Path(p).exists():
+                try:
+                    entry["hgt"] = pd.read_csv(p, sep="\t")
+                    break
+                except Exception:
+                    pass
+
+        # Phage/mobile elements
+        for key in ("bio_phage_mobile_elements_path", "bio_phage_mobile_elements", "phage_mobile_elements"):
+            p = paths.get(key)
+            if p and Path(p).exists():
+                try:
+                    entry["phage_mobile"] = pd.read_csv(p, sep="\t")
+                    break
+                except Exception:
+                    pass
+
+        # Strand asymmetry
+        for key in ("bio_strand_asymmetry_path", "bio_strand_asymmetry", "strand_asymmetry"):
+            p = paths.get(key)
+            if p and Path(p).exists():
+                try:
+                    entry["strand_asymmetry"] = pd.read_csv(p, sep="\t")
+                    break
+                except Exception:
+                    pass
+
+        # Operon coadaptation
+        for key in ("bio_operon_coadaptation_path", "bio_operon_coadaptation", "operon_coadaptation"):
+            p = paths.get(key)
+            if p and Path(p).exists():
+                try:
+                    entry["operon_coadaptation"] = pd.read_csv(p, sep="\t")
+                    break
+                except Exception:
+                    pass
+
+        # Growth rate
+        for key in ("bio_growth_rate_prediction_path", "bio_growth_rate_prediction"):
+            p = paths.get(key)
+            if p and Path(p).exists():
+                try:
+                    import json as _json
+                    entry["growth_rate"] = _json.loads(Path(p).read_text())
+                    break
+                except Exception:
+                    # Growth rate TSV is also common
+                    try:
+                        _gr_df = pd.read_csv(p, sep="\t")
+                        if not _gr_df.empty:
+                            entry["growth_rate"] = _gr_df.iloc[0].to_dict()
+                        break
+                    except Exception:
+                        pass
+
+        # gRodon2 prediction
+        for key in ("bio_grodon2_prediction_path", "bio_grodon2_prediction"):
+            p = paths.get(key)
+            if p and Path(p).exists():
+                try:
+                    _gd_df = pd.read_csv(p, sep="\t")
+                    if not _gd_df.empty:
+                        entry["grodon2"] = _gd_df.iloc[0].to_dict()
+                    break
+                except Exception:
+                    pass
+
+        # Translational selection - optimal codons
+        for key in ("bio_trans_sel_optimal_codons_path", "bio_trans_sel_optimal_codons"):
+            p = paths.get(key)
+            if p and Path(p).exists():
+                try:
+                    entry["optimal_codons"] = pd.read_csv(p, sep="\t")
+                    break
+                except Exception:
+                    pass
+
+        # Codon frequency table
+        p = paths.get("codon_frequency")
+        if p and Path(p).exists():
+            try:
+                entry["codon_frequency"] = pd.read_csv(p, sep="\t")
+            except Exception:
+                pass
+
+        data[sid] = entry
+
+    return data
+
+
+def plot_pairwise_rscu_overlay(
+    sample_data: dict[str, dict],
+    output_path: Path,
+):
+    """Overlaid RSCU bar chart comparing all genomes.
+
+    Each genome's genome-wide median RSCU is plotted as a semi-transparent
+    colored bar.  Shared preferences appear as tall stacked bars; divergent
+    codons show up as mismatched heights.
+
+    Args:
+        sample_data: Per-sample data from _load_sample_data().
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    sids = sorted(sample_data.keys())
+    profiles = {}
+    for sid in sids:
+        df = sample_data[sid].get("rscu_median")
+        if df is not None:
+            rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
+            if rscu_cols and len(df) > 0:
+                profiles[sid] = {c: df[c].iloc[0] for c in rscu_cols}
+
+    if len(profiles) < 2:
+        return
+
+    common_cols = sorted(set.intersection(*[set(p.keys()) for p in profiles.values()]))
+    if len(common_cols) < 10:
+        return
+
+    n = len(common_cols)
+    n_samples = len(profiles)
+    bar_w = 0.8 / n_samples
+    x = np.arange(n)
+    palette = sns.color_palette("Set2", n_samples)
+
+    fig, ax = plt.subplots(figsize=(max(14, n * 0.35), 6))
+    for i, (sid, vals) in enumerate(profiles.items()):
+        y = [vals.get(c, 0) for c in common_cols]
+        offset = (i - n_samples / 2 + 0.5) * bar_w
+        ax.bar(x + offset, y, bar_w, label=sid, color=palette[i],
+               edgecolor="white", linewidth=0.3, alpha=0.75)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([c.split("-")[-1] for c in common_cols], rotation=90, fontsize=6)
+    ax.axhline(1.0, color="black", linestyle=":", linewidth=0.8, alpha=0.4)
+    ax.set_ylabel("RSCU")
+    ax.set_title("Genome-wide RSCU comparison")
+    ax.legend(fontsize=7, loc="upper right", ncol=min(n_samples, 4))
+
+    _add_aa_family_spans(ax, common_cols, n)
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_pairwise_rscu_delta_heatmap(
+    sample_data: dict[str, dict],
+    output_path: Path,
+):
+    """Heatmap of ΔRSCU between genomes.
+
+    Rows = codons (grouped by amino acid).  For 2 genomes the single column
+    shows the signed difference.  For >2 genomes each column is a pairwise
+    comparison.  Codons with large absolute differences are the most
+    discriminating markers.
+
+    Args:
+        sample_data: Per-sample data from _load_sample_data().
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    sids = sorted(sample_data.keys())
+    profiles = {}
+    for sid in sids:
+        df = sample_data[sid].get("rscu_median")
+        if df is not None:
+            rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
+            if rscu_cols and len(df) > 0:
+                profiles[sid] = {c: df[c].iloc[0] for c in rscu_cols}
+
+    if len(profiles) < 2:
+        return
+
+    common_cols = sorted(set.intersection(*[set(p.keys()) for p in profiles.values()]))
+    if len(common_cols) < 10:
+        return
+
+    # Build pairwise difference columns
+    pairs = []
+    for i in range(len(sids)):
+        for j in range(i + 1, len(sids)):
+            if sids[i] in profiles and sids[j] in profiles:
+                pairs.append((sids[i], sids[j]))
+
+    if not pairs:
+        return
+
+    # Limit to 10 pairwise comparisons for readability
+    pairs = pairs[:10]
+
+    mat_data = {}
+    for s1, s2 in pairs:
+        label = f"{s1}\nvs\n{s2}" if len(pairs) <= 5 else f"{s1} vs {s2}"
+        mat_data[label] = [profiles[s1].get(c, 0) - profiles[s2].get(c, 0) for c in common_cols]
+
+    mat = pd.DataFrame(mat_data, index=[c.split("-")[-1] for c in common_cols])
+
+    vmax = max(abs(mat.values.min()), abs(mat.values.max()), 0.3)
+    fig_w = max(4, len(pairs) * 1.5 + 2)
+    fig, ax = plt.subplots(figsize=(fig_w, max(10, len(common_cols) * 0.22)))
+    sns.heatmap(
+        mat, ax=ax, cmap="RdBu_r", center=0, vmin=-vmax, vmax=vmax,
+        linewidths=0.3, linecolor="white",
+        cbar_kws={"label": "ΔRSCU", "shrink": 0.6},
+        annot=len(pairs) <= 3, fmt=".2f", annot_kws={"size": 5},
+    )
+    ax.set_ylabel("Codon")
+    ax.set_title("Pairwise RSCU differences")
+    ax.tick_params(axis="y", labelsize=6)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_genome_metrics_comparison(
+    sample_data: dict[str, dict],
+    combined_rscu: pd.DataFrame,
+    output_path: Path,
+):
+    """Multi-panel dot plot comparing key genome-level metrics across samples.
+
+    Panels: median ENC, median GC3, median CAI, predicted doubling time,
+    HGT gene count, MGE/phage gene count.  Each sample is a labeled dot.
+
+    Args:
+        sample_data: Per-sample data from _load_sample_data().
+        combined_rscu: Combined RSCU table (for IQR-based metrics).
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    sids = sorted(sample_data.keys())
+    rows = []
+    for sid in sids:
+        row = {"sample_id": sid}
+        enc_df = sample_data[sid].get("enc")
+        if enc_df is not None and "ENC" in enc_df.columns:
+            row["Median ENC"] = enc_df["ENC"].median()
+            row["Median GC3"] = enc_df["GC3"].median() if "GC3" in enc_df.columns else np.nan
+
+        expr = sample_data[sid].get("expression")
+        if expr is not None:
+            for m in ("CAI", "MELP", "Fop"):
+                if m in expr.columns:
+                    row[f"Median {m}"] = expr[m].median()
+
+        gr = sample_data[sid].get("growth_rate")
+        if isinstance(gr, dict) and "predicted_doubling_time_hours" in gr:
+            row["Doubling time\n(CAI, h)"] = gr["predicted_doubling_time_hours"]
+
+        grodon = sample_data[sid].get("grodon2")
+        if isinstance(grodon, dict) and "predicted_doubling_time_hours" in grodon:
+            row["Doubling time\n(gRodon2, h)"] = grodon["predicted_doubling_time_hours"]
+            if "CUBHE" in grodon:
+                row["CUBHE"] = grodon["CUBHE"]
+            if "ConsistencyHE" in grodon:
+                row["ConsistencyHE"] = grodon["ConsistencyHE"]
+
+        hgt = sample_data[sid].get("hgt")
+        if hgt is not None:
+            if "hgt_flag" in hgt.columns:
+                row["HGT genes"] = int(hgt["hgt_flag"].sum())
+            row["Total genes"] = len(hgt)
+
+        phage = sample_data[sid].get("phage_mobile")
+        if phage is not None:
+            for col in ("is_mobilome", "mobilome"):
+                if col in phage.columns:
+                    row["Mobilome genes"] = int(phage[col].astype(bool).sum())
+                    break
+            for col in ("is_phage_related", "is_phage", "phage_related"):
+                if col in phage.columns:
+                    row["Phage genes"] = int(phage[col].astype(bool).sum())
+                    break
+
+        operon = sample_data[sid].get("operon_coadaptation")
+        if operon is not None and not operon.empty:
+            if "mean_rscu_distance" in operon.columns:
+                row["Operon CU\ncoadaptation"] = operon["mean_rscu_distance"].median()
+
+        rows.append(row)
+
+    metrics_df = pd.DataFrame(rows)
+    metric_cols = [c for c in metrics_df.columns if c != "sample_id"
+                   and metrics_df[c].notna().sum() >= 2]
+    if not metric_cols:
+        return
+
+    n_panels = len(metric_cols)
+    ncols = min(n_panels, 4)
+    nrows = (n_panels + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.5 * ncols, 3.5 * nrows))
+    axes_flat = np.atleast_1d(axes).flatten()
+
+    palette = sns.color_palette("Set2", len(sids))
+    sid_colors = dict(zip(sids, palette))
+
+    for i, col in enumerate(metric_cols):
+        ax = axes_flat[i]
+        vals = metrics_df.dropna(subset=[col])
+        for _, row in vals.iterrows():
+            ax.scatter(row[col], row["sample_id"], s=80,
+                       color=sid_colors[row["sample_id"]],
+                       edgecolors="black", linewidth=0.5, zorder=3)
+        ax.set_xlabel(col, fontsize=9)
+        if i % ncols == 0:
+            ax.set_ylabel("")
+        ax.tick_params(axis="y", labelsize=8)
+        ax.grid(axis="x", alpha=0.3)
+
+    for j in range(i + 1, len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    fig.suptitle("Genome metric comparison", fontsize=12, y=1.02)
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_expression_tier_comparison(
+    sample_data: dict[str, dict],
+    output_path: Path,
+):
+    """Stacked bar chart comparing expression tier proportions across genomes.
+
+    For each expression metric (CAI, MELP, Fop), shows the fraction of genes
+    in high/medium/low tiers per genome.
+
+    Args:
+        sample_data: Per-sample data from _load_sample_data().
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    sids = sorted(sample_data.keys())
+    tier_data = []
+    for sid in sids:
+        expr = sample_data[sid].get("expression")
+        if expr is None:
+            continue
+        for metric in ("CAI", "MELP", "Fop"):
+            col = f"{metric}_class"
+            if col not in expr.columns:
+                continue
+            counts = expr[col].value_counts()
+            total = counts.sum()
+            for tier in ("high", "medium", "low"):
+                tier_data.append({
+                    "sample_id": sid, "metric": metric, "tier": tier,
+                    "fraction": counts.get(tier, 0) / total if total > 0 else 0,
+                })
+
+    if not tier_data:
+        return
+
+    df = pd.DataFrame(tier_data)
+    metrics = df["metric"].unique()
+    n_metrics = len(metrics)
+
+    fig, axes = plt.subplots(1, n_metrics, figsize=(3 * n_metrics + 1, max(4, len(sids) * 0.6 + 1)))
+    if n_metrics == 1:
+        axes = [axes]
+
+    tier_colors = {"high": "#e8853d", "medium": "#b0b0b0", "low": "#4a90d9"}
+
+    for ax, metric in zip(axes, metrics):
+        sub = df[df["metric"] == metric]
+        sample_order = sids
+        bottom = np.zeros(len(sample_order))
+        for tier in ("high", "medium", "low"):
+            tier_vals = []
+            for sid in sample_order:
+                match = sub[(sub["sample_id"] == sid) & (sub["tier"] == tier)]
+                tier_vals.append(match["fraction"].iloc[0] if len(match) > 0 else 0)
+            ax.barh(sample_order, tier_vals, left=bottom, height=0.6,
+                    color=tier_colors[tier], label=tier, edgecolor="white", linewidth=0.3)
+            bottom += np.array(tier_vals)
+        ax.set_xlabel("Fraction of genes")
+        ax.set_title(metric, fontsize=10)
+        ax.set_xlim(0, 1)
+        if ax == axes[0]:
+            ax.legend(fontsize=7, loc="lower right")
+
+    fig.suptitle("Expression tier distribution", fontsize=12, y=1.02)
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_enrichment_comparison_heatmap(
+    sample_data: dict[str, dict],
+    output_path: Path,
+):
+    """Heatmap of pathway enrichment significance across genomes.
+
+    Rows = KEGG pathways (union across all samples), columns = genomes.
+    Cell colour = −log10(FDR).  Shows shared and genome-specific enrichments.
+
+    Args:
+        sample_data: Per-sample data from _load_sample_data().
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    sids = sorted(sample_data.keys())
+
+    # Collect all enrichment results, keeping only significant or top pathways
+    all_rows = []
+    for sid in sids:
+        enrichments = sample_data[sid].get("enrichment", {})
+        for key, edf in enrichments.items():
+            if edf.empty or "fdr" not in edf.columns:
+                continue
+            metric_tier = key.replace("enrichment_", "")
+            for _, row in edf.iterrows():
+                pw_name = row.get("pathway_name", "") or row.get("pathway", "")
+                all_rows.append({
+                    "sample_id": sid,
+                    "pathway": pw_name if pw_name else row.get("pathway", ""),
+                    "fdr": row["fdr"],
+                    "metric_tier": metric_tier,
+                })
+
+    if not all_rows:
+        return
+
+    df = pd.DataFrame(all_rows)
+    df["neg_log_fdr"] = -np.log10(df["fdr"].clip(lower=1e-20))
+
+    # Pivot: pathway × sample_id, taking max significance across metric_tiers
+    pivot = df.pivot_table(
+        index="pathway", columns="sample_id", values="neg_log_fdr", aggfunc="max",
+    ).reindex(columns=sids)
+
+    # Keep top 30 pathways by max significance
+    max_sig = pivot.max(axis=1).sort_values(ascending=False)
+    pivot = pivot.loc[max_sig.head(30).index]
+
+    if pivot.empty or pivot.shape[0] < 1:
+        return
+
+    fig_h = max(5, pivot.shape[0] * 0.35 + 2)
+    fig_w = max(5, len(sids) * 1.5 + 3)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    sig_line = -np.log10(0.05)
+    sns.heatmap(
+        pivot.fillna(0), ax=ax, cmap="YlOrRd", vmin=0,
+        linewidths=0.5, linecolor="white",
+        cbar_kws={"label": "−log₁₀(FDR)", "shrink": 0.6},
+        annot=pivot.shape[1] <= 5, fmt=".1f", annot_kws={"size": 7},
+    )
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.set_title(f"Pathway enrichment comparison (red line: FDR = 0.05)")
+    ax.tick_params(axis="y", labelsize=7)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_bio_ecology_comparison(
+    sample_data: dict[str, dict],
+    output_path: Path,
+):
+    """Multi-panel comparison of bio/ecology features across genomes.
+
+    Panels: HGT Mahalanobis distribution, strand asymmetry significant codons,
+    operon coadaptation distances, and optimal codon counts.
+
+    Args:
+        sample_data: Per-sample data from _load_sample_data().
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    sids = sorted(sample_data.keys())
+    palette = sns.color_palette("Set2", len(sids))
+    sid_colors = dict(zip(sids, palette))
+
+    panels = []
+
+    # Panel 1: HGT Mahalanobis distance distributions
+    hgt_data = []
+    for sid in sids:
+        hgt = sample_data[sid].get("hgt")
+        if hgt is not None and "mahalanobis_dist" in hgt.columns:
+            for v in hgt["mahalanobis_dist"].dropna():
+                hgt_data.append({"sample_id": sid, "mahalanobis_dist": v})
+    if len(hgt_data) > 0:
+        panels.append(("hgt", pd.DataFrame(hgt_data)))
+
+    # Panel 2: Strand asymmetry — count of significant codons per sample
+    asym_data = []
+    for sid in sids:
+        sa = sample_data[sid].get("strand_asymmetry")
+        if sa is not None and "significant" in sa.columns:
+            n_sig = sa["significant"].sum()
+            n_total = len(sa)
+            asym_data.append({
+                "sample_id": sid,
+                "n_significant": int(n_sig),
+                "fraction_significant": n_sig / n_total if n_total > 0 else 0,
+            })
+    if asym_data:
+        panels.append(("strand_asym", pd.DataFrame(asym_data)))
+
+    # Panel 3: Operon coadaptation — distribution of mean RSCU distances
+    operon_data = []
+    for sid in sids:
+        op = sample_data[sid].get("operon_coadaptation")
+        if op is not None and "mean_rscu_distance" in op.columns:
+            for v in op["mean_rscu_distance"].dropna():
+                operon_data.append({"sample_id": sid, "mean_rscu_distance": v})
+    if operon_data:
+        panels.append(("operon", pd.DataFrame(operon_data)))
+
+    # Panel 4: Optimal codons — count per sample
+    opt_data = []
+    for sid in sids:
+        oc = sample_data[sid].get("optimal_codons")
+        if oc is not None and "is_optimal" in oc.columns:
+            n_optimal = (oc["is_optimal"] >= 1).sum()
+            n_top = (oc["is_optimal"] >= 2).sum()
+            opt_data.append({
+                "sample_id": sid,
+                "n_optimal": int(n_optimal),
+                "n_top_optimal": int(n_top),
+            })
+    if opt_data:
+        panels.append(("optimal", pd.DataFrame(opt_data)))
+
+    if not panels:
+        return
+
+    n_panels = len(panels)
+    fig, axes = plt.subplots(1, n_panels, figsize=(4 * n_panels, 5))
+    if n_panels == 1:
+        axes = [axes]
+
+    for ax, (ptype, pdf) in zip(axes, panels):
+        if ptype == "hgt":
+            sns.violinplot(data=pdf, x="sample_id", y="mahalanobis_dist",
+                           palette=sid_colors, ax=ax, inner="box", cut=0, linewidth=0.8)
+            ax.set_ylabel("Mahalanobis distance")
+            ax.set_xlabel("")
+            ax.set_title("HGT detection\n(CU deviation)", fontsize=10)
+        elif ptype == "strand_asym":
+            bars = [pdf.loc[pdf["sample_id"] == s, "n_significant"].values[0]
+                    for s in sids if s in pdf["sample_id"].values]
+            bar_sids = [s for s in sids if s in pdf["sample_id"].values]
+            ax.bar(bar_sids, bars, color=[sid_colors[s] for s in bar_sids],
+                   edgecolor="white", linewidth=0.5)
+            ax.set_ylabel("Significant codons")
+            ax.set_xlabel("")
+            ax.set_title("Strand asymmetry", fontsize=10)
+        elif ptype == "operon":
+            sns.violinplot(data=pdf, x="sample_id", y="mean_rscu_distance",
+                           palette=sid_colors, ax=ax, inner="box", cut=0, linewidth=0.8)
+            ax.set_ylabel("Mean RSCU distance")
+            ax.set_xlabel("")
+            ax.set_title("Operon codon\ncoadaptation", fontsize=10)
+        elif ptype == "optimal":
+            bar_data = {s: 0 for s in sids}
+            for _, row in pdf.iterrows():
+                bar_data[row["sample_id"]] = row["n_optimal"]
+            ax.bar(list(bar_data.keys()), list(bar_data.values()),
+                   color=[sid_colors[s] for s in bar_data],
+                   edgecolor="white", linewidth=0.5)
+            ax.set_ylabel("Optimal codons")
+            ax.set_xlabel("")
+            ax.set_title("Translational\nselection", fontsize=10)
+
+        ax.tick_params(axis="x", rotation=30, labelsize=8)
+
+    fig.suptitle("Biological & ecological feature comparison", fontsize=12, y=1.02)
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_hgt_mge_comparison(
+    sample_data: dict[str, dict],
+    output_path: Path,
+):
+    """Grouped bar chart comparing HGT, mobilome, and phage gene counts.
+
+    Three bar groups per genome: HGT candidates, mobilome genes, phage genes.
+    Provides a single-figure overview of foreign DNA burden across genomes.
+
+    Args:
+        sample_data: Per-sample data from _load_sample_data().
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    sids = sorted(sample_data.keys())
+    rows = []
+    for sid in sids:
+        row = {"sample_id": sid, "HGT candidates": 0, "Mobilome": 0, "Phage-related": 0}
+        hgt = sample_data[sid].get("hgt")
+        if hgt is not None and "hgt_flag" in hgt.columns:
+            row["HGT candidates"] = int(hgt["hgt_flag"].sum())
+        phage = sample_data[sid].get("phage_mobile")
+        if phage is not None:
+            for col in ("is_mobilome", "mobilome"):
+                if col in phage.columns:
+                    row["Mobilome"] = int(phage[col].astype(bool).sum())
+                    break
+            for col in ("is_phage_related", "is_phage", "phage_related"):
+                if col in phage.columns:
+                    row["Phage-related"] = int(phage[col].astype(bool).sum())
+                    break
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    categories = ["HGT candidates", "Mobilome", "Phage-related"]
+    has_data = any(df[c].sum() > 0 for c in categories)
+    if not has_data:
+        return
+
+    x = np.arange(len(sids))
+    bar_w = 0.25
+    cat_colors = {"HGT candidates": "#d9a032", "Mobilome": "#e84040", "Phage-related": "#9467bd"}
+
+    fig, ax = plt.subplots(figsize=(max(5, len(sids) * 2), 5))
+    for i, cat in enumerate(categories):
+        offset = (i - 1) * bar_w
+        ax.bar(x + offset, df[cat].values, bar_w, label=cat,
+               color=cat_colors[cat], edgecolor="white", linewidth=0.5)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(sids, rotation=30, ha="right")
+    ax.set_ylabel("Gene count")
+    ax.set_title("HGT and mobile genetic element comparison")
+    ax.legend(fontsize=8)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_rp_he_comparison_across_genomes(
+    sample_data: dict[str, dict],
+    output_path: Path,
+):
+    """Compare RP and high-expression RSCU profiles across genomes.
+
+    For each genome, shows the Euclidean distance between its ribosomal
+    and high-expression RSCU profiles as a horizontal bar, plus the
+    correlation coefficient.  Reveals whether the RP/HE relationship
+    is conserved or divergent across genomes.
+
+    Args:
+        sample_data: Per-sample data from _load_sample_data().
+        output_path: Base path for saving.
+    """
+    _apply_style()
+    sids = sorted(sample_data.keys())
+    rows = []
+    for sid in sids:
+        rp_df = sample_data[sid].get("rscu_ribosomal")
+        expr = sample_data[sid].get("expression")
+        enc_data = sample_data[sid].get("enc")
+
+        if rp_df is None or expr is None:
+            continue
+
+        rp_cols = [c for c in RSCU_COLUMN_NAMES if c in rp_df.columns]
+        if len(rp_cols) < 10 or len(rp_df) == 0:
+            continue
+
+        rp_vals = pd.Series({c: rp_df[c].iloc[0] for c in rp_cols})
+
+        # Load per-gene RSCU to compute HE median
+        rscu_all_path = sample_data[sid].get("rscu_median")
+        # We need per-gene RSCU to compute HE median — use rscu_median as genome reference
+        genome_vals = None
+        rscu_median_df = sample_data[sid].get("rscu_median")
+        if rscu_median_df is not None and len(rscu_median_df) > 0:
+            genome_vals = pd.Series({c: rscu_median_df[c].iloc[0] for c in rp_cols
+                                     if c in rscu_median_df.columns})
+
+        if genome_vals is None:
+            continue
+
+        # Euclidean distance RP vs genome
+        shared = sorted(set(rp_vals.index) & set(genome_vals.index))
+        if len(shared) < 10:
+            continue
+
+        rp_v = np.array([rp_vals[c] for c in shared])
+        gn_v = np.array([genome_vals[c] for c in shared])
+        mask = np.isfinite(rp_v) & np.isfinite(gn_v)
+
+        if mask.sum() < 10:
+            continue
+
+        dist = np.sqrt(np.sum((rp_v[mask] - gn_v[mask]) ** 2))
+        rho, _ = stats.spearmanr(rp_v[mask], gn_v[mask])
+
+        rows.append({
+            "sample_id": sid,
+            "rp_genome_distance": dist,
+            "rp_genome_rho": rho,
+        })
+
+    if len(rows) < 2:
+        return
+
+    df = pd.DataFrame(rows).sort_values("rp_genome_distance")
+    palette = sns.color_palette("Set2", len(df))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, max(4, len(df) * 0.5 + 1)))
+
+    # Distance bars
+    ax1.barh(df["sample_id"], df["rp_genome_distance"],
+             color=palette, edgecolor="white", linewidth=0.5)
+    ax1.set_xlabel("Euclidean distance\n(RP vs genome RSCU)")
+    ax1.set_title("RP codon usage\ndivergence from genome")
+
+    # Correlation dots
+    ax2.scatter(df["rp_genome_rho"], df["sample_id"], s=80,
+                color=palette, edgecolors="black", linewidth=0.5, zorder=3)
+    ax2.axvline(1.0, color="gray", linestyle=":", alpha=0.4)
+    ax2.set_xlabel("Spearman ρ\n(RP vs genome RSCU)")
+    ax2.set_title("RP–genome\ncorrelation")
+    ax2.set_xlim(min(df["rp_genome_rho"].min() - 0.05, 0.5), 1.05)
+
+    fig.suptitle("Ribosomal protein codon usage across genomes", fontsize=12, y=1.02)
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def generate_pairwise_comparison_plots(
+    sample_outputs: dict[str, dict[str, Path]],
+    combined_rscu: pd.DataFrame,
+    output_dir: Path,
+) -> dict[str, Path]:
+    """Generate qualitative comparison plots for small batches (≥2 genomes).
+
+    These plots do not require statistical tests or condition columns.
+    They provide visual comparisons of codon usage, expression, bio/ecology,
+    and enrichment across all samples.
+
+    Args:
+        sample_outputs: Per-sample pipeline output paths.
+        combined_rscu: Combined genome-level RSCU table.
+        output_dir: Base output directory.
+
+    Returns:
+        Dict of output plot paths.
+    """
+    plot_dir = output_dir / "comparison" / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    outputs: dict[str, Path] = {}
+
+    sample_data = _load_sample_data(sample_outputs)
+    if len(sample_data) < 2:
+        logger.info("SKIPPED: pairwise comparison plots (fewer than 2 samples)")
+        return outputs
+
+    logger.info("Generating qualitative comparison plots for %d genomes", len(sample_data))
+
+    # RSCU overlay comparison
+    try:
+        p = plot_dir / "rscu_overlay"
+        plot_pairwise_rscu_overlay(sample_data, p)
+        outputs["rscu_overlay"] = p.with_suffix(".png")
+    except Exception as e:
+        logger.warning("RSCU overlay plot failed: %s", e)
+
+    # RSCU difference heatmap
+    try:
+        p = plot_dir / "rscu_delta_heatmap"
+        plot_pairwise_rscu_delta_heatmap(sample_data, p)
+        outputs["rscu_delta_heatmap"] = p.with_suffix(".png")
+    except Exception as e:
+        logger.warning("RSCU delta heatmap failed: %s", e)
+
+    # Genome metrics comparison
+    try:
+        p = plot_dir / "genome_metrics"
+        plot_genome_metrics_comparison(sample_data, combined_rscu, p)
+        outputs["genome_metrics"] = p.with_suffix(".png")
+    except Exception as e:
+        logger.warning("Genome metrics comparison failed: %s", e)
+
+    # Expression tier comparison
+    try:
+        p = plot_dir / "expression_tiers"
+        plot_expression_tier_comparison(sample_data, p)
+        outputs["expression_tiers"] = p.with_suffix(".png")
+    except Exception as e:
+        logger.warning("Expression tier comparison failed: %s", e)
+
+    # Enrichment comparison heatmap
+    try:
+        p = plot_dir / "enrichment_comparison"
+        plot_enrichment_comparison_heatmap(sample_data, p)
+        outputs["enrichment_comparison"] = p.with_suffix(".png")
+    except Exception as e:
+        logger.warning("Enrichment comparison heatmap failed: %s", e)
+
+    # Bio/ecology multi-panel comparison
+    try:
+        p = plot_dir / "bio_ecology_comparison"
+        plot_bio_ecology_comparison(sample_data, p)
+        outputs["bio_ecology_comparison"] = p.with_suffix(".png")
+    except Exception as e:
+        logger.warning("Bio/ecology comparison failed: %s", e)
+
+    # HGT/MGE/phage comparison
+    try:
+        p = plot_dir / "hgt_mge_comparison"
+        plot_hgt_mge_comparison(sample_data, p)
+        outputs["hgt_mge_comparison"] = p.with_suffix(".png")
+    except Exception as e:
+        logger.warning("HGT/MGE comparison failed: %s", e)
+
+    # RP vs HE across genomes
+    try:
+        p = plot_dir / "rp_he_across_genomes"
+        plot_rp_he_comparison_across_genomes(sample_data, p)
+        outputs["rp_he_across_genomes"] = p.with_suffix(".png")
+    except Exception as e:
+        logger.warning("RP/HE comparison across genomes failed: %s", e)
+
+    # gRodon2 batch comparison
+    grodon_data = {
+        sid: d["grodon2"]
+        for sid, d in sample_data.items()
+        if "grodon2" in d and isinstance(d["grodon2"], dict)
+    }
+    if len(grodon_data) >= 2:
+        try:
+            cai_data = {
+                sid: d["growth_rate"]
+                for sid, d in sample_data.items()
+                if "growth_rate" in d and isinstance(d["growth_rate"], dict)
+            }
+            p = plot_dir / "grodon2_comparison"
+            plot_grodon2_batch_comparison(
+                grodon_data, cai_data if cai_data else None, p,
+            )
+            outputs["grodon2_comparison"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("gRodon2 batch comparison plot failed: %s", e)
+    else:
+        logger.info("SKIPPED: gRodon2 batch comparison plot (fewer than 2 genomes with gRodon2 data)")
+
+    logger.info("Generated %d pairwise comparison plots", len(outputs))
     return outputs
