@@ -854,8 +854,7 @@ def run_advanced_analyses(
     # 6. Delta RSCU
     if expr_df is not None:
         logger.info("Computing delta RSCU (high-expression vs genome avg) for %s", sample_id)
-        # Include ACE-derived expression classes when available
-        delta_class_cols = ["expression_class", "ace_MELP_class",
+        delta_class_cols = ["expression_class",
                            "CAI_class", "MELP_class", "Fop_class"]
         for class_col in delta_class_cols:
             if class_col in expr_df.columns:
