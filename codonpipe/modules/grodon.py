@@ -44,16 +44,32 @@ _INSTALL_R_SCRIPT = r"""
 #      or:  Rscript --no-save --no-restore <this_file>
 
 local({
+  # ── Ensure a writable user library exists ──────────────────────
+  # In non-interactive mode R will NOT prompt to create a personal
+  # library, so install.packages() may fail silently or install into
+  # a session-temp path that the next Rscript invocation cannot see.
+  user_lib <- Sys.getenv("R_LIBS_USER", unset = "")
+  if (nchar(user_lib) == 0 || grepl("%", user_lib)) {
+    user_lib <- file.path(Sys.getenv("HOME"), "R", "library")
+  }
+  if (!dir.exists(user_lib)) {
+    dir.create(user_lib, recursive = TRUE, showWarnings = FALSE)
+    cat(sprintf("Created user R library: %s\n", user_lib))
+  }
+  .libPaths(c(user_lib, .libPaths()))
+  cat(sprintf("R library paths: %s\n", paste(.libPaths(), collapse = "; ")))
+
   # 1. BiocManager (needed to install Bioconductor packages)
   if (!requireNamespace("BiocManager", quietly = TRUE))
-    install.packages("BiocManager", repos = "https://cloud.r-project.org")
+    install.packages("BiocManager", repos = "https://cloud.r-project.org",
+                     lib = user_lib)
 
   # 2. Bioconductor dependencies
   bioc_pkgs <- c("Biostrings", "coRdon")
   for (pkg in bioc_pkgs) {
     if (!requireNamespace(pkg, quietly = TRUE)) {
       cat(sprintf("Installing Bioconductor package: %s\n", pkg))
-      BiocManager::install(pkg, ask = FALSE, update = FALSE)
+      BiocManager::install(pkg, ask = FALSE, update = FALSE, lib = user_lib)
     }
   }
 
@@ -62,41 +78,73 @@ local({
   for (pkg in cran_pkgs) {
     if (!requireNamespace(pkg, quietly = TRUE)) {
       cat(sprintf("Installing CRAN package: %s\n", pkg))
-      install.packages(pkg, repos = "https://cloud.r-project.org")
+      install.packages(pkg, repos = "https://cloud.r-project.org",
+                       lib = user_lib)
     }
   }
 
   # 4. gRodon2 from GitHub
   if (!requireNamespace("gRodon", quietly = TRUE)) {
     cat("Installing gRodon2 from GitHub (jlw-ecoevo/gRodon2)\n")
-    remotes::install_github("jlw-ecoevo/gRodon2", upgrade = "never")
+    remotes::install_github("jlw-ecoevo/gRodon2", upgrade = "never",
+                            lib = user_lib)
   }
 
   # Verify
   library(gRodon)
   cat(sprintf("gRodon2 version %s installed successfully\n",
               paste(packageVersion("gRodon"), collapse = ".")))
+  cat(sprintf("INSTALL_LIB=%s\n", user_lib))
 })
 """
 
 
-def _probe_grodon(rscript: str) -> str | None:
+def _r_user_lib(rscript: str) -> str | None:
+    """Return the first user-writable R library path, creating it if needed."""
+    try:
+        result = subprocess.run(
+            [rscript, "--no-save", "--no-restore", "-e",
+             "cat(Sys.getenv('R_LIBS_USER', unset=path.expand('~/R/library')))"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            p = result.stdout.strip().split("\n")[-1]
+            # R_LIBS_USER can contain %V or %p placeholders
+            if "%" not in p:
+                return p
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return None
+
+
+def _probe_grodon(rscript: str, extra_lib: str | None = None) -> str | None:
     """Try to load gRodon2 in R. Returns the version string or None.
 
     Uses ``--no-save --no-restore`` instead of ``--vanilla`` so that
     ``.Renviron`` and ``.Rprofile`` are still read — this is critical
     for finding packages in user library paths (R_LIBS_USER).
+
+    If *extra_lib* is given it is prepended to ``.libPaths()`` before
+    the ``library()`` call, which handles the case where the user lib
+    directory was created during install but isn't on the default path.
     """
+    preamble = ""
+    if extra_lib:
+        preamble = f".libPaths(c('{extra_lib}', .libPaths())); "
     try:
         result = subprocess.run(
             [rscript, "--no-save", "--no-restore", "-e",
-             "library(gRodon); cat(packageVersion('gRodon')[[1]], sep='.')"],
+             preamble + "library(gRodon); cat(packageVersion('gRodon')[[1]], sep='.')"],
             capture_output=True,
             text=True,
             timeout=30,
         )
         if result.returncode == 0:
-            return result.stdout.strip()
+            ver = result.stdout.strip()
+            if ver:
+                return ver
+        else:
+            logger.debug("gRodon2 probe stderr:\n%s", result.stderr[:1000])
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
     return None
@@ -140,15 +188,32 @@ def install_grodon(timeout: int = 600) -> bool:
         if result.returncode == 0:
             logger.info("gRodon2 installation succeeded")
             logger.debug("gRodon2 install stdout:\n%s", result.stdout)
-            # Verify the install is loadable
+
+            # Extract the library path the install script used so the
+            # probe can look in the same place even if .Renviron is absent.
+            install_lib = None
+            for line in result.stdout.splitlines():
+                if line.startswith("INSTALL_LIB="):
+                    install_lib = line.split("=", 1)[1].strip()
+                    break
+
+            # Verify the install is loadable — try plain probe first,
+            # then with the explicit library path from the install.
             version = _probe_grodon(rscript)
+            if version is None and install_lib:
+                logger.debug(
+                    "Plain probe failed; retrying with lib=%s", install_lib
+                )
+                version = _probe_grodon(rscript, extra_lib=install_lib)
             if version is not None:
                 logger.info("gRodon2 version %s is now available", version)
                 return True
             else:
                 logger.error(
                     "gRodon2 install script succeeded but the package "
-                    "could not be loaded. Check R library paths."
+                    "could not be loaded. Check R library paths.\n"
+                    "Install lib: %s",
+                    install_lib or "(unknown)",
                 )
                 return False
         else:
@@ -185,6 +250,14 @@ def is_grodon_available() -> bool:
         return False
 
     version = _probe_grodon(rscript)
+    if version is None:
+        # The user library may not be on R's default .libPaths() (e.g.
+        # when .Renviron is absent or R_LIBS_USER has %V placeholders).
+        # Try once more with the conventional ~/R/library path.
+        user_lib = _r_user_lib(rscript)
+        if user_lib:
+            version = _probe_grodon(rscript, extra_lib=user_lib)
+
     if version is not None:
         logger.info("gRodon2: found version %s", version)
         _GRODON_AVAILABLE = True
@@ -203,6 +276,16 @@ def is_grodon_available() -> bool:
 _R_SCRIPT = r"""
 # gRodon2 wrapper called by CodonPipe
 # Arguments: <cds_fasta> <output_json>
+
+# Ensure user library is on the search path even when .Renviron is absent
+local({
+  user_lib <- Sys.getenv("R_LIBS_USER", unset = "")
+  if (nchar(user_lib) == 0 || grepl("%%", user_lib)) {
+    user_lib <- file.path(Sys.getenv("HOME"), "R", "library")
+  }
+  if (dir.exists(user_lib)) .libPaths(c(user_lib, .libPaths()))
+})
+
 suppressPackageStartupMessages({
   library(gRodon)
   library(Biostrings)
