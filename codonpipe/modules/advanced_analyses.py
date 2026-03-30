@@ -389,7 +389,12 @@ def compute_delta_rscu(
         delta_rscu columns.
     """
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
-    if not rscu_cols or class_col not in expr_df.columns:
+    if not rscu_cols:
+        logger.warning("Delta RSCU: no RSCU columns found in gene DataFrame")
+        return pd.DataFrame()
+    if class_col not in expr_df.columns:
+        logger.warning("Delta RSCU: classification column '%s' not found in expression data "
+                       "(available: %s)", class_col, list(expr_df.columns))
         return pd.DataFrame()
 
     # Merge RSCU with expression tiers
@@ -679,13 +684,12 @@ def compute_cog_enrichment(
     cog_slim.columns = ["gene", "cog_cat"]
     cog_slim["cog_cat"] = cog_slim["cog_cat"].astype(str)
 
-    # Explode multi-letter categories (e.g. "KL" -> "K", "L")
-    exploded = []
-    for _, row in cog_slim.iterrows():
-        for letter in row["cog_cat"]:
-            if letter.isalpha():
-                exploded.append({"gene": row["gene"], "cog_cat": letter})
-    cog_exploded = pd.DataFrame(exploded)
+    # Explode multi-letter categories (e.g. "KL" -> ["K", "L"])
+    cog_slim["cog_cat"] = cog_slim["cog_cat"].apply(
+        lambda s: [ch for ch in s if ch.isalpha()]
+    )
+    cog_exploded = cog_slim.explode("cog_cat").dropna(subset=["cog_cat"])
+    cog_exploded = cog_exploded[cog_exploded["cog_cat"].str.len() > 0]
 
     merged = cog_exploded.merge(expr_df[["gene", class_col]], on="gene", how="inner")
 
