@@ -19,6 +19,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from codonpipe.utils.statistics import benjamini_hochberg
+
 logger = logging.getLogger("codonpipe")
 
 # KEGG REST endpoint for the KO-to-pathway link table
@@ -262,21 +264,12 @@ def hypergeometric_enrichment(
     result = pd.DataFrame(rows).sort_values("p_value").reset_index(drop=True)
 
     # Benjamini-Hochberg FDR correction
-    n_tests = len(result)
-    if n_tests > 0:
-        ranked_pvals = result["p_value"].values
-        bh_fdr = np.zeros(n_tests)
-        for i in range(n_tests):
-            bh_fdr[i] = ranked_pvals[i] * n_tests / (i + 1)
-        # Enforce monotonicity (cumulative minimum from the right)
-        for i in range(n_tests - 2, -1, -1):
-            bh_fdr[i] = min(bh_fdr[i], bh_fdr[i + 1])
-        bh_fdr = np.minimum(bh_fdr, 1.0)
-        result["fdr"] = bh_fdr
+    if len(result) > 0:
+        result["fdr"] = benjamini_hochberg(result["p_value"].values)
         result["significant"] = result["fdr"] <= fdr_threshold
     else:
-        result["fdr"] = []
-        result["significant"] = []
+        result["fdr"] = pd.Series(dtype=float)
+        result["significant"] = pd.Series(dtype=bool)
 
     return result
 
@@ -433,7 +426,5 @@ def _find_ko_column(df: pd.DataFrame) -> str | None:
 
 def _find_gene_column(df: pd.DataFrame) -> str | None:
     """Find the gene ID column in a KofamScan DataFrame."""
-    for col in ("gene_name", "gene", "gene_id", "query", "query_id"):
-        if col in df.columns:
-            return col
-    return None
+    from codonpipe.utils.io import find_gene_id_column
+    return find_gene_id_column(df)
