@@ -535,7 +535,7 @@ def run_grodon(
         upper_ci = raw["upper_ci"]
 
         # Growth class (same thresholds as gRodon2's own warnings)
-        if d is None or d != d:  # NaN check
+        if d is None or (d is not None and np.isnan(d)):
             growth_class = "very_slow"
             caveat = "gRodon2 returned NaN; doubling time too long to estimate reliably."
         elif d > 5.0:
@@ -553,7 +553,7 @@ def run_grodon(
         # are extrapolations and should be flagged.
         training_min_hours = 0.2
         training_max_hours = 72.0
-        if d is not None and d == d:  # not NaN
+        if d is not None and not np.isnan(d):
             in_training_range = training_min_hours <= d <= training_max_hours
         else:
             in_training_range = False
