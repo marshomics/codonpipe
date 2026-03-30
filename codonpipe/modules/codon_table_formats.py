@@ -395,7 +395,7 @@ def generate_all_codon_tables(
     sample_id: str,
     expr_df: pd.DataFrame | None = None,
     rp_ids_file: Path | None = None,
-    gmm_cluster_gene_ids: set[str] | None = None,
+    mahal_cluster_gene_ids: set[str] | None = None,
 ) -> dict[str, Path]:
     """Generate comprehensive codon usage tables for multiple gene sets.
 
@@ -403,7 +403,7 @@ def generate_all_codon_tables(
     a) All genes (genome-wide)
     b) Ribosomal protein genes (from rp_ffn_path if provided)
     c) High-expression genes (if expr_df available)
-    d) GMM RP-cluster genes (if gmm_cluster_gene_ids provided)
+    d) Mahalanobis RP-cluster genes (if mahal_cluster_gene_ids provided)
 
     Saves tables as TSVs to output_dir/codon_tables/
     Naming: {sample_id}_{geneset}_{format}.tsv
@@ -416,7 +416,7 @@ def generate_all_codon_tables(
         expr_df: Optional DataFrame with expression data. Should have columns
                  'gene_id' and either 'expression_class' or 'CAI_class' with values like 'high'.
         rp_ids_file: Optional path to file with ribosomal protein gene IDs (one per line).
-        gmm_cluster_gene_ids: Optional set of gene IDs from the GMM RP cluster.
+        mahal_cluster_gene_ids: Optional set of gene IDs from the Mahalanobis RP cluster.
 
     Returns:
         Dict mapping output descriptions to file paths.
@@ -479,12 +479,12 @@ def generate_all_codon_tables(
                 "desc": "High-expression genes",
             }
 
-    # Add GMM RP-cluster genes if available
-    if gmm_cluster_gene_ids and len(gmm_cluster_gene_ids) >= 5:
-        gene_sets["gmm_cluster"] = {
+    # Add Mahalanobis RP-cluster genes if available
+    if mahal_cluster_gene_ids and len(mahal_cluster_gene_ids) >= 5:
+        gene_sets["mahal_cluster"] = {
             "ffn": ffn_path,
-            "gene_ids": gmm_cluster_gene_ids,
-            "desc": "GMM RP-cluster genes",
+            "gene_ids": mahal_cluster_gene_ids,
+            "desc": "Mahalanobis RP-cluster genes",
         }
 
     # Generate tables for each gene set
@@ -543,6 +543,8 @@ def generate_all_codon_tables(
     if "ribosomal" in gene_sets and "all" in gene_sets:
         logger.info("Computing codon adaptation weights (ribosomal vs all genes)")
         rp_ids = gene_sets["ribosomal"]["gene_ids"]
+        # Same file for both args: ref_gene_ids filters to ribosomal proteins,
+        # while all genes are read unfiltered for the denominator.
         weights_df = compute_codon_adaptation_weights(ffn_path, ffn_path, rp_ids)
 
         if not weights_df.empty:
@@ -583,37 +585,37 @@ def generate_all_codon_tables(
                     outputs["cbi"] = cbi_path
                     logger.info("Saved CBI to %s", cbi_path)
 
-    # Compute GMM-cluster-based adaptation weights and CBI (GMM cluster vs all genes)
-    if "gmm_cluster" in gene_sets and "all" in gene_sets:
-        logger.info("Computing codon adaptation weights (GMM RP-cluster vs all genes)")
-        gmm_ids = gene_sets["gmm_cluster"]["gene_ids"]
-        gmm_weights_df = compute_codon_adaptation_weights(ffn_path, ffn_path, gmm_ids)
+    # Compute Mahalanobis-cluster-based adaptation weights and CBI (Mahalanobis cluster vs all genes)
+    if "mahal_cluster" in gene_sets and "all" in gene_sets:
+        logger.info("Computing codon adaptation weights (Mahalanobis RP-cluster vs all genes)")
+        mahal_ids = gene_sets["mahal_cluster"]["gene_ids"]
+        mahal_weights_df = compute_codon_adaptation_weights(ffn_path, ffn_path, mahal_ids)
 
-        if not gmm_weights_df.empty:
-            gmm_w_path = codon_dir / f"{sample_id}_gmm_cluster_adaptation_weights.tsv"
-            gmm_weights_df.to_csv(gmm_w_path, sep="\t", index=False)
-            outputs["gmm_cluster_adaptation_weights"] = gmm_w_path
-            logger.info("Saved GMM-cluster adaptation weights to %s", gmm_w_path)
+        if not mahal_weights_df.empty:
+            mahal_w_path = codon_dir / f"{sample_id}_mahal_cluster_adaptation_weights.tsv"
+            mahal_weights_df.to_csv(mahal_w_path, sep="\t", index=False)
+            outputs["mahal_cluster_adaptation_weights"] = mahal_w_path
+            logger.info("Saved Mahalanobis-cluster adaptation weights to %s", mahal_w_path)
 
-            # Extract GMM-derived optimal codons and compute CBI
-            gmm_opt_sorted = (
-                gmm_weights_df[gmm_weights_df["is_optimal"]]
+            # Extract Mahalanobis-derived optimal codons and compute CBI
+            mahal_opt_sorted = (
+                mahal_weights_df[mahal_weights_df["is_optimal"]]
                 .sort_values("weight", ascending=False)
             )
-            gmm_optimal_codons = dict(
-                gmm_opt_sorted
+            mahal_optimal_codons = dict(
+                mahal_opt_sorted
                 .drop_duplicates(subset=["amino_acid"])
                 .set_index("amino_acid")["codon"]
             )
 
-            if gmm_optimal_codons:
-                logger.info("Computing CBI from GMM-cluster-derived optimal codons")
-                gmm_cbi_df = compute_cbi(ffn_path, gmm_optimal_codons)
-                if not gmm_cbi_df.empty:
-                    gmm_cbi_path = codon_dir / f"{sample_id}_gmm_cluster_cbi.tsv"
-                    gmm_cbi_df.to_csv(gmm_cbi_path, sep="\t", index=False)
-                    outputs["gmm_cluster_cbi"] = gmm_cbi_path
-                    logger.info("Saved GMM-cluster CBI to %s", gmm_cbi_path)
+            if mahal_optimal_codons:
+                logger.info("Computing CBI from Mahalanobis-cluster-derived optimal codons")
+                mahal_cbi_df = compute_cbi(ffn_path, mahal_optimal_codons)
+                if not mahal_cbi_df.empty:
+                    mahal_cbi_path = codon_dir / f"{sample_id}_mahal_cluster_cbi.tsv"
+                    mahal_cbi_df.to_csv(mahal_cbi_path, sep="\t", index=False)
+                    outputs["mahal_cluster_cbi"] = mahal_cbi_path
+                    logger.info("Saved Mahalanobis-cluster CBI to %s", mahal_cbi_path)
 
     logger.info("Codon table generation complete. Output directory: %s", codon_dir)
     return outputs
