@@ -254,14 +254,25 @@ def _calculate_enc(codon_counts: Counter) -> float:
             if f_avg > 0:
                 enc += n_families[k] / f_avg
             else:
-                # F_hat = 0 shouldn't happen with n > 1, but if it does
-                # treat as no bias: each family contributes k codons
+                # F_hat = 0 means every amino acid in this class uses a
+                # single codon exclusively — all p_i are 0 or 1 and
+                # sum(p_i^2) = 1, yet the (n*Σp² - 1)/(n-1) correction
+                # drove F̂ to 0.  This is a data edge-case (very low
+                # counts).  We fall back to assuming no bias (F = 1/k)
+                # so the contribution is n_families[k] / (1/k) = n_families[k] * k.
+                logger.warning(
+                    "ENC: F_avg=0 for %d-fold degenerate class — likely a "
+                    "low-count artefact. Falling back to no-bias assumption "
+                    "(F=1/%d). Consider filtering genes shorter than %d nt.",
+                    k, k, MIN_GENE_LENGTH,
+                )
                 enc += n_families[k] * k
         else:
             # No amino acids observed for this degeneracy class.
-            # Standard assumption (codonW convention): assume uniform usage (F = 1/k),
-            # which contributes n_families * k. This may overestimate ENC for genes
-            # with severely incomplete amino acid representation.
+            # codonW convention: assume uniform usage (F = 1/k), so the
+            # Wright formula contributes n_families[k] / (1/k) =
+            # n_families[k] * k.  This overestimates ENC for genes with
+            # severely incomplete amino acid representation.
             enc += n_families[k] * k
             logger.debug("ENC: no observed amino acids for %d-fold degenerate class; "
                         "assuming no bias (F=1/%d)", k, k)
