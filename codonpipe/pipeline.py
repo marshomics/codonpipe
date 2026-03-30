@@ -32,6 +32,8 @@ from codonpipe.plotting.plots import (
     generate_single_genome_plots,
     generate_batch_plots,
     generate_pairwise_comparison_plots,
+    plot_rscu_heatmap_rounded_comparison,
+    _mahal_rscu_to_freq_df,
 )
 from codonpipe.plotting.comparative_plots import generate_comparative_plots
 from codonpipe.utils.codon_tables import RSCU_COLUMN_NAMES
@@ -665,7 +667,6 @@ def run_single_genome(
         bio_ecology_results=bio_ecology_results if bio_ecology_results else None,
         gff_path=resolved_gff,
         mahal_cluster_rscu=mahal_cluster_rscu,
-        mahal_rp_cluster=mahal_results.get("mahal_rp_cluster"),
         mahal_cluster_size=len(mahal_cluster_gene_ids) if mahal_cluster_gene_ids else None,
     )
     all_outputs.update(plot_outputs)
@@ -929,6 +930,30 @@ def _run_batch_analyses(
             outputs.update(pairwise_outputs)
         except Exception as e:
             logger.warning("Pairwise comparison plots failed: %s", e)
+
+    # ── Comparative RSCU heatmap for exactly 2 genomes ────────────────
+    if len(sample_outputs) == 2:
+        try:
+            comp_freq_dfs: dict[str, pd.DataFrame] = {}
+            for sid, sout in sample_outputs.items():
+                mahal_path = sout.get("rscu_mahal_cluster")
+                if mahal_path and Path(mahal_path).exists():
+                    mahal_s = pd.read_csv(mahal_path, sep="\t", index_col=0)["RSCU"]
+                    comp_freq_dfs[sid] = _mahal_rscu_to_freq_df(mahal_s)
+            if len(comp_freq_dfs) == 2:
+                comp_plot_dir = output_dir / "batch_pairwise" / "plots"
+                comp_plot_dir.mkdir(parents=True, exist_ok=True)
+                comp_p = comp_plot_dir / "rscu_heatmap_comparison"
+                plot_rscu_heatmap_rounded_comparison(comp_freq_dfs, comp_p)
+                outputs["rscu_heatmap_comparison"] = comp_p.with_suffix(".png")
+                logger.info("Comparative RSCU heatmap saved to batch_pairwise/plots/")
+            else:
+                logger.info(
+                    "SKIPPED: comparative RSCU heatmap (Mahalanobis cluster RSCU "
+                    "available for %d/2 samples)", len(comp_freq_dfs),
+                )
+        except Exception as e:
+            logger.warning("Comparative RSCU heatmap failed: %s", e)
 
     # ── Condition-aware comparative analyses ──────────────────────────
     if condition_col:
