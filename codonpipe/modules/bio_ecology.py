@@ -31,6 +31,8 @@ from codonpipe.utils.codon_tables import (
     SENSE_CODONS,
     dna_to_rna,
 )
+from codonpipe.utils.io import find_gene_id_column
+from codonpipe.utils.statistics import benjamini_hochberg
 
 logger = logging.getLogger("codonpipe")
 
@@ -151,7 +153,7 @@ def detect_hgt_candidates(
     centroid using robust covariance estimation (LedoitWolf shrinkage). Also
     computes per-gene GC3 deviation from genome mean and a combined HGT flag.
 
-    When ``reference_rscu`` is provided (e.g. GMM cluster RSCU), distances are
+    When ``reference_rscu`` is provided (e.g. Mahalanobis cluster RSCU), distances are
     measured from that reference instead of the genome mean, making HGT calls
     relative to the translationally optimised gene pool.
 
@@ -166,7 +168,7 @@ def detect_hgt_candidates(
             threshold targeting this fraction.
         reference_rscu: Optional reference RSCU centroid (dict or Series keyed by
             RSCU column names). When provided, Mahalanobis distance is computed
-            from this reference instead of the genome mean. Typically the GMM
+            from this reference instead of the genome mean. Typically the Mahalanobis
             cluster RSCU from concatenated pooling.
 
     Returns:
@@ -198,19 +200,23 @@ def detect_hgt_candidates(
     valid_mask = ~(np.isnan(X) | np.isinf(X)).any(axis=1)
     if valid_mask.sum() < 10:
         logger.warning("Too few genes with complete RSCU data (%d) for HGT detection", valid_mask.sum())
-        return pd.DataFrame(columns=["gene", "mahalanobis_distance", "p_value", "p_adjusted",
-                                      "gc3_deviation", "is_hgt_candidate"])
+        return pd.DataFrame(columns=[
+            "gene", "mahalanobis_dist", "gc3_deviation", "p_value", "p_adjusted",
+            "hgt_flag_fdr", "hgt_flag_adaptive", "gc3_outlier", "hgt_flag_combined",
+        ])
     X = X[valid_mask]
     genes = genes[valid_mask]
     n_genes = X.shape[0]
 
     # If fewer genes than features, use PCA reduction first
+    pca_applied = False
     if n_genes < n_features:
         logger.info("Fewer genes (%d) than RSCU features (%d); applying PCA reduction",
                     n_genes, n_features)
         pca = PCA(n_components=min(n_genes - 1, n_features))
         X = pca.fit_transform(X)
         n_features = X.shape[1]
+        pca_applied = True
 
     # Compute robust covariance via LedoitWolf
     try:
@@ -222,7 +228,7 @@ def detect_hgt_candidates(
         cov = np.cov(X.T)
         cov_inv = np.linalg.pinv(cov)
 
-    # Reference centroid: GMM cluster RSCU if provided, else genome mean
+    # Reference centroid: Mahalanobis cluster RSCU if provided, else genome mean
     if reference_rscu is not None:
         ref_series = pd.Series(reference_rscu) if isinstance(reference_rscu, dict) else reference_rscu
         # Align to the same RSCU column order used in X
@@ -233,11 +239,10 @@ def detect_hgt_candidates(
             nan_mask = np.isnan(ref_vals)
             ref_vals[nan_mask] = genome_mean[nan_mask]
         # If PCA was applied, project reference into PCA space
-        if n_genes < n_features:
-            # pca was fitted above; n_features was updated to PCA dimension
+        if pca_applied:
             ref_vals = pca.transform(ref_vals.reshape(1, -1)).flatten()
         mean_rscu = ref_vals
-        logger.info("HGT detection: using provided reference RSCU (e.g. GMM cluster) as centroid")
+        logger.info("HGT detection: using provided reference RSCU (e.g. Mahalanobis cluster) as centroid")
     else:
         mean_rscu = X.mean(axis=0)
         logger.info("HGT detection: using genome mean RSCU as centroid")
@@ -273,19 +278,7 @@ def detect_hgt_candidates(
     gc3_deviations = np.array(gc3_deviations)
 
     # Benjamini-Hochberg FDR correction across all genes
-    n_genes = len(p_values)
-    if n_genes > 1:
-        order = np.argsort(p_values)
-        ranks = np.empty_like(order)
-        ranks[order] = np.arange(1, n_genes + 1)
-        p_adjusted = np.minimum(p_values * n_genes / ranks, 1.0)
-        # Enforce monotonicity
-        sorted_adj = p_adjusted[order]
-        for k in range(n_genes - 2, -1, -1):
-            sorted_adj[k] = min(sorted_adj[k], sorted_adj[k + 1])
-        p_adjusted[order] = sorted_adj
-    else:
-        p_adjusted = p_values.copy()
+    p_adjusted = benjamini_hochberg(p_values)
 
     # ── FDR-based flag (sensitivity parameter) ──────────────────────────
     fdr_thresholds = {"conservative": 0.001, "moderate": 0.01, "sensitive": 0.05}
@@ -351,11 +344,11 @@ def detect_hgt_candidates(
 def predict_growth_rate(
     expr_df: pd.DataFrame,
     rp_ids_file: Path | str | None = None,
-    gmm_cluster_gene_ids: list[str] | set[str] | None = None,
+    mahal_cluster_gene_ids: list[str] | set[str] | None = None,
 ) -> dict | None:
     """Predict minimum doubling time from codon adaptation of a reference gene set.
 
-    When *gmm_cluster_gene_ids* is provided (from GMM clustering), those genes
+    When *mahal_cluster_gene_ids* is provided (from Mahalanobis clustering), those genes
     are used as the reference set.  Otherwise, falls back to ribosomal proteins
     from *rp_ids_file* or a heuristic name match.
 
@@ -364,7 +357,7 @@ def predict_growth_rate(
     ``doubling_time = exp(a + b * mean_metric)``.
 
     The coefficients (a=7.15, b=-7.38) were calibrated on CAI of ribosomal
-    proteins, but apply equally to MELP and to broader GMM-derived reference
+    proteins, but apply equally to MELP and to broader Mahalanobis-derived reference
     sets because both metrics are normalised to [0, 1] with the same biological
     interpretation (higher = more adapted).
 
@@ -372,8 +365,8 @@ def predict_growth_rate(
         expr_df: Expression table with gene and at least one of MELP, CAI,
             or Fop columns.
         rp_ids_file: File with ribosomal protein gene IDs (one per line).
-                     Fallback when gmm_cluster_gene_ids is not provided.
-        gmm_cluster_gene_ids: Gene IDs from the GMM optimal cluster (preferred
+                     Fallback when mahal_cluster_gene_ids is not provided.
+        mahal_cluster_gene_ids: Gene IDs from the Mahalanobis optimal cluster (preferred
                               reference set when available).
 
     Returns:
@@ -391,13 +384,13 @@ def predict_growth_rate(
                        "cannot predict growth rate")
         return None
 
-    # Determine reference gene set: GMM cluster preferred, RP fallback
+    # Determine reference gene set: Mahalanobis cluster preferred, RP fallback
     ref_genes = set()
     ref_label = "unknown"
-    if gmm_cluster_gene_ids is not None and len(gmm_cluster_gene_ids) >= 3:
-        ref_genes = set(gmm_cluster_gene_ids)
-        ref_label = "gmm_cluster"
-        logger.info("Growth rate prediction using %s on GMM cluster (%d genes)",
+    if mahal_cluster_gene_ids is not None and len(mahal_cluster_gene_ids) >= 3:
+        ref_genes = set(mahal_cluster_gene_ids)
+        ref_label = "mahal_cluster"
+        logger.info("Growth rate prediction using %s on Mahalanobis cluster (%d genes)",
                      metric, len(ref_genes))
     else:
         if rp_ids_file is not None:
@@ -623,12 +616,10 @@ def quantify_translational_selection(
             n_opt = sum(gene_counts.get(c, 0) for c in optimal_codons_set if c in SENSE_CODONS)
             n_total = sum(gene_counts.get(c, 0) for c in SENSE_CODONS)
             if n_total > 0:
-                all_fop_vals.append(n_opt / n_total)
                 metric_val = merged.loc[merged["gene"] == rec.id, metric].values
                 if len(metric_val) > 0:
+                    all_fop_vals.append(n_opt / n_total)
                     all_metric_vals.append(metric_val[0])
-                else:
-                    all_fop_vals.pop()
 
         if len(all_fop_vals) >= 10:
             from scipy.stats import spearmanr
@@ -657,14 +648,12 @@ def quantify_translational_selection(
         # 5' region
         seq_5p = seq_upper[:region_nt]
         counts_5p = count_codons(seq_5p)
-        rscu_5p = compute_rscu_from_counts(counts_5p)
-        fop_5p = _compute_fop_from_rscu(rscu_5p, optimal_df) if not optimal_df.empty else np.nan
+        fop_5p = _compute_fop_from_counts(counts_5p, optimal_df) if not optimal_df.empty else np.nan
 
         # 3' region
         seq_3p = seq_upper[-region_nt:]
         counts_3p = count_codons(seq_3p)
-        rscu_3p = compute_rscu_from_counts(counts_3p)
-        fop_3p = _compute_fop_from_rscu(rscu_3p, optimal_df) if not optimal_df.empty else np.nan
+        fop_3p = _compute_fop_from_counts(counts_3p, optimal_df) if not optimal_df.empty else np.nan
 
         # Middle region
         mid_start = region_nt
@@ -672,8 +661,7 @@ def quantify_translational_selection(
         if mid_end > mid_start:
             seq_mid = seq_upper[mid_start:mid_end]
             counts_mid = count_codons(seq_mid)
-            rscu_mid = compute_rscu_from_counts(counts_mid)
-            fop_mid = _compute_fop_from_rscu(rscu_mid, optimal_df) if not optimal_df.empty else np.nan
+            fop_mid = _compute_fop_from_counts(counts_mid, optimal_df) if not optimal_df.empty else np.nan
         else:
             fop_mid = np.nan
 
@@ -697,20 +685,14 @@ def quantify_translational_selection(
     }
 
 
-def _compute_fop_from_rscu(rscu_dict: dict[str, float], optimal_df: pd.DataFrame) -> float:
-    """Helper: compute Fop from RSCU dict and optimal codon table."""
+def _compute_fop_from_counts(codon_counts: Counter, optimal_df: pd.DataFrame) -> float:
+    """Helper: compute Fop (fraction of optimal codons) from raw codon counts."""
     if optimal_df.empty:
         return np.nan
     optimal_codons = set(optimal_df.loc[optimal_df["is_optimal"] > 0, "codon"])
-    total = 0
-    opt_sum = 0
-    for col_name, rscu_val in rscu_dict.items():
-        if col_name in RSCU_COL_TO_CODON:
-            codon = RSCU_COL_TO_CODON[col_name]
-            total += rscu_val
-            if codon in optimal_codons:
-                opt_sum += rscu_val
-    return opt_sum / total if total > 0 else np.nan
+    opt_count = sum(codon_counts.get(c, 0) for c in optimal_codons)
+    total_count = sum(codon_counts.get(c, 0) for c in SENSE_CODONS)
+    return opt_count / total_count if total_count > 0 else np.nan
 
 
 def detect_phage_mobile_elements(
@@ -763,13 +745,7 @@ def detect_phage_mobile_elements(
                             func_col = col
                             break
 
-                query_col = None
-                for candidate in ["QUERY_ID", "query_id", "Query", "query", "gene_id", "protein_id"]:
-                    if candidate in cog_df.columns:
-                        query_col = candidate
-                        break
-                if query_col is None:
-                    query_col = cog_df.columns[0]
+                query_col = find_gene_id_column(cog_df, fallback_to_first=True)
 
                 # COG category descriptions
                 cog_descriptions = {
@@ -911,18 +887,7 @@ def compute_strand_asymmetry(
     result_df = pd.DataFrame(rows) if rows else None
     if result_df is not None and len(result_df) > 1:
         # Benjamini-Hochberg FDR correction across all per-codon tests
-        pvals = result_df["p_value"].values
-        n = len(pvals)
-        order = np.argsort(pvals)
-        ranks = np.empty_like(order)
-        ranks[order] = np.arange(1, n + 1)
-        fdr = np.minimum(pvals * n / ranks, 1.0)
-        # Enforce BH monotonicity: walk sorted order in reverse
-        fdr_sorted = fdr[order]
-        for k in range(n - 2, -1, -1):
-            fdr_sorted[k] = min(fdr_sorted[k], fdr_sorted[k + 1])
-        fdr[order] = fdr_sorted
-        result_df["p_adjusted"] = np.round(fdr, 6)
+        result_df["p_adjusted"] = np.round(benjamini_hochberg(result_df["p_value"].values), 6)
         result_df["significant"] = result_df["p_adjusted"] < 0.05
 
         # Check for severe strand imbalance
@@ -1097,14 +1062,7 @@ def _build_gene_annotation_map(
                 cog_df = pd.read_csv(cog_path, sep="\t")
 
                 # Find query column
-                query_col = None
-                for candidate in ["QUERY_ID", "query_id", "Query", "query",
-                                   "gene_id", "protein_id"]:
-                    if candidate in cog_df.columns:
-                        query_col = candidate
-                        break
-                if query_col is None:
-                    query_col = cog_df.columns[0]
+                query_col = find_gene_id_column(cog_df, fallback_to_first=True)
 
                 # Find COG ID column
                 cog_id_col = None
@@ -1188,9 +1146,9 @@ def run_bio_ecology_analyses(
     cog_result_tsv: Path | str | None = None,
     kofam_df: pd.DataFrame | None = None,
     gff_path: Path | None = None,
-    gmm_cluster_rscu: dict[str, float] | pd.Series | None = None,
-    gmm_cluster_gene_ids: list[str] | set[str] | None = None,
-    gmm_cluster_ids_path: Path | str | None = None,
+    mahal_cluster_rscu: dict[str, float] | pd.Series | None = None,
+    mahal_cluster_gene_ids: list[str] | set[str] | None = None,
+    mahal_cluster_ids_path: Path | str | None = None,
 ) -> dict[str, pd.DataFrame | Path | dict]:
     """Run all biological and ecological analyses.
 
@@ -1208,13 +1166,13 @@ def run_bio_ecology_analyses(
         cog_result_tsv: Optional COG result TSV.
         kofam_df: Optional KOFam annotation DataFrame.
         gff_path: Optional GFF3 annotation file.
-        gmm_cluster_rscu: Optional GMM cluster RSCU (dict or Series). When
+        mahal_cluster_rscu: Optional Mahalanobis cluster RSCU (dict or Series). When
             provided, HGT detection uses this as the reference centroid
             instead of the genome mean.
-        gmm_cluster_gene_ids: Optional gene IDs from the GMM optimal cluster.
+        mahal_cluster_gene_ids: Optional gene IDs from the Mahalanobis optimal cluster.
             When provided, growth rate prediction uses these as the reference
             gene set instead of ribosomal proteins.
-        gmm_cluster_ids_path: Optional path to the Mahalanobis-defined
+        mahal_cluster_ids_path: Optional path to the Mahalanobis-defined
             optimised gene IDs file (one ID per line).  When provided
             alongside *expr_df* containing MELP-based expression_class,
             gRodon2 uses the optimised set as the background and high-MELP
@@ -1240,7 +1198,7 @@ def run_bio_ecology_analyses(
     try:
         hgt_df = detect_hgt_candidates(
             rscu_gene_df, enc_df, expr_df,
-            reference_rscu=gmm_cluster_rscu,
+            reference_rscu=mahal_cluster_rscu,
         )
         if not hgt_df.empty:
             hgt_df = _annotate_df(hgt_df, ann_map, "gene")
@@ -1258,7 +1216,7 @@ def run_bio_ecology_analyses(
         if expr_df is not None:
             growth_result = predict_growth_rate(
                 expr_df, rp_ids_file,
-                gmm_cluster_gene_ids=gmm_cluster_gene_ids,
+                mahal_cluster_gene_ids=mahal_cluster_gene_ids,
             )
             if growth_result is not None:
                 outputs["growth_rate_prediction"] = growth_result
@@ -1280,7 +1238,7 @@ def run_bio_ecology_analyses(
     # 2b. gRodon2 growth rate prediction (requires R + gRodon2 package)
     #
     # When Mahalanobis outputs are available, gRodon2 uses:
-    #   - background: Mahalanobis-defined optimised gene set (gmm_cluster_ids_path)
+    #   - background: Mahalanobis-defined optimised gene set (mahal_cluster_ids_path)
     #   - highly expressed: high-MELP-tier genes (expression_class == "high")
     # This ensures CUBHE measures the bias of the most highly expressed genes
     # relative to the optimised (RP-like) background, with both sets informed
@@ -1316,8 +1274,8 @@ def run_bio_ecology_analyses(
 
         # Resolve background IDs path
         bg_ids_path = None
-        if gmm_cluster_ids_path is not None and Path(gmm_cluster_ids_path).exists():
-            bg_ids_path = Path(gmm_cluster_ids_path)
+        if mahal_cluster_ids_path is not None and Path(mahal_cluster_ids_path).exists():
+            bg_ids_path = Path(mahal_cluster_ids_path)
             logger.info(
                 "gRodon2: using Mahalanobis-defined gene set as background"
             )
@@ -1388,7 +1346,7 @@ def run_bio_ecology_analyses(
             # Need HGT results first
             hgt_df = detect_hgt_candidates(
                 rscu_gene_df, enc_df, expr_df,
-                reference_rscu=gmm_cluster_rscu,
+                reference_rscu=mahal_cluster_rscu,
             )
 
         if not hgt_df.empty:
