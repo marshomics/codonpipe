@@ -36,7 +36,15 @@ from codonpipe.plotting.plots import (
     _mahal_rscu_to_freq_df,
 )
 from codonpipe.plotting.comparative_plots import generate_comparative_plots
-from codonpipe.utils.codon_tables import RSCU_COLUMN_NAMES
+from codonpipe.utils.codon_tables import (
+    RSCU_COLUMN_NAMES,
+    COL_GENE, COL_ENC_DIFF, COL_ENCPRIME_RESIDUAL,
+    COL_EXPRESSION_CLASS, COL_IN_MAHAL_CLUSTER,
+    COL_MELP, COL_CAI, COL_FOP,
+    COL_MELP_CLASS, COL_CAI_CLASS, COL_FOP_CLASS,
+    EXPRESSION_METRICS, EXPRESSION_CLASS_COLS,
+    RP_PREFIX,
+)
 from codonpipe.utils.io import load_batch_table, write_tsv
 
 logger = logging.getLogger("codonpipe")
@@ -262,7 +270,7 @@ def run_single_genome(
 
     # ── Step 6: Expression analysis ─────────────────────────────────────
     expr_df = None
-    if not skip_expression and rp_ids_file and rp_ids_file.exists():
+    if not skip_expression and rp_ids_file and rp_ids_file.exists() and skip_mahal:
         logger.info("[Step 6/12] Running expression level prediction (MELP/CAI/Fop)")
         try:
             expr_outputs = run_expression_analysis(
@@ -278,17 +286,17 @@ def run_single_genome(
                     try:
                         from codonpipe.modules.advanced_analyses import compute_enc_diff
                         enc_diff_df = compute_enc_diff(enc_df, encprime_df)
-                        if not enc_diff_df.empty and "gene" in enc_diff_df.columns:
+                        if not enc_diff_df.empty and COL_GENE in enc_diff_df.columns:
                             expr_df = expr_df.merge(
-                                enc_diff_df[["gene", "ENC_diff"]].rename(
-                                    columns={"ENC_diff": "ENCprime_residual"}
+                                enc_diff_df[[COL_GENE, COL_ENC_DIFF]].rename(
+                                    columns={COL_ENC_DIFF: COL_ENCPRIME_RESIDUAL}
                                 ),
-                                on="gene", how="left",
+                                on=COL_GENE, how="left",
                             )
                             # Re-save the updated expression table
                             expr_df.to_csv(expr_outputs["expression_combined"], sep="\t", index=False)
                             logger.info("Merged ENC' residual into expression table (%d genes with values)",
-                                        expr_df["ENCprime_residual"].notna().sum())
+                                        expr_df[COL_ENCPRIME_RESIDUAL].notna().sum())
                     except Exception as e:
                         logger.warning("Could not merge ENC' residual: %s", e)
 
@@ -307,7 +315,7 @@ def run_single_genome(
 
     # ── Step 7: Pathway enrichment (RP-based tiers) ─────────────────────
     enrichment_results = {}
-    if expr_df is not None and kofam_df is not None and not kofam_df.empty:
+    if skip_mahal and expr_df is not None and kofam_df is not None and not kofam_df.empty:
         logger.info("[Step 7/12] Running pathway enrichment (hypergeometric test, RP-based tiers)")
         try:
             enrich_outputs = run_enrichment_analysis(
@@ -380,8 +388,8 @@ def run_single_genome(
             if rp_ffn and rp_ffn.exists():
                 try:
                     rp_rscu_df = compute_rscu_per_gene(rp_ffn)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Could not compute per-gene RSCU for RP sequences: %s", e)
 
             mahal_out = run_mahal_clustering(
                 rscu_gene_df=rscu_gene_df,
@@ -409,11 +417,11 @@ def run_single_genome(
             # Annotate expression table with Mahalanobis cluster membership
             if mahal_cluster_gene_ids and expr_df is not None and not expr_df.empty:
                 try:
-                    expr_df["in_mahal_cluster"] = expr_df["gene"].isin(mahal_cluster_gene_ids)
+                    expr_df[COL_IN_MAHAL_CLUSTER] = expr_df[COL_GENE].isin(mahal_cluster_gene_ids)
                     logger.info(
                         "Annotated expression table with Mahalanobis cluster membership "
                         "(%d genes in RP cluster)",
-                        expr_df["in_mahal_cluster"].sum(),
+                        expr_df[COL_IN_MAHAL_CLUSTER].sum(),
                     )
                 except Exception as e:
                     logger.warning("Could not annotate expression table with Mahalanobis clusters: %s", e)
@@ -463,30 +471,29 @@ def run_single_genome(
                 # Preserve RP-based scores as secondary columns
                 if expr_df is not None and not expr_df.empty:
                     rp_cols_to_keep = {}
-                    for col in ("MELP", "CAI", "Fop", "MELP_class", "CAI_class",
-                                "Fop_class", "expression_class"):
+                    for col in (*EXPRESSION_METRICS, *EXPRESSION_CLASS_COLS, COL_EXPRESSION_CLASS):
                         if col in expr_df.columns:
-                            rp_cols_to_keep[col] = f"rp_{col}"
+                            rp_cols_to_keep[col] = f"{RP_PREFIX}{col}"
 
-                    rp_backup = expr_df[["gene"] + list(rp_cols_to_keep.keys())].rename(
+                    rp_backup = expr_df[[COL_GENE] + list(rp_cols_to_keep.keys())].rename(
                         columns=rp_cols_to_keep
                     )
-                    mahal_expr_df = mahal_expr_df.merge(rp_backup, on="gene", how="left")
+                    mahal_expr_df = mahal_expr_df.merge(rp_backup, on=COL_GENE, how="left")
 
                 # Add Mahalanobis cluster membership flag
-                mahal_expr_df["in_mahal_cluster"] = mahal_expr_df["gene"].isin(mahal_cluster_gene_ids)
+                mahal_expr_df[COL_IN_MAHAL_CLUSTER] = mahal_expr_df[COL_GENE].isin(mahal_cluster_gene_ids)
 
                 # Merge ENC' residual if available
                 if enc_df is not None and encprime_df is not None:
                     try:
                         from codonpipe.modules.advanced_analyses import compute_enc_diff
                         enc_diff_df = compute_enc_diff(enc_df, encprime_df)
-                        if not enc_diff_df.empty and "gene" in enc_diff_df.columns:
+                        if not enc_diff_df.empty and COL_GENE in enc_diff_df.columns:
                             mahal_expr_df = mahal_expr_df.merge(
-                                enc_diff_df[["gene", "ENC_diff"]].rename(
-                                    columns={"ENC_diff": "ENCprime_residual"}
+                                enc_diff_df[[COL_GENE, COL_ENC_DIFF]].rename(
+                                    columns={COL_ENC_DIFF: COL_ENCPRIME_RESIDUAL}
                                 ),
-                                on="gene", how="left",
+                                on=COL_GENE, how="left",
                             )
                     except Exception as e:
                         logger.warning("Could not merge ENC' residual: %s", e)
@@ -511,6 +518,19 @@ def run_single_genome(
                 "Mahalanobis-based expression re-scoring failed: %s. "
                 "Keeping RP-based expression scores.", e, exc_info=True,
             )
+
+    # Fallback: if Mahalanobis-based expression wasn't produced, run RP-based
+    if not skip_mahal and expr_df is None and not skip_expression and rp_ids_file and rp_ids_file.exists():
+        logger.info("[Step 9b fallback] Mahalanobis unavailable; running RP-based expression analysis")
+        try:
+            expr_outputs = run_expression_analysis(
+                ffn_path, rp_ids_file, output_dir, sample_id, force=force,
+            )
+            all_outputs.update(expr_outputs)
+            if "expression_combined" in expr_outputs:
+                expr_df = pd.read_csv(expr_outputs["expression_combined"], sep="\t")
+        except (FileNotFoundError, RuntimeError) as e:
+            logger.warning("RP-based expression analysis failed: %s. Continuing.", e, exc_info=True)
 
     # ── Step 9c: Re-run pathway enrichment on Mahalanobis-based expression tiers ─
     # Step 7 enrichment used RP-only expression tiers.  Now that genes are
@@ -539,13 +559,31 @@ def run_single_genome(
         except Exception as e:
             logger.warning("Mahalanobis-tier pathway enrichment failed: %s. Continuing.", e, exc_info=True)
 
-    # ── Step 9d: Recompute S-value and COG enrichment with Mahalanobis reference ──
-    # Step 8 computed S-value against ribosomal proteins and COG enrichment
-    # against RP-based expression tiers.  Now that expression is re-scored
-    # against the Mahalanobis cluster, recompute both.
+    # Fallback: if Mahalanobis-based enrichment wasn't produced, run RP-based
+    _has_mahal_enrichment = any(k.startswith("mahal_enrichment") for k in enrichment_results)
+    if not skip_mahal and not _has_mahal_enrichment and expr_df is not None and kofam_df is not None and not kofam_df.empty:
+        logger.info("[Step 9c fallback] Mahalanobis enrichment unavailable; running RP-based enrichment analysis")
+        try:
+            enrich_outputs = run_enrichment_analysis(
+                expr_df, kofam_df, output_dir, sample_id,
+                kegg_ko_pathway_file=kegg_ko_pathway,
+            )
+            all_outputs.update(enrich_outputs)
+            for key, path in enrich_outputs.items():
+                if key.startswith("enrichment_") and path.exists():
+                    enrichment_results[f"rp_{key}"] = pd.read_csv(path, sep="\t")
+        except Exception as e:
+            logger.warning("RP-based pathway enrichment failed: %s. Continuing.", e, exc_info=True)
+
+    # ── Step 9d: Recompute S-value, delta RSCU, COG enrichment with Mahalanobis ──
+    # Step 8 computed these against RP-based tiers / genome-average baseline.
+    # Now recompute with Mahalanobis cluster as both the expression reference
+    # (tiers already updated in 9b) and as the RSCU baseline for delta RSCU.
     if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty:
         try:
-            from codonpipe.modules.advanced_analyses import compute_s_value, compute_delta_rscu
+            from codonpipe.modules.advanced_analyses import (
+                compute_s_value, compute_delta_rscu, compute_cog_enrichment,
+            )
             rscu_mahal_dict = mahal_cluster_rscu.to_dict()
             adv_dir = output_dir / "advanced"
 
@@ -559,9 +597,9 @@ def run_single_genome(
                 advanced_results["s_value"] = s_val_mahal_df
                 logger.info("S-value recomputed against Mahalanobis-cluster reference (%d genes)", len(s_val_mahal_df))
 
-            # Delta RSCU with Mahalanobis-based expression tiers
+            # Delta RSCU with Mahalanobis-based expression tiers (genome-avg baseline)
             if expr_df is not None:
-                for class_col in ["expression_class"]:
+                for class_col in [COL_EXPRESSION_CLASS]:
                     if class_col in expr_df.columns:
                         delta_df = compute_delta_rscu(rscu_gene_df, expr_df, class_col)
                         if not delta_df.empty:
@@ -570,17 +608,37 @@ def run_single_genome(
                             delta_df.to_csv(out_path, sep="\t", index=False)
                             all_outputs[f"advanced_delta_rscu_{metric}_path"] = out_path
                             advanced_results[f"delta_rscu_{metric}"] = delta_df
+
+            # Delta RSCU with Mahalanobis cluster RSCU as the baseline
+            # (deviation of high-expression genes from Mahalanobis cluster)
+            if expr_df is not None:
+                for class_col in [COL_EXPRESSION_CLASS, COL_CAI_CLASS, COL_MELP_CLASS, COL_FOP_CLASS]:
+                    if class_col in expr_df.columns:
+                        delta_mahal_df = compute_delta_rscu(
+                            rscu_gene_df, expr_df, class_col,
+                            rscu_reference=rscu_mahal_dict,
+                            reference_label="mahal_cluster",
+                        )
+                        if not delta_mahal_df.empty:
+                            metric = class_col.replace("_class", "")
+                            out_path = adv_dir / f"{sample_id}_delta_rscu_{metric}_mahal_ref.tsv"
+                            delta_mahal_df.to_csv(out_path, sep="\t", index=False)
+                            all_outputs[f"advanced_delta_rscu_{metric}_mahal_ref_path"] = out_path
+                            advanced_results[f"delta_rscu_{metric}_mahal_ref"] = delta_mahal_df
+
+            # Preserve RP-based COG enrichment before overwriting
+            if "cog_enrichment" in advanced_results:
+                advanced_results["cog_enrichment_rp"] = advanced_results["cog_enrichment"]
+
             # Re-run COG enrichment with Mahalanobis-based expression tiers
             cog_tsv = all_outputs.get("cog_result")
             if cog_tsv and Path(cog_tsv).exists() and expr_df is not None:
-                from codonpipe.modules.advanced_analyses import compute_cog_enrichment
-                adv_dir = output_dir / "advanced"
                 cog_enrich_mahal = compute_cog_enrichment(Path(cog_tsv), expr_df)
                 if not cog_enrich_mahal.empty:
-                    cog_path = adv_dir / f"{sample_id}_cog_enrichment.tsv"
+                    cog_path = adv_dir / f"{sample_id}_cog_enrichment_mahal.tsv"
                     cog_enrich_mahal.to_csv(cog_path, sep="\t", index=False)
-                    all_outputs["advanced_cog_enrichment_path"] = cog_path
-                    advanced_results["cog_enrichment"] = cog_enrich_mahal
+                    all_outputs["advanced_cog_enrichment_mahal_path"] = cog_path
+                    advanced_results["cog_enrichment_mahal"] = cog_enrich_mahal
                     logger.info("COG enrichment recomputed with Mahalanobis-based expression tiers")
 
         except Exception as e:
@@ -931,29 +989,45 @@ def _run_batch_analyses(
         except Exception as e:
             logger.warning("Pairwise comparison plots failed: %s", e)
 
-    # ── Comparative RSCU heatmap for exactly 2 genomes ────────────────
+    # ── Comparative RSCU heatmaps for exactly 2 genomes (3 versions) ──
     if len(sample_outputs) == 2:
-        try:
-            comp_freq_dfs: dict[str, pd.DataFrame] = {}
-            for sid, sout in sample_outputs.items():
-                mahal_path = sout.get("rscu_mahal_cluster")
-                if mahal_path and Path(mahal_path).exists():
-                    mahal_s = pd.read_csv(mahal_path, sep="\t", index_col=0)["RSCU"]
-                    comp_freq_dfs[sid] = _mahal_rscu_to_freq_df(mahal_s)
-            if len(comp_freq_dfs) == 2:
-                comp_plot_dir = output_dir / "batch_pairwise" / "plots"
-                comp_plot_dir.mkdir(parents=True, exist_ok=True)
-                comp_p = comp_plot_dir / "rscu_heatmap_comparison"
-                plot_rscu_heatmap_rounded_comparison(comp_freq_dfs, comp_p)
-                outputs["rscu_heatmap_comparison"] = comp_p.with_suffix(".png")
-                logger.info("Comparative RSCU heatmap saved to batch_pairwise/plots/")
-            else:
-                logger.info(
-                    "SKIPPED: comparative RSCU heatmap (Mahalanobis cluster RSCU "
-                    "available for %d/2 samples)", len(comp_freq_dfs),
-                )
-        except Exception as e:
-            logger.warning("Comparative RSCU heatmap failed: %s", e)
+        comp_plot_dir = output_dir / "batch_pairwise" / "plots"
+        comp_plot_dir.mkdir(parents=True, exist_ok=True)
+
+        _comp_variants = [
+            ("genome", "All CDS", "rscu_median", False),
+            ("ribosomal", "Ribosomal Proteins", "rscu_ribosomal", False),
+            ("mahal", "Mahalanobis cluster", "rscu_mahal_cluster", True),
+        ]
+        for suffix, label, key, is_index_based in _comp_variants:
+            try:
+                comp_freq_dfs: dict[str, pd.DataFrame] = {}
+                for sid, sout in sample_outputs.items():
+                    p = sout.get(key)
+                    if p and Path(p).exists():
+                        if is_index_based:
+                            raw = pd.read_csv(p, sep="\t", index_col=0)["RSCU"]
+                        else:
+                            raw = pd.read_csv(p, sep="\t")
+                            # Column-based: single row with RSCU column names
+                            if len(raw) > 0:
+                                raw = raw.iloc[0].drop("sample_id", errors="ignore")
+                        comp_freq_dfs[sid] = _mahal_rscu_to_freq_df(raw)
+                if len(comp_freq_dfs) == 2:
+                    comp_p = comp_plot_dir / f"rscu_heatmap_comparison_{suffix}"
+                    plot_rscu_heatmap_rounded_comparison(
+                        comp_freq_dfs, comp_p,
+                        title=f"RSCU Comparison — {label}",
+                    )
+                    outputs[f"rscu_heatmap_comparison_{suffix}"] = comp_p.with_suffix(".png")
+                    logger.info("Comparative RSCU heatmap (%s) saved", suffix)
+                else:
+                    logger.info(
+                        "SKIPPED: comparative RSCU heatmap (%s) — data available "
+                        "for %d/2 samples", suffix, len(comp_freq_dfs),
+                    )
+            except Exception as e:
+                logger.warning("Comparative RSCU heatmap (%s) failed: %s", suffix, e)
 
     # ── Condition-aware comparative analyses ──────────────────────────
     if condition_col:
@@ -1009,8 +1083,8 @@ def _run_batch_analyses(
                     hgt_burden = between_condition_hgt_burden(
                         sample_outputs, metrics_df, condition_col,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Could not compute HGT burden comparison: %s", e)
 
             if "between_condition_strand_asymmetry_patterns" in comp_outputs:
                 p = comp_outputs["between_condition_strand_asymmetry_patterns"]
