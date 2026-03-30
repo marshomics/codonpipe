@@ -1249,50 +1249,24 @@ def run_bio_ecology_analyses(
     # contrast and severely underestimates growth rate.
     logger.info("Running gRodon2 growth rate prediction for %s", sample_id)
     try:
-        import tempfile as _tmpmod
         from codonpipe.modules.grodon import run_grodon
 
-        # Extract high-MELP gene IDs for the HE set when available
-        he_ids_path = None
-        if (
-            expr_df is not None
-            and not expr_df.empty
-            and "expression_class" in expr_df.columns
-            and "gene" in expr_df.columns
-        ):
-            high_melp_genes = expr_df.loc[
-                expr_df["expression_class"] == "high", "gene"
-            ].dropna().tolist()
-            if high_melp_genes:
-                he_tmp = _tmpmod.NamedTemporaryFile(
-                    mode="w", suffix="_he_ids.txt", delete=False,
-                    dir=eco_dir,
-                )
-                he_tmp.write("\n".join(high_melp_genes) + "\n")
-                he_tmp.close()
-                he_ids_path = Path(he_tmp.name)
-                logger.info(
-                    "gRodon2: using %d high-MELP genes as HE set",
-                    len(high_melp_genes),
-                )
-
-        # gRodon2 background: always use the FULL genome CDS set.
+        # gRodon2's HE set: use ribosomal protein IDs, NOT the broad
+        # high-MELP tier.
         #
-        # The Mahalanobis cluster is useful for identifying HE genes, but
-        # gRodon2's CUBHE metric measures bias of HE genes *relative to
-        # the genomic background*.  If the background is restricted to the
-        # already-optimised Mahalanobis cluster, the HE-vs-background
-        # contrast shrinks dramatically and the model underestimates
-        # growth rate (e.g. predicting ~15 h for E. coli instead of <1 h).
+        # gRodon2's CUBHE/ConsistencyHE/CPB regression was trained with
+        # ribosomal proteins (~55 genes) as the HE anchor (Weissman et al.
+        # 2021).  The model coefficients assume that specific, narrow level
+        # of bias.  Substituting the high-MELP tier (often 300-500+ genes)
+        # dilutes CUBHE and causes the model to underestimate growth rate
+        # (e.g. predicting ~6 h for E. coli instead of <1 h).
+        #
+        # The full genome CDS set is always used as background — see the
+        # earlier comment on why Mahalanobis subsetting was removed.
         grodon_result = run_grodon(
             ffn_path, output_dir, sample_id,
             rp_ids_file=rp_ids_file,
-            he_ids_file=he_ids_path,
         )
-
-        # Clean up temp HE IDs file
-        if he_ids_path is not None:
-            he_ids_path.unlink(missing_ok=True)
 
         if grodon_result is not None:
             grodon_path = grodon_result.pop("path", None)
