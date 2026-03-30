@@ -465,12 +465,15 @@ def run_grodon(
     json_out.close()
 
     # Resolve which file supplies the HE gene IDs: prefer explicit
-    # high-MELP IDs, fall back to RP IDs, then gRodon2's own regex.
+    # filtered HE IDs (RP ∩ Mahalanobis), fall back to all RPs, then regex.
     effective_he = None
+    he_source = "header_regex"  # tracks which source actually provided IDs
     if he_ids_file is not None and Path(he_ids_file).exists():
         effective_he = str(he_ids_file)
+        he_source = "rp_mahal_filtered"
     elif rp_ids_file is not None and Path(rp_ids_file).exists():
         effective_he = str(rp_ids_file)
+        he_source = "rp_ids"
 
     try:
         cmd = ["Rscript", "--no-save", "--no-restore", r_script_path,
@@ -539,13 +542,7 @@ def run_grodon(
         else:
             in_training_range = False
 
-        # Determine the reference mode for provenance tracking
-        if effective_he:
-            ref_mode = "melp_he"
-        elif rp_ids_file and Path(rp_ids_file).exists():
-            ref_mode = "rp_ids"
-        else:
-            ref_mode = "header_regex"
+        ref_mode = he_source
 
         grodon_result = {
             "predicted_doubling_time_hours": float(d) if d is not None else None,
