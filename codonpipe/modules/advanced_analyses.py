@@ -24,6 +24,15 @@ from codonpipe.utils.codon_tables import (
     RSCU_COL_TO_CODON,
     SENSE_CODONS,
     dna_to_rna,
+    COL_EXPRESSION_CLASS,
+    COL_ENC_DIFF,
+    COL_ENCPRIME,
+    COL_ENC,
+    COL_GENE,
+    COL_GC3,
+    COL_CAI_CLASS,
+    COL_MELP_CLASS,
+    COL_FOP_CLASS,
 )
 from codonpipe.utils.io import find_gene_id_column
 from codonpipe.utils.statistics import benjamini_hochberg
@@ -112,12 +121,12 @@ def compute_coa_on_rscu(
     coa_df.insert(0, "gene", genes)
 
     # Merge expression tiers if available
-    if expr_df is not None and "gene" in expr_df.columns:
-        class_cols = [c for c in expr_df.columns if c.endswith("_class") and c != "expression_class"]
+    if expr_df is not None and COL_GENE in expr_df.columns:
+        class_cols = [c for c in expr_df.columns if c.endswith("_class") and c != COL_EXPRESSION_CLASS]
         if class_cols:
-            merge_cols = ["gene"] + class_cols
+            merge_cols = [COL_GENE] + class_cols
             available = [c for c in merge_cols if c in expr_df.columns]
-            coa_df = coa_df.merge(expr_df[available], on="gene", how="left")
+            coa_df = coa_df.merge(expr_df[available], on=COL_GENE, how="left")
 
     # Codon coordinates
     codon_df = pd.DataFrame(col_coords[:, :2], columns=["Axis1", "Axis2"])
@@ -183,11 +192,11 @@ def compute_s_value(
         ref_label = "rp"
 
     if ref is None:
-        return pd.DataFrame(columns=["gene", "S_value", "S_reference"])
+        return pd.DataFrame(columns=[COL_GENE, "S_value", "S_reference"])
 
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns and c in ref]
     if not rscu_cols:
-        return pd.DataFrame(columns=["gene", "S_value", "S_reference"])
+        return pd.DataFrame(columns=[COL_GENE, "S_value", "S_reference"])
 
     ref_vec = np.array([ref[c] for c in rscu_cols])
     gene_mat = rscu_gene_df[rscu_cols].values
@@ -201,7 +210,7 @@ def compute_s_value(
         dists = np.sqrt(np.sum((gene_mat - ref_vec[np.newaxis, :]) ** 2, axis=1))
 
     return pd.DataFrame({
-        "gene": rscu_gene_df["gene"].values,
+        COL_GENE: rscu_gene_df[COL_GENE].values,
         "S_value": dists,
         "S_reference": ref_label,
     })
@@ -227,21 +236,21 @@ def compute_enc_diff(
         DataFrame with gene, ENC, ENCprime, ENC_diff, GC3.
     """
     if enc_df.empty or encprime_df.empty:
-        return pd.DataFrame(columns=["gene", "ENC", "ENCprime", "ENC_diff", "GC3"])
+        return pd.DataFrame(columns=[COL_GENE, COL_ENC, COL_ENCPRIME, COL_ENC_DIFF, COL_GC3])
 
     # Identify the ENCprime score column
     score_candidates = [c for c in encprime_df.columns if c not in ("gene", "width")]
     if not score_candidates:
         logger.warning("ENCprime DataFrame has no score column; skipping ENC diff")
-        return pd.DataFrame(columns=["gene", "ENC", "ENCprime", "ENC_diff", "GC3"])
+        return pd.DataFrame(columns=[COL_GENE, COL_ENC, COL_ENCPRIME, COL_ENC_DIFF, COL_GC3])
     score_col = score_candidates[0]
 
-    merged = enc_df[["gene", "ENC", "GC3"]].merge(
-        encprime_df[["gene", score_col]].rename(columns={score_col: "ENCprime"}),
-        on="gene",
+    merged = enc_df[[COL_GENE, COL_ENC, COL_GC3]].merge(
+        encprime_df[[COL_GENE, score_col]].rename(columns={score_col: COL_ENCPRIME}),
+        on=COL_GENE,
         how="inner",
     )
-    merged["ENC_diff"] = merged["ENC"] - merged["ENCprime"]
+    merged[COL_ENC_DIFF] = merged[COL_ENC] - merged[COL_ENCPRIME]
     return merged
 
 
@@ -288,16 +297,16 @@ def compute_gc12_gc3(ffn_path: Path, min_length: int = 240) -> pd.DataFrame:
             gc12_frac = (gc1 + gc2) / (total1 + total2)
             gc3_frac = gc3 / total3
             rows.append({
-                "gene": rec.id,
+                COL_GENE: rec.id,
                 "GC1": gc1_frac,
                 "GC2": gc2_frac,
                 "GC12": gc12_frac,
-                "GC3": gc3_frac,
+                COL_GC3: gc3_frac,
                 "length": len(seq),
             })
 
     return pd.DataFrame(rows) if rows else pd.DataFrame(
-        columns=["gene", "GC1", "GC2", "GC12", "GC3", "length"]
+        columns=[COL_GENE, "GC1", "GC2", "GC12", COL_GC3, "length"]
     )
 
 
@@ -353,12 +362,14 @@ def compute_pr2(ffn_path: Path, min_length: int = 240) -> pd.DataFrame:
 def compute_delta_rscu(
     rscu_gene_df: pd.DataFrame,
     expr_df: pd.DataFrame,
-    class_col: str = "expression_class",
+    class_col: str = COL_EXPRESSION_CLASS,
+    rscu_reference: dict[str, float] | None = None,
+    reference_label: str = "genome_avg",
 ) -> pd.DataFrame:
-    """Compute delta RSCU (high-expression genes vs genome average) per codon.
+    """Compute delta RSCU (high-expression genes vs a reference) per codon.
 
-    Positive delta = codon favored in highly expressed genes.
-    Negative delta = codon avoided in highly expressed genes.
+    Positive delta = codon favored in highly expressed genes relative to the
+    reference.  Negative delta = codon avoided.
 
     The default *class_col* is ``expression_class``, which resolves to
     ACE-MELP tiers when ACE has run, or RP-MELP tiers otherwise.
@@ -367,9 +378,14 @@ def compute_delta_rscu(
         rscu_gene_df: Per-gene RSCU table.
         expr_df: Expression table with gene and *_class columns.
         class_col: Which classification column to use.
+        rscu_reference: Optional dict of reference RSCU values (e.g.
+            Mahalanobis cluster RSCU).  When *None* the genome-wide
+            average is used as the baseline.
+        reference_label: Label used in the ``ref_rscu`` output column
+            name (e.g. ``"genome_avg"`` or ``"mahal_cluster"``).
 
     Returns:
-        DataFrame with codon, amino_acid, genome_avg_rscu, high_expr_rscu,
+        DataFrame with codon, amino_acid, ref_rscu, high_expr_rscu,
         delta_rscu columns.
     """
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
@@ -381,7 +397,11 @@ def compute_delta_rscu(
         expr_df[["gene", class_col]], on="gene", how="inner"
     )
 
-    genome_avg = merged[rscu_cols].mean()
+    if rscu_reference is not None:
+        ref_vals = pd.Series({c: rscu_reference.get(c, float("nan")) for c in rscu_cols})
+    else:
+        ref_vals = merged[rscu_cols].mean()
+
     high_mask = merged[class_col] == "high"
 
     if high_mask.sum() < 3:
@@ -399,9 +419,9 @@ def compute_delta_rscu(
             "codon_col": col,
             "codon": codon,
             "amino_acid": aa,
-            "genome_avg_rscu": round(genome_avg[col], 4),
+            f"{reference_label}_rscu": round(ref_vals[col], 4),
             "high_expr_rscu": round(high_avg[col], 4),
-            "delta_rscu": round(high_avg[col] - genome_avg[col], 4),
+            "delta_rscu": round(high_avg[col] - ref_vals[col], 4),
         })
 
     return pd.DataFrame(rows)
@@ -512,7 +532,7 @@ def compute_trna_codon_correlation(
     trna_df: pd.DataFrame,
     rscu_gene_df: pd.DataFrame,
     expr_df: pd.DataFrame | None = None,
-    class_col: str = "expression_class",
+    class_col: str = COL_EXPRESSION_CLASS,
 ) -> pd.DataFrame:
     """Correlate tRNA gene copy number with codon frequency in highly expressed genes.
 
@@ -579,7 +599,7 @@ def compute_trna_codon_correlation(
 def compute_cog_enrichment(
     cog_result_tsv: Path,
     expr_df: pd.DataFrame,
-    class_col: str = "expression_class",
+    class_col: str = COL_EXPRESSION_CLASS,
 ) -> pd.DataFrame:
     """Test COG functional category enrichment in expression tiers.
 
@@ -743,13 +763,13 @@ def compute_gene_length_bias(
     if enc_df.empty:
         return pd.DataFrame()
 
-    result = enc_df[["gene", "length", "ENC", "GC3"]].copy()
+    result = enc_df[[COL_GENE, "length", COL_ENC, COL_GC3]].copy()
 
-    if expr_df is not None and "gene" in expr_df.columns:
+    if expr_df is not None and COL_GENE in expr_df.columns:
         score_cols = [c for c in ["MELP", "CAI", "Fop"] if c in expr_df.columns]
         if score_cols:
             result = result.merge(
-                expr_df[["gene"] + score_cols], on="gene", how="left"
+                expr_df[[COL_GENE] + score_cols], on=COL_GENE, how="left"
             )
 
     return result
@@ -863,8 +883,8 @@ def run_advanced_analyses(
     # 6. Delta RSCU
     if expr_df is not None:
         logger.info("Computing delta RSCU (high-expression vs genome avg) for %s", sample_id)
-        delta_class_cols = ["expression_class",
-                           "CAI_class", "MELP_class", "Fop_class"]
+        delta_class_cols = [COL_EXPRESSION_CLASS,
+                           COL_CAI_CLASS, COL_MELP_CLASS, COL_FOP_CLASS]
         for class_col in delta_class_cols:
             if class_col in expr_df.columns:
                 delta_df = compute_delta_rscu(rscu_gene_df, expr_df, class_col)
