@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from Bio import SeqIO
 from scipy import stats
-from scipy.spatial.distance import mahalanobis, euclidean
+from scipy.spatial.distance import euclidean
 from sklearn.covariance import LedoitWolf
 from sklearn.decomposition import PCA
 
@@ -577,24 +577,31 @@ def quantify_translational_selection(
     else:
         optimal_codons_set = set()
 
-    for q_num, q_genes in quintiles:
-        if not optimal_codons_set:
-            break
-
-        # Compute true Fop per gene from actual codon counts
-        fop_vals = []
-        for rec in SeqIO.parse(str(ffn_path), "fasta"):
-            if rec.id not in q_genes:
-                continue
-            seq = str(rec.seq)
-            if len(seq) < 240:
-                continue
-            gene_counts = count_codons(seq)
+    # Pre-parse FASTA once: store codon counts and Fop for all merged genes.
+    # This avoids re-reading the file per quintile (was 5+1 passes).
+    all_gene_ids = set(merged["gene"].values)
+    _gene_codon_counts: dict[str, dict[str, int]] = {}
+    _gene_fop: dict[str, float] = {}
+    for rec in SeqIO.parse(str(ffn_path), "fasta"):
+        if rec.id not in all_gene_ids:
+            continue
+        seq = str(rec.seq)
+        if len(seq) < 240:
+            continue
+        gene_counts = count_codons(seq)
+        _gene_codon_counts[rec.id] = gene_counts
+        if optimal_codons_set:
             n_opt = sum(gene_counts.get(c, 0) for c in optimal_codons_set
                         if c in SENSE_CODONS)
             n_total = sum(gene_counts.get(c, 0) for c in SENSE_CODONS)
             if n_total > 0:
-                fop_vals.append(n_opt / n_total)
+                _gene_fop[rec.id] = n_opt / n_total
+
+    for q_num, q_genes in quintiles:
+        if not optimal_codons_set:
+            break
+
+        fop_vals = [_gene_fop[g] for g in q_genes if g in _gene_fop]
 
         if fop_vals:
             fop_rows.append({
@@ -608,22 +615,13 @@ def quantify_translational_selection(
 
     # Continuous Spearman correlation (expression metric vs Fop)
     if optimal_codons_set and not merged.empty:
+        metric_lookup = merged.set_index("gene")[metric]
         all_fop_vals = []
         all_metric_vals = []
-        for rec in SeqIO.parse(str(ffn_path), "fasta"):
-            if rec.id not in merged["gene"].values:
-                continue
-            seq = str(rec.seq)
-            if len(seq) < 240:
-                continue
-            gene_counts = count_codons(seq)
-            n_opt = sum(gene_counts.get(c, 0) for c in optimal_codons_set if c in SENSE_CODONS)
-            n_total = sum(gene_counts.get(c, 0) for c in SENSE_CODONS)
-            if n_total > 0:
-                metric_val = merged.loc[merged["gene"] == rec.id, metric].values
-                if len(metric_val) > 0:
-                    all_fop_vals.append(n_opt / n_total)
-                    all_metric_vals.append(metric_val[0])
+        for gene_id, fop_val in _gene_fop.items():
+            if gene_id in metric_lookup.index:
+                all_fop_vals.append(fop_val)
+                all_metric_vals.append(metric_lookup[gene_id])
 
         if len(all_fop_vals) >= 10:
             from scipy.stats import spearmanr
@@ -757,24 +755,25 @@ def detect_phage_mobile_elements(
                     "L": "Replication, recombination and repair",
                 }
 
-                cog_map = {}
-                for _, row in cog_df.iterrows():
-                    gene = row[query_col]
-                    cat = str(row[func_col]).strip() if func_col else None
-                    if cat:
-                        cog_map[gene] = (cat, cog_descriptions.get(cat, "Unknown"))
+                # Build a slim COG lookup DataFrame and merge vectorised
+                cog_slim = cog_df[[query_col, func_col]].copy()
+                cog_slim.columns = ["gene", "cog_cat"]
+                cog_slim["cog_cat"] = cog_slim["cog_cat"].astype(str).str.strip()
+                cog_slim = cog_slim[cog_slim["cog_cat"].str.len() > 0]
+                cog_slim["cog_description"] = cog_slim["cog_cat"].map(
+                    lambda c: cog_descriptions.get(c, "Unknown")
+                )
+                # Keep first COG assignment per gene (avoid duplicates)
+                cog_slim = cog_slim.drop_duplicates(subset="gene", keep="first")
 
-                # Merge into result
-                for idx, row in result.iterrows():
-                    gene = row["gene"]
-                    if gene in cog_map:
-                        cat, desc = cog_map[gene]
-                        result.at[idx, "cog_category"] = cat
-                        result.at[idx, "cog_description"] = desc
-                        if cat == "X":
-                            result.at[idx, "is_mobilome"] = True
-                        elif cat == "L" and row["hgt_flag"]:
-                            result.at[idx, "is_phage_related"] = True
+                result = result.merge(
+                    cog_slim.rename(columns={"cog_cat": "cog_category"}),
+                    on="gene", how="left", suffixes=("", "_cog"),
+                )
+                result["is_mobilome"] = result["is_mobilome"] | (result["cog_category"] == "X")
+                result["is_phage_related"] = result["is_phage_related"] | (
+                    (result["cog_category"] == "L") & result["hgt_flag"]
+                )
 
             except Exception as e:
                 logger.warning("Error reading COG file: %s", e)
@@ -1242,11 +1241,12 @@ def run_bio_ecology_analyses(
     # 2b. gRodon2 growth rate prediction (requires R + gRodon2 package)
     #
     # When Mahalanobis outputs are available, gRodon2 uses:
-    #   - background: Mahalanobis-defined optimised gene set (mahal_cluster_ids_path)
-    #   - highly expressed: high-MELP-tier genes (expression_class == "high")
-    # This ensures CUBHE measures the bias of the most highly expressed genes
-    # relative to the optimised (RP-like) background, with both sets informed
-    # by the Mahalanobis classification.
+    #   - highly expressed: high-MELP-tier genes (expression_class == "high"),
+    #     identified via scoring against the Mahalanobis cluster reference
+    #   - background: FULL genome CDS set (NOT the Mahalanobis cluster)
+    # gRodon2's CUBHE measures HE bias relative to the genomic average.
+    # Restricting the background to the Mahalanobis cluster collapses the
+    # contrast and severely underestimates growth rate.
     logger.info("Running gRodon2 growth rate prediction for %s", sample_id)
     try:
         import tempfile as _tmpmod
@@ -1276,13 +1276,15 @@ def run_bio_ecology_analyses(
                     len(high_melp_genes),
                 )
 
-        # Resolve background IDs path
+        # gRodon2 background: always use the FULL genome CDS set.
+        #
+        # The Mahalanobis cluster is useful for identifying HE genes, but
+        # gRodon2's CUBHE metric measures bias of HE genes *relative to
+        # the genomic background*.  If the background is restricted to the
+        # already-optimised Mahalanobis cluster, the HE-vs-background
+        # contrast shrinks dramatically and the model underestimates
+        # growth rate (e.g. predicting ~15 h for E. coli instead of <1 h).
         bg_ids_path = None
-        if mahal_cluster_ids_path is not None and Path(mahal_cluster_ids_path).exists():
-            bg_ids_path = Path(mahal_cluster_ids_path)
-            logger.info(
-                "gRodon2: using Mahalanobis-defined gene set as background"
-            )
 
         grodon_result = run_grodon(
             ffn_path, output_dir, sample_id,
