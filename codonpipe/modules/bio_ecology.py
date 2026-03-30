@@ -197,9 +197,13 @@ def detect_hgt_candidates(
     n_genes, n_features = X.shape
 
     # Remove genes with missing RSCU values rather than imputing zeros
+    n_before = len(X)
     valid_mask = ~(np.isnan(X) | np.isinf(X)).any(axis=1)
-    if valid_mask.sum() < 10:
-        logger.warning("Too few genes with complete RSCU data (%d) for HGT detection", valid_mask.sum())
+    n_after = valid_mask.sum()
+    if n_before > n_after:
+        logger.info("HGT detection: dropped %d/%d genes with NaN/inf RSCU values", n_before - n_after, n_before)
+    if n_after < 10:
+        logger.warning("Too few genes with complete RSCU data (%d) for HGT detection", n_after)
         return pd.DataFrame(columns=[
             "gene", "mahalanobis_dist", "gc3_deviation", "p_value", "p_adjusted",
             "hgt_flag_fdr", "hgt_flag_adaptive", "gc3_outlier", "hgt_flag_combined",
