@@ -131,14 +131,36 @@ def _load_user_ko_map(path: Path) -> dict[str, set[str]]:
     return dict(ko_map)
 
 
-def _download_kegg_ko_map() -> dict[str, set[str]]:
-    """Download KO-to-pathway link table from KEGG REST API."""
+def _download_kegg_ko_map(max_retries: int = 3) -> dict[str, set[str]]:
+    """Download KO-to-pathway link table from KEGG REST API.
+
+    Retries up to *max_retries* times with exponential back-off on transient
+    network errors (timeout, temporary server failure, etc.).
+    """
+    import time
+    import urllib.error
     import urllib.request
 
-    logger.info("Downloading KO-pathway mapping from KEGG REST API...")
-    req = urllib.request.Request(_KEGG_LINK_URL, headers={"User-Agent": "CodonPipe/0.1"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        text = resp.read().decode("utf-8")
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info("Downloading KO-pathway mapping from KEGG REST API (attempt %d/%d)...",
+                        attempt, max_retries)
+            req = urllib.request.Request(_KEGG_LINK_URL, headers={"User-Agent": "CodonPipe/0.1"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                text = resp.read().decode("utf-8")
+            break  # success
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                logger.warning("KEGG download attempt %d failed: %s. Retrying in %ds...",
+                               attempt, exc, wait)
+                time.sleep(wait)
+            else:
+                raise RuntimeError(
+                    f"KEGG KO-pathway download failed after {max_retries} attempts: {exc}"
+                ) from last_exc
 
     ko_map: dict[str, set[str]] = defaultdict(set)
     for line in text.strip().split("\n"):
@@ -157,13 +179,33 @@ def _download_kegg_ko_map() -> dict[str, set[str]]:
     return dict(ko_map)
 
 
-def _download_kegg_pathway_names() -> dict[str, str]:
-    """Download pathway ID -> name mapping from KEGG REST API."""
+def _download_kegg_pathway_names(max_retries: int = 3) -> dict[str, str]:
+    """Download pathway ID -> name mapping from KEGG REST API.
+
+    Retries up to *max_retries* times with exponential back-off.
+    """
+    import time
+    import urllib.error
     import urllib.request
 
-    req = urllib.request.Request(_KEGG_PATHWAY_LIST_URL, headers={"User-Agent": "CodonPipe/0.1"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        text = resp.read().decode("utf-8")
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = urllib.request.Request(_KEGG_PATHWAY_LIST_URL, headers={"User-Agent": "CodonPipe/0.1"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                text = resp.read().decode("utf-8")
+            break  # success
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                logger.warning("KEGG pathway names download attempt %d failed: %s. Retrying in %ds...",
+                               attempt, exc, wait)
+                time.sleep(wait)
+            else:
+                raise RuntimeError(
+                    f"KEGG pathway names download failed after {max_retries} attempts: {exc}"
+                ) from last_exc
 
     names = {}
     for line in text.strip().split("\n"):
