@@ -24,6 +24,7 @@ from codonpipe.modules.cu_statistics import run_cu_statistics
 from codonpipe.modules.enrichment import run_enrichment_analysis
 from codonpipe.modules.advanced_analyses import run_advanced_analyses
 from codonpipe.modules.mahal_clustering import run_mahal_clustering
+from codonpipe.modules.cluster_stability import run_stability_analysis
 from codonpipe.modules.bio_ecology import run_bio_ecology_analyses
 from codonpipe.modules.codon_table_formats import generate_all_codon_tables
 from codonpipe.modules.statistics import run_batch_statistics
@@ -97,6 +98,10 @@ def run_single_genome(
     mahal_min_k: int = 2,
     mahal_max_k: int = 8,
     mahal_distance_multiplier: float = 2.0,
+    run_stability: bool = False,
+    stability_bootstraps: int = 100,
+    stability_multipliers: list[float] | None = None,
+    auto_select_multiplier: bool = False,
     kegg_ko_pathway: Path | None = None,
     gff_file: Path | None = None,
     force: bool = False,
@@ -117,6 +122,8 @@ def run_single_genome(
         9. Mahalanobis clustering — COA-based Mahalanobis distance clustering
            to identify the translationally optimised gene cluster, using
            ribosomal proteins as anchor
+       9s. (Optional) Bootstrap stability analysis — sweep multiplier grid,
+           compute per-gene membership frequency, recommend optimal multiplier
        10. Biological/ecological analyses (HGT detection, growth rate
            prediction, translational selection, phage detection, strand
            asymmetry, operon co-adaptation)
@@ -150,6 +157,17 @@ def run_single_genome(
         mahal_distance_multiplier: Threshold = multiplier × median RP
             Mahalanobis distance (default 2.0).  Lower values produce a
             tighter cluster; higher values are more permissive.
+        run_stability: Run bootstrap stability analysis on the Mahalanobis
+            cluster (default False).  Sweeps a grid of multipliers and
+            computes per-gene membership frequency to quantify robustness.
+        stability_bootstraps: Number of bootstrap replicates per multiplier
+            (default 100).
+        stability_multipliers: Custom list of multiplier values to test.
+            Defaults to [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0].
+        auto_select_multiplier: When True and run_stability is True, use
+            the stability-recommended multiplier instead of the user-supplied
+            mahal_distance_multiplier.  The Mahalanobis clustering step is
+            re-run with the recommended value.
         kegg_ko_pathway: User-supplied KO-to-pathway mapping TSV for offline use.
         gff_file: GFF3 annotation file for tRNA extraction (auto-detected from
             Prokka output if omitted).
@@ -442,6 +460,85 @@ def run_single_genome(
             logger.warning("Mahalanobis clustering failed: %s. Continuing.", e, exc_info=True)
     else:
         logger.info("[Step 9/12] Skipping Mahalanobis clustering (--skip-mahal)")
+
+    # ── Step 9s: Bootstrap stability analysis (optional) ───────────────────────
+    stability_results = {}
+    if run_stability and not skip_mahal and rscu_gene_df is not None:
+        logger.info("[Step 9s/12] Running bootstrap cluster stability analysis")
+        try:
+            rp_rscu_df_stab = None
+            if rp_ffn and rp_ffn.exists():
+                try:
+                    rp_rscu_df_stab = compute_rscu_per_gene(rp_ffn)
+                except Exception:
+                    pass
+
+            stability_results = run_stability_analysis(
+                rscu_gene_df=rscu_gene_df,
+                output_dir=output_dir,
+                sample_id=sample_id,
+                ffn_path=ffn_path,
+                rp_ids_file=rp_ids_file,
+                rp_rscu_df=rp_rscu_df_stab,
+                expr_df=expr_df,
+                n_bootstraps=stability_bootstraps,
+                multiplier_grid=stability_multipliers,
+            )
+
+            for key, val in stability_results.items():
+                if isinstance(val, Path):
+                    all_outputs[f"stability_{key}"] = val
+
+            # If auto-select is enabled and we got a recommendation, re-run
+            # Mahalanobis clustering at the recommended multiplier.
+            rec_mult = stability_results.get("recommended_multiplier")
+            if (
+                auto_select_multiplier
+                and rec_mult is not None
+                and abs(rec_mult - mahal_distance_multiplier) > 0.01
+            ):
+                logger.info(
+                    "Auto-selecting recommended multiplier %.2f (was %.2f); "
+                    "re-running Mahalanobis clustering",
+                    rec_mult, mahal_distance_multiplier,
+                )
+                mahal_distance_multiplier = rec_mult
+
+                rp_rscu_df_rerun = None
+                if rp_ffn and rp_ffn.exists():
+                    try:
+                        rp_rscu_df_rerun = compute_rscu_per_gene(rp_ffn)
+                    except Exception:
+                        pass
+
+                mahal_out = run_mahal_clustering(
+                    rscu_gene_df=rscu_gene_df,
+                    output_dir=output_dir,
+                    sample_id=sample_id,
+                    ffn_path=ffn_path,
+                    rp_ids_file=rp_ids_file,
+                    rp_rscu_df=rp_rscu_df_rerun,
+                    expr_df=expr_df,
+                    min_k=mahal_min_k,
+                    max_k=mahal_max_k,
+                    distance_multiplier=rec_mult,
+                )
+                mahal_results = {}
+                for key, val in mahal_out.items():
+                    mahal_results[key] = val
+                    if isinstance(val, Path):
+                        all_outputs[f"mahal_{key}"] = val
+                mahal_cluster_gene_ids = mahal_results.get("mahal_cluster_gene_ids")
+                mahal_cluster_rscu = mahal_results.get("mahal_cluster_rscu")
+
+                if mahal_cluster_gene_ids and expr_df is not None and not expr_df.empty:
+                    try:
+                        expr_df[COL_IN_MAHAL_CLUSTER] = expr_df[COL_GENE].isin(mahal_cluster_gene_ids)
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            logger.warning("Stability analysis failed: %s. Continuing.", e, exc_info=True)
 
     # Save Mahalanobis cluster RSCU to rscu/ directory alongside genome and RP RSCU
     if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty:
