@@ -714,27 +714,30 @@ def run_single_genome(
 
     # ── Step 12: Plots ────────────────────────────────────────────────────
     logger.info("[Step 12/12] Generating publication-ready plots")
-    plot_outputs = generate_single_genome_plots(
-        sample_id, output_dir,
-        freq_df=freq_df,
-        rscu_all=rscu_all,
-        rscu_rp=rscu_rp,
-        rscu_gene_df=rscu_gene_df,
-        enc_df=enc_df,
-        expr_df=expr_df,
-        encprime_df=encprime_df,
-        milc_df=milc_df,
-        enrichment_results=enrichment_results if enrichment_results else None,
-        advanced_results=advanced_results if advanced_results else None,
-        bio_ecology_results=bio_ecology_results if bio_ecology_results else None,
-        gff_path=resolved_gff,
-        mahal_cluster_rscu=mahal_cluster_rscu,
-        mahal_cluster_size=len(mahal_cluster_gene_ids) if mahal_cluster_gene_ids else None,
-        mahal_cluster_gene_ids=mahal_cluster_gene_ids,
-        mahal_coa_coords=mahal_results.get("mahal_coa_coords"),
-        coa_inertia=mahal_results.get("mahal_coa_inertia"),
-    )
-    all_outputs.update(plot_outputs)
+    try:
+        plot_outputs = generate_single_genome_plots(
+            sample_id, output_dir,
+            freq_df=freq_df,
+            rscu_all=rscu_all,
+            rscu_rp=rscu_rp,
+            rscu_gene_df=rscu_gene_df,
+            enc_df=enc_df,
+            expr_df=expr_df,
+            encprime_df=encprime_df,
+            milc_df=milc_df,
+            enrichment_results=enrichment_results if enrichment_results else None,
+            advanced_results=advanced_results if advanced_results else None,
+            bio_ecology_results=bio_ecology_results if bio_ecology_results else None,
+            gff_path=resolved_gff,
+            mahal_cluster_rscu=mahal_cluster_rscu,
+            mahal_cluster_size=len(mahal_cluster_gene_ids) if mahal_cluster_gene_ids else None,
+            mahal_cluster_gene_ids=mahal_cluster_gene_ids,
+            mahal_coa_coords=mahal_results.get("mahal_coa_coords"),
+            coa_inertia=mahal_results.get("mahal_coa_inertia"),
+        )
+        all_outputs.update(plot_outputs)
+    except Exception as e:
+        logger.warning("Plot generation failed: %s. Continuing.", e, exc_info=True)
 
     # ── Summary ─────────────────────────────────────────────────────────
     _write_summary(all_outputs, output_dir, sample_id)
