@@ -12,7 +12,6 @@ import warnings
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.colors as mcolors
 import matplotlib.gridspec as gridspec
 import matplotlib.patheffects as pe
@@ -1232,6 +1231,865 @@ def plot_coa_codons(
     _save_fig(fig, output_path)
 
 
+def plot_coa_landscape(
+    coa_coords: pd.DataFrame,
+    coa_inertia: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+    coa_codon_coords: pd.DataFrame | None = None,
+    rp_gene_ids: set[str] | None = None,
+    membership_freq: dict[str, float] | None = None,
+    stability_class: pd.Series | None = None,
+):
+    """Standalone per-gene COA landscape with optional codon biplot overlay.
+
+    Shows every gene in Axis 1 vs Axis 2 space, colored by bootstrap
+    membership frequency when available, with RP genes marked and codon
+    loadings overlaid as text annotations.  Gives a single-figure overview
+    of the genome's codon usage structure.
+
+    Args:
+        coa_coords: Gene COA coordinates (gene, Axis1, Axis2, ...).
+        coa_inertia: Inertia table (axis, pct_inertia).
+        output_path: Base path for saving (extensions appended).
+        sample_id: Sample name for title.
+        coa_codon_coords: Optional codon loadings (codon, Axis1, Axis2)
+            for biplot overlay.
+        rp_gene_ids: Optional set of ribosomal protein gene IDs.
+        membership_freq: Optional dict mapping gene ID → bootstrap
+            membership frequency (0.0–1.0).  When provided, genes are
+            colored on a continuous gradient.
+        stability_class: Optional Series indexed by gene with categorical
+            labels ('stable', 'moderate', 'unstable', 'absent').
+    """
+    _apply_style()
+    if len(coa_coords) < 3 or "Axis1" not in coa_coords.columns:
+        return
+
+    # Inertia percentages for axis labels
+    _axis1 = coa_inertia.loc[coa_inertia["axis"] == 1, "pct_inertia"].values
+    _axis2 = coa_inertia.loc[coa_inertia["axis"] == 2, "pct_inertia"].values
+    pct1 = _axis1[0] if len(_axis1) > 0 else 0
+    pct2 = _axis2[0] if len(_axis2) > 0 else 0
+
+    x = coa_coords["Axis1"].values
+    y = coa_coords["Axis2"].values
+    gene_ids = coa_coords["gene"].astype(str).values
+
+    has_freq = membership_freq is not None and len(membership_freq) > 0
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+
+    if has_freq:
+        # Color by bootstrap membership frequency
+        freqs = np.array([membership_freq.get(g, 0.0) for g in gene_ids])
+
+        # Background genes (freq == 0) in pale gray
+        zero_mask = freqs <= 0
+        if zero_mask.any():
+            ax.scatter(
+                x[zero_mask], y[zero_mask],
+                s=5, alpha=0.15, c="#d0d0d0", edgecolors="none",
+                rasterized=True, zorder=1,
+            )
+
+        # Non-zero genes on a continuous gradient
+        nonzero = ~zero_mask
+        if nonzero.any():
+            norm = mcolors.Normalize(vmin=0, vmax=1)
+            sc = ax.scatter(
+                x[nonzero], y[nonzero],
+                c=freqs[nonzero], cmap="YlOrRd", norm=norm,
+                s=8, alpha=0.65, edgecolors="none",
+                rasterized=True, zorder=2,
+            )
+            cbar = fig.colorbar(sc, ax=ax, shrink=0.75, pad=0.02)
+            cbar.set_label("Bootstrap membership frequency", fontsize=9)
+    else:
+        # No stability data: uniform color
+        ax.scatter(
+            x, y,
+            s=6, alpha=0.35, c="steelblue", edgecolors="none",
+            rasterized=True, zorder=2,
+        )
+
+    # Mark RP genes
+    if rp_gene_ids:
+        rp_mask = np.array([g in rp_gene_ids for g in gene_ids])
+        if rp_mask.any():
+            ax.scatter(
+                x[rp_mask], y[rp_mask],
+                facecolors="none", edgecolors="black", s=35,
+                linewidths=0.7, zorder=4,
+                label=f"Ribosomal proteins (n={int(rp_mask.sum())})",
+            )
+
+    # Codon loading biplot overlay
+    if coa_codon_coords is not None and len(coa_codon_coords) > 0:
+        # Scale codon coordinates to fit within gene scatter range
+        cx = coa_codon_coords["Axis1"].values
+        cy = coa_codon_coords["Axis2"].values
+
+        # Scaling: fit codon coords to ~80% of gene scatter span
+        x_range = np.ptp(x) if np.ptp(x) > 0 else 1
+        y_range = np.ptp(y) if np.ptp(y) > 0 else 1
+        cx_range = np.ptp(cx) if np.ptp(cx) > 0 else 1
+        cy_range = np.ptp(cy) if np.ptp(cy) > 0 else 1
+        scale = 0.8 * min(x_range / cx_range, y_range / cy_range)
+        cx_scaled = cx * scale
+        cy_scaled = cy * scale
+
+        # Color codons by amino acid family
+        codon_labels = coa_codon_coords["codon"].values
+        aa_names = [c.split("-")[0].rstrip("0123456789") for c in codon_labels]
+        unique_aa = list(dict.fromkeys(aa_names))
+        palette = sns.color_palette("husl", len(unique_aa))
+        aa_cmap = dict(zip(unique_aa, palette))
+
+        for i, codon in enumerate(codon_labels):
+            aa = codon.split("-")[0].rstrip("0123456789")
+            triplet = codon.split("-")[-1] if "-" in codon else codon
+            color = aa_cmap.get(aa, "gray")
+            ax.annotate(
+                triplet, (cx_scaled[i], cy_scaled[i]),
+                fontsize=6, color=color, alpha=0.75,
+                ha="center", va="center", fontweight="bold",
+                path_effects=[
+                    pe.withStroke(linewidth=1.5, foreground="white"),
+                ],
+                zorder=3,
+            )
+
+    # ── 2D KDE contour overlay ────────────────────────────────────────
+    # Gaussian KDE on the gene scatter reveals density modes (expression
+    # tiers, HGT islands, phage, etc.) that are invisible in a scatter.
+    try:
+        if len(x) >= 20:
+            from scipy.stats import gaussian_kde
+            xy_stack = np.vstack([x, y])
+            kde = gaussian_kde(xy_stack, bw_method="scott")
+            xi = np.linspace(x.min() - 0.05 * np.ptp(x), x.max() + 0.05 * np.ptp(x), 120)
+            yi = np.linspace(y.min() - 0.05 * np.ptp(y), y.max() + 0.05 * np.ptp(y), 120)
+            Xi, Yi = np.meshgrid(xi, yi)
+            Zi = kde(np.vstack([Xi.ravel(), Yi.ravel()])).reshape(Xi.shape)
+            ax.contour(
+                Xi, Yi, Zi, levels=6, colors="black",
+                linewidths=0.5, alpha=0.35, zorder=5,
+            )
+    except Exception:
+        pass  # KDE can fail on degenerate distributions; not worth crashing
+
+    # Axis setup
+    ax.set_xlabel(f"COA Axis 1 ({pct1:.1f}% inertia)")
+    ax.set_ylabel(f"COA Axis 2 ({pct2:.1f}% inertia)")
+    ax.axhline(0, color="gray", linewidth=0.4, linestyle="--", alpha=0.4)
+    ax.axvline(0, color="gray", linewidth=0.4, linestyle="--", alpha=0.4)
+
+    # Summary annotation
+    n_genes = len(gene_ids)
+    title_parts = [f"{sample_id}: codon usage landscape ({n_genes} genes)"]
+    if has_freq:
+        n_core = int(sum(1 for f in membership_freq.values() if f >= 0.5))
+        title_parts.append(f" — {n_core} core genes (freq ≥ 0.5)")
+    ax.set_title("".join(title_parts), fontsize=11)
+
+    if rp_gene_ids:
+        ax.legend(fontsize=8, loc="best", framealpha=0.7, markerscale=1.2)
+
+    _save_fig(fig, output_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Per-gene UMAP at multiple hyperparameters (2-D and 3-D)
+# ═══════════════════════════════════════════════════════════════════════
+
+_UMAP_GRID: list[dict] = [
+    {"n_neighbors": 10, "min_dist": 0.05},
+    {"n_neighbors": 15, "min_dist": 0.1},
+    {"n_neighbors": 30, "min_dist": 0.1},
+    {"n_neighbors": 50, "min_dist": 0.25},
+]
+
+
+def plot_umap_gene_grid(
+    rscu_gene_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+    enc_df: pd.DataFrame | None = None,
+    expr_df: pd.DataFrame | None = None,
+    rp_gene_ids: set[str] | None = None,
+    membership_freq: dict[str, float] | None = None,
+    umap_grid: list[dict] | None = None,
+):
+    """2-D UMAP panel grid at multiple hyperparameter settings.
+
+    Each panel shows the same per-gene RSCU data embedded with different
+    n_neighbors / min_dist combinations.  Genes are colored by bootstrap
+    membership frequency when available, falling back to a continuous ENC
+    gradient or uniform color.
+
+    Args:
+        rscu_gene_df: Per-gene RSCU matrix (gene × codons).
+        output_path: Base path (extensions appended by _save_fig).
+        sample_id: Genome label for title.
+        enc_df: Optional DataFrame with gene, ENC columns.
+        expr_df: Optional expression DataFrame (CAI/MELP).
+        rp_gene_ids: Optional set of RP gene IDs to mark.
+        membership_freq: Optional dict gene→bootstrap frequency.
+        umap_grid: List of dicts with n_neighbors, min_dist overrides.
+    """
+    try:
+        import umap as umap_lib
+    except ImportError:
+        logger.warning("umap-learn not installed; skipping per-gene UMAP grid")
+        return
+
+    _apply_style()
+    grid = umap_grid or _UMAP_GRID
+    rscu_cols = [c for c in rscu_gene_df.columns if c != "gene"]
+    if len(rscu_cols) < 2 or len(rscu_gene_df) < 20:
+        logger.info("Too few genes/codons for UMAP grid; skipping")
+        return
+
+    gene_ids = rscu_gene_df["gene"].astype(str).values
+    X = rscu_gene_df[rscu_cols].fillna(0.0).values
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Determine color vector
+    has_freq = membership_freq is not None and len(membership_freq) > 0
+    has_enc = enc_df is not None and "ENC" in enc_df.columns
+
+    if has_freq:
+        color_vals = np.array([membership_freq.get(g, 0.0) for g in gene_ids])
+        cmap_name, clabel = "YlOrRd", "Bootstrap frequency"
+        vmin, vmax = 0.0, 1.0
+    elif has_enc:
+        enc_map = dict(zip(enc_df["gene"].astype(str), enc_df["ENC"]))
+        color_vals = np.array([enc_map.get(g, np.nan) for g in gene_ids])
+        cmap_name, clabel = "viridis", "ENC"
+        vmin, vmax = np.nanmin(color_vals), np.nanmax(color_vals)
+    else:
+        color_vals = None
+        cmap_name, clabel = None, None
+        vmin, vmax = 0, 1
+
+    ncols = 2
+    nrows = (len(grid) + 1) // 2
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows))
+    axes = np.atleast_2d(axes)
+
+    for idx, params in enumerate(grid):
+        ax = axes[idx // ncols, idx % ncols]
+        nn = params.get("n_neighbors", 15)
+        md = params.get("min_dist", 0.1)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="n_jobs value")
+            reducer = umap_lib.UMAP(
+                n_neighbors=nn, min_dist=md, n_components=2,
+                metric="cosine", random_state=42,
+            )
+            coords = reducer.fit_transform(X_scaled)
+
+        if color_vals is not None:
+            norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+            sc = ax.scatter(
+                coords[:, 0], coords[:, 1],
+                c=color_vals, cmap=cmap_name, norm=norm,
+                s=5, alpha=0.55, edgecolors="none", rasterized=True,
+            )
+        else:
+            ax.scatter(
+                coords[:, 0], coords[:, 1],
+                s=5, alpha=0.4, c="steelblue", edgecolors="none", rasterized=True,
+            )
+
+        if rp_gene_ids:
+            rp_mask = np.array([g in rp_gene_ids for g in gene_ids])
+            if rp_mask.any():
+                ax.scatter(
+                    coords[rp_mask, 0], coords[rp_mask, 1],
+                    facecolors="none", edgecolors="black", s=28,
+                    linewidths=0.6, zorder=4,
+                )
+
+        ax.set_xlabel("UMAP 1", fontsize=8)
+        ax.set_ylabel("UMAP 2", fontsize=8)
+        ax.set_title(f"n_neighbors={nn}, min_dist={md}", fontsize=9)
+        ax.tick_params(labelsize=7)
+
+    # Remove unused axes
+    for idx in range(len(grid), nrows * ncols):
+        axes[idx // ncols, idx % ncols].set_visible(False)
+
+    if color_vals is not None:
+        fig.colorbar(
+            plt.cm.ScalarMappable(
+                norm=mcolors.Normalize(vmin=vmin, vmax=vmax),
+                cmap=cmap_name,
+            ),
+            ax=axes.ravel().tolist(), shrink=0.6, pad=0.02,
+            label=clabel,
+        )
+
+    fig.suptitle(
+        f"{sample_id}: per-gene UMAP (cosine distance on RSCU)",
+        fontsize=12, y=1.01,
+    )
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+def plot_umap_gene_3d(
+    rscu_gene_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+    enc_df: pd.DataFrame | None = None,
+    rp_gene_ids: set[str] | None = None,
+    membership_freq: dict[str, float] | None = None,
+    n_neighbors: int = 15,
+    min_dist: float = 0.1,
+):
+    """3-D UMAP embedding of per-gene RSCU, rendered as three 2-D projections.
+
+    Produces a 1×3 panel figure showing the XY, XZ, and YZ projections
+    of a 3-component UMAP embedding.  Gives a pseudo-3D view without
+    needing interactive rendering.
+
+    Args:
+        rscu_gene_df: Per-gene RSCU matrix (gene × codons).
+        output_path: Base path (extensions appended by _save_fig).
+        sample_id: Genome label.
+        enc_df: Optional ENC data for coloring.
+        rp_gene_ids: Optional RP gene IDs to mark.
+        membership_freq: Optional bootstrap frequency dict.
+        n_neighbors: UMAP n_neighbors.
+        min_dist: UMAP min_dist.
+    """
+    try:
+        import umap as umap_lib
+    except ImportError:
+        logger.warning("umap-learn not installed; skipping 3-D UMAP")
+        return
+
+    _apply_style()
+    rscu_cols = [c for c in rscu_gene_df.columns if c != "gene"]
+    if len(rscu_cols) < 2 or len(rscu_gene_df) < 30:
+        logger.info("Too few genes for 3-D UMAP; skipping")
+        return
+
+    gene_ids = rscu_gene_df["gene"].astype(str).values
+    X = rscu_gene_df[rscu_cols].fillna(0.0).values
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    has_freq = membership_freq is not None and len(membership_freq) > 0
+    has_enc = enc_df is not None and "ENC" in enc_df.columns
+
+    if has_freq:
+        color_vals = np.array([membership_freq.get(g, 0.0) for g in gene_ids])
+        cmap_name, clabel = "YlOrRd", "Bootstrap frequency"
+        vmin, vmax = 0.0, 1.0
+    elif has_enc:
+        enc_map = dict(zip(enc_df["gene"].astype(str), enc_df["ENC"]))
+        color_vals = np.array([enc_map.get(g, np.nan) for g in gene_ids])
+        cmap_name, clabel = "viridis", "ENC"
+        vmin, vmax = np.nanmin(color_vals), np.nanmax(color_vals)
+    else:
+        color_vals = None
+        cmap_name, clabel = None, None
+        vmin, vmax = 0, 1
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="n_jobs value")
+        reducer = umap_lib.UMAP(
+            n_neighbors=n_neighbors, min_dist=min_dist,
+            n_components=3, metric="cosine", random_state=42,
+        )
+        coords = reducer.fit_transform(X_scaled)
+
+    projections = [
+        (0, 1, "UMAP 1", "UMAP 2"),
+        (0, 2, "UMAP 1", "UMAP 3"),
+        (1, 2, "UMAP 2", "UMAP 3"),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    for ax, (xi, yi, xlab, ylab) in zip(axes, projections):
+        if color_vals is not None:
+            norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+            sc = ax.scatter(
+                coords[:, xi], coords[:, yi],
+                c=color_vals, cmap=cmap_name, norm=norm,
+                s=5, alpha=0.55, edgecolors="none", rasterized=True,
+            )
+        else:
+            ax.scatter(
+                coords[:, xi], coords[:, yi],
+                s=5, alpha=0.4, c="steelblue", edgecolors="none", rasterized=True,
+            )
+
+        if rp_gene_ids:
+            rp_mask = np.array([g in rp_gene_ids for g in gene_ids])
+            if rp_mask.any():
+                ax.scatter(
+                    coords[rp_mask, xi], coords[rp_mask, yi],
+                    facecolors="none", edgecolors="black", s=28,
+                    linewidths=0.6, zorder=4,
+                )
+
+        ax.set_xlabel(xlab, fontsize=9)
+        ax.set_ylabel(ylab, fontsize=9)
+        ax.tick_params(labelsize=7)
+
+    if color_vals is not None:
+        fig.colorbar(
+            plt.cm.ScalarMappable(
+                norm=mcolors.Normalize(vmin=vmin, vmax=vmax), cmap=cmap_name,
+            ),
+            ax=axes.tolist(), shrink=0.7, pad=0.02, label=clabel,
+        )
+
+    fig.suptitle(
+        f"{sample_id}: 3-D UMAP projections (n={n_neighbors}, d={min_dist})",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Per-gene scalar metrics distributions (ENC, CAI, MELP, Mahal distance)
+# ═══════════════════════════════════════════════════════════════════════
+
+def plot_gene_metric_distributions(
+    output_path: Path,
+    sample_id: str = "",
+    enc_df: pd.DataFrame | None = None,
+    expr_df: pd.DataFrame | None = None,
+    mahal_distances: pd.Series | None = None,
+    rp_gene_ids: set[str] | None = None,
+):
+    """Multi-panel ridge/density plots of per-gene codon bias metrics.
+
+    Each panel shows the kernel density estimate for one scalar metric
+    (ENC, CAI, MELP, Fop, Mahalanobis distance), with RP genes drawn as
+    a separate, overlaid distribution for comparison.
+
+    Args:
+        output_path: Base path (extensions appended).
+        sample_id: Genome label.
+        enc_df: DataFrame with gene, ENC, optionally GC3.
+        expr_df: DataFrame with gene, CAI, MELP, Fop columns.
+        mahal_distances: Series indexed by gene ID with Mahalanobis distances.
+        rp_gene_ids: Optional set of RP gene IDs for overlay.
+    """
+    _apply_style()
+
+    # Collect (label, all_values, rp_values) tuples
+    panels: list[tuple[str, np.ndarray, np.ndarray | None]] = []
+
+    def _split_rp(genes, values):
+        if rp_gene_ids is None:
+            return values, None
+        mask = np.array([g in rp_gene_ids for g in genes])
+        return values, values[mask] if mask.any() else None
+
+    if enc_df is not None and "ENC" in enc_df.columns:
+        vals = enc_df["ENC"].dropna().values
+        genes = enc_df["gene"].astype(str).values[: len(vals)]
+        all_v, rp_v = _split_rp(genes, vals)
+        panels.append(("ENC", all_v, rp_v))
+
+    if expr_df is not None:
+        for col, label in [("CAI", "CAI"), ("MELP", "MELP"), ("Fop", "Fop")]:
+            if col in expr_df.columns:
+                sub = expr_df[["gene", col]].dropna(subset=[col])
+                all_v, rp_v = _split_rp(sub["gene"].astype(str).values, sub[col].values)
+                panels.append((label, all_v, rp_v))
+
+    if mahal_distances is not None and len(mahal_distances) > 0:
+        genes_m = mahal_distances.index.astype(str).values
+        vals_m = mahal_distances.values.astype(float)
+        all_v, rp_v = _split_rp(genes_m, vals_m)
+        panels.append(("Mahalanobis dist.", all_v, rp_v))
+
+    if not panels:
+        logger.info("No scalar metrics available for distribution plot; skipping")
+        return
+
+    n = len(panels)
+    fig, axes = plt.subplots(n, 1, figsize=(8, 2.5 * n), sharex=False)
+    if n == 1:
+        axes = [axes]
+
+    for ax, (label, all_v, rp_v) in zip(axes, panels):
+        if len(all_v) < 5:
+            ax.set_visible(False)
+            continue
+
+        # All genes
+        sns.kdeplot(all_v, ax=ax, fill=True, color="steelblue", alpha=0.35,
+                    linewidth=1.0, label=f"All genes (n={len(all_v)})")
+
+        # RP overlay
+        if rp_v is not None and len(rp_v) >= 3:
+            sns.kdeplot(rp_v, ax=ax, fill=False, color="crimson", linewidth=1.5,
+                        linestyle="--", label=f"RP (n={len(rp_v)})")
+
+        # Rug plot for small-n visibility
+        ax.plot(all_v, np.zeros_like(all_v) - 0.002, "|", color="steelblue",
+                alpha=0.08, markersize=4)
+
+        ax.set_ylabel("Density", fontsize=8)
+        ax.set_xlabel(label, fontsize=9)
+        ax.legend(fontsize=7, loc="upper right", framealpha=0.7)
+        ax.tick_params(labelsize=7)
+
+    fig.suptitle(
+        f"{sample_id}: per-gene codon bias metric distributions",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Standalone 2-D KDE density plot on COA plane
+# ═══════════════════════════════════════════════════════════════════════
+
+def plot_coa_kde(
+    coa_coords: pd.DataFrame,
+    coa_inertia: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+    rp_gene_ids: set[str] | None = None,
+):
+    """Filled 2-D KDE contour on the COA Axis 1 vs Axis 2 plane.
+
+    Density modes correspond to groups of genes sharing codon usage
+    dialects: highly expressed native genes, horizontally acquired genes,
+    phage insertions, etc.
+
+    Args:
+        coa_coords: Gene COA coordinates (gene, Axis1, Axis2).
+        coa_inertia: Inertia table.
+        output_path: Base path.
+        sample_id: Genome label.
+        rp_gene_ids: Optional RP gene IDs to overlay.
+    """
+    _apply_style()
+    if len(coa_coords) < 30 or "Axis1" not in coa_coords.columns:
+        return
+
+    x = coa_coords["Axis1"].values
+    y = coa_coords["Axis2"].values
+    gene_ids = coa_coords["gene"].astype(str).values
+
+    _axis1 = coa_inertia.loc[coa_inertia["axis"] == 1, "pct_inertia"].values
+    _axis2 = coa_inertia.loc[coa_inertia["axis"] == 2, "pct_inertia"].values
+    pct1 = _axis1[0] if len(_axis1) > 0 else 0
+    pct2 = _axis2[0] if len(_axis2) > 0 else 0
+
+    from scipy.stats import gaussian_kde
+    xy_stack = np.vstack([x, y])
+    kde = gaussian_kde(xy_stack, bw_method="scott")
+    xi = np.linspace(x.min() - 0.08 * np.ptp(x), x.max() + 0.08 * np.ptp(x), 200)
+    yi = np.linspace(y.min() - 0.08 * np.ptp(y), y.max() + 0.08 * np.ptp(y), 200)
+    Xi, Yi = np.meshgrid(xi, yi)
+    Zi = kde(np.vstack([Xi.ravel(), Yi.ravel()])).reshape(Xi.shape)
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+
+    # Filled contour
+    cf = ax.contourf(Xi, Yi, Zi, levels=15, cmap="Blues", alpha=0.7)
+    ax.contour(Xi, Yi, Zi, levels=15, colors="navy", linewidths=0.3, alpha=0.4)
+    cbar = fig.colorbar(cf, ax=ax, shrink=0.75, pad=0.02)
+    cbar.set_label("Gene density (KDE)", fontsize=9)
+
+    # Scatter underneath for context
+    ax.scatter(x, y, s=3, alpha=0.15, c="black", edgecolors="none", rasterized=True, zorder=1)
+
+    if rp_gene_ids:
+        rp_mask = np.array([g in rp_gene_ids for g in gene_ids])
+        if rp_mask.any():
+            ax.scatter(
+                x[rp_mask], y[rp_mask],
+                facecolors="none", edgecolors="crimson", s=30,
+                linewidths=0.8, zorder=4,
+                label=f"Ribosomal proteins (n={int(rp_mask.sum())})",
+            )
+            ax.legend(fontsize=8, loc="best", framealpha=0.7)
+
+    ax.set_xlabel(f"COA Axis 1 ({pct1:.1f}% inertia)")
+    ax.set_ylabel(f"COA Axis 2 ({pct2:.1f}% inertia)")
+    ax.axhline(0, color="gray", linewidth=0.3, linestyle="--", alpha=0.3)
+    ax.axvline(0, color="gray", linewidth=0.3, linestyle="--", alpha=0.3)
+    ax.set_title(f"{sample_id}: COA density landscape ({len(gene_ids)} genes)", fontsize=11)
+
+    _save_fig(fig, output_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Codon usage similarity network
+# ═══════════════════════════════════════════════════════════════════════
+
+def plot_codon_similarity_network(
+    rscu_gene_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+    rp_gene_ids: set[str] | None = None,
+    membership_freq: dict[str, float] | None = None,
+    max_genes: int = 500,
+    cosine_threshold: float = 0.92,
+):
+    """Codon usage similarity network using cosine similarity on RSCU.
+
+    Genes are nodes, edges connect genes with cosine similarity above
+    *cosine_threshold*.  The layout is computed with a spring-directed
+    algorithm (Fruchterman-Reingold).  Genes are colored by bootstrap
+    membership frequency when available.
+
+    For genomes with >max_genes CDS, the function subsamples to keep
+    rendering tractable.
+
+    Args:
+        rscu_gene_df: Per-gene RSCU (gene × codons).
+        output_path: Base path.
+        sample_id: Genome label.
+        rp_gene_ids: Optional RP gene IDs.
+        membership_freq: Optional bootstrap frequency dict.
+        max_genes: Maximum genes to include (subsampled if exceeded).
+        cosine_threshold: Minimum cosine similarity to draw an edge.
+    """
+    try:
+        import networkx as nx
+    except ImportError:
+        logger.warning("networkx not installed; skipping similarity network")
+        return
+
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    _apply_style()
+    rscu_cols = [c for c in rscu_gene_df.columns if c != "gene"]
+    if len(rscu_cols) < 2 or len(rscu_gene_df) < 10:
+        return
+
+    df = rscu_gene_df.copy()
+    # Subsample for tractability
+    if len(df) > max_genes:
+        # Keep all RP genes, sample the rest
+        if rp_gene_ids:
+            rp_mask = df["gene"].astype(str).isin(rp_gene_ids)
+            rp_df = df[rp_mask]
+            non_rp = df[~rp_mask].sample(
+                n=min(max_genes - len(rp_df), len(df) - len(rp_df)),
+                random_state=42,
+            )
+            df = pd.concat([rp_df, non_rp], ignore_index=True)
+        else:
+            df = df.sample(n=max_genes, random_state=42)
+
+    gene_ids = df["gene"].astype(str).values
+    X = df[rscu_cols].fillna(0.0).values
+
+    # Cosine similarity matrix
+    sim_matrix = cosine_similarity(X)
+    np.fill_diagonal(sim_matrix, 0)
+
+    # Build graph
+    G = nx.Graph()
+    G.add_nodes_from(range(len(gene_ids)))
+    edges = []
+    for i in range(len(gene_ids)):
+        for j in range(i + 1, len(gene_ids)):
+            if sim_matrix[i, j] >= cosine_threshold:
+                edges.append((i, j, {"weight": sim_matrix[i, j]}))
+    G.add_edges_from(edges)
+
+    if G.number_of_edges() == 0:
+        logger.info(
+            "No edges above cosine threshold %.2f; lowering by 0.05 and retrying",
+            cosine_threshold,
+        )
+        cosine_threshold -= 0.05
+        edges = []
+        for i in range(len(gene_ids)):
+            for j in range(i + 1, len(gene_ids)):
+                if sim_matrix[i, j] >= cosine_threshold:
+                    edges.append((i, j, {"weight": sim_matrix[i, j]}))
+        G.add_edges_from(edges)
+
+    if G.number_of_edges() == 0:
+        logger.warning("No network edges even at threshold %.2f; skipping plot", cosine_threshold)
+        return
+
+    # Layout
+    pos = nx.spring_layout(G, seed=42, k=1.5 / np.sqrt(len(gene_ids)), iterations=80)
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+
+    # Draw edges (faint)
+    edge_xs, edge_ys = [], []
+    for u, v in G.edges():
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        edge_xs.extend([x0, x1, None])
+        edge_ys.extend([y0, y1, None])
+    ax.plot(edge_xs, edge_ys, color="lightgray", linewidth=0.15, alpha=0.4, zorder=1)
+
+    # Node positions
+    node_x = np.array([pos[i][0] for i in range(len(gene_ids))])
+    node_y = np.array([pos[i][1] for i in range(len(gene_ids))])
+
+    has_freq = membership_freq is not None and len(membership_freq) > 0
+    if has_freq:
+        freqs = np.array([membership_freq.get(g, 0.0) for g in gene_ids])
+        norm = mcolors.Normalize(vmin=0, vmax=1)
+        sc = ax.scatter(
+            node_x, node_y, c=freqs, cmap="YlOrRd", norm=norm,
+            s=12, alpha=0.7, edgecolors="none", zorder=2, rasterized=True,
+        )
+        cbar = fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.02)
+        cbar.set_label("Bootstrap frequency", fontsize=9)
+    else:
+        ax.scatter(
+            node_x, node_y, s=12, alpha=0.5, c="steelblue",
+            edgecolors="none", zorder=2, rasterized=True,
+        )
+
+    if rp_gene_ids:
+        rp_mask = np.array([g in rp_gene_ids for g in gene_ids])
+        if rp_mask.any():
+            ax.scatter(
+                node_x[rp_mask], node_y[rp_mask],
+                facecolors="none", edgecolors="black", s=40,
+                linewidths=0.8, zorder=4,
+                label=f"RP genes (n={int(rp_mask.sum())})",
+            )
+            ax.legend(fontsize=8, loc="best", framealpha=0.7)
+
+    n_edges = G.number_of_edges()
+    n_components = nx.number_connected_components(G)
+    ax.set_title(
+        f"{sample_id}: codon usage network ({len(gene_ids)} genes, "
+        f"{n_edges} edges, cos ≥ {cosine_threshold:.2f}, "
+        f"{n_components} components)",
+        fontsize=10,
+    )
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    _save_fig(fig, output_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Wright ENC vs GC3s plot (standalone, reusable in landscape suite)
+# ═══════════════════════════════════════════════════════════════════════
+
+def plot_enc_gc3_landscape(
+    enc_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+    expr_df: pd.DataFrame | None = None,
+    rp_gene_ids: set[str] | None = None,
+):
+    """ENC vs GC3 Wright plot with KDE contours, RP overlay, and
+    optional expression-tier coloring.
+
+    Combines the Wright (1990) expected curve with density contours to
+    show how many genes fall below the neutral expectation (i.e., under
+    translational selection).
+
+    Args:
+        enc_df: DataFrame with gene, ENC, GC3 columns.
+        output_path: Base path.
+        sample_id: Genome label.
+        expr_df: Optional expression DataFrame with gene + CAI/MELP.
+        rp_gene_ids: Optional RP gene IDs.
+    """
+    _apply_style()
+    if enc_df is None or "GC3" not in enc_df.columns or "ENC" not in enc_df.columns:
+        return
+    if len(enc_df) < 20:
+        return
+
+    gc3 = enc_df["GC3"].values
+    enc = enc_df["ENC"].values
+    gene_ids = enc_df["gene"].astype(str).values
+
+    # Wright expected curve
+    s_vals = np.linspace(0.01, 0.99, 200)
+    expected_enc = 2 + s_vals + (29 / (s_vals**2 + (1 - s_vals)**2))
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(s_vals, expected_enc, "k-", linewidth=1.2, alpha=0.6, label="Wright (1990) expected")
+
+    # KDE contours on gene scatter
+    try:
+        from scipy.stats import gaussian_kde
+        valid = np.isfinite(gc3) & np.isfinite(enc)
+        if valid.sum() >= 30:
+            xy = np.vstack([gc3[valid], enc[valid]])
+            kde = gaussian_kde(xy, bw_method="scott")
+            xi = np.linspace(gc3[valid].min() - 0.05, gc3[valid].max() + 0.05, 120)
+            yi = np.linspace(enc[valid].min() - 2, enc[valid].max() + 2, 120)
+            Xi, Yi = np.meshgrid(xi, yi)
+            Zi = kde(np.vstack([Xi.ravel(), Yi.ravel()])).reshape(Xi.shape)
+            ax.contourf(Xi, Yi, Zi, levels=10, cmap="Blues", alpha=0.35, zorder=0)
+            ax.contour(Xi, Yi, Zi, levels=10, colors="steelblue", linewidths=0.3, alpha=0.4)
+    except Exception:
+        pass
+
+    # Expression coloring if available
+    has_expr = expr_df is not None and "CAI" in expr_df.columns
+    if has_expr:
+        cai_map = dict(zip(expr_df["gene"].astype(str), expr_df["CAI"]))
+        cai_vals = np.array([cai_map.get(g, np.nan) for g in gene_ids])
+        valid_cai = np.isfinite(cai_vals)
+        if valid_cai.sum() > 10:
+            norm = mcolors.Normalize(
+                vmin=np.nanpercentile(cai_vals[valid_cai], 5),
+                vmax=np.nanpercentile(cai_vals[valid_cai], 95),
+            )
+            sc = ax.scatter(
+                gc3[valid_cai], enc[valid_cai],
+                c=cai_vals[valid_cai], cmap="RdYlGn", norm=norm,
+                s=6, alpha=0.5, edgecolors="none", rasterized=True, zorder=2,
+            )
+            fig.colorbar(sc, ax=ax, shrink=0.7, pad=0.02, label="CAI")
+            # Plot non-CAI genes in gray
+            ax.scatter(
+                gc3[~valid_cai], enc[~valid_cai],
+                s=4, alpha=0.15, c="#d0d0d0", edgecolors="none", rasterized=True, zorder=1,
+            )
+        else:
+            ax.scatter(gc3, enc, s=6, alpha=0.35, c="steelblue", edgecolors="none", rasterized=True)
+    else:
+        ax.scatter(gc3, enc, s=6, alpha=0.35, c="steelblue", edgecolors="none", rasterized=True)
+
+    if rp_gene_ids:
+        rp_mask = np.array([g in rp_gene_ids for g in gene_ids])
+        if rp_mask.any():
+            ax.scatter(
+                gc3[rp_mask], enc[rp_mask],
+                facecolors="none", edgecolors="crimson", s=30,
+                linewidths=0.7, zorder=4,
+                label=f"RP (n={int(rp_mask.sum())})",
+            )
+
+    ax.set_xlabel("GC3s")
+    ax.set_ylabel("ENC")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(20, 62)
+    ax.legend(fontsize=8, loc="upper left", framealpha=0.7)
+    ax.set_title(f"{sample_id}: ENC–GC3 landscape ({len(gene_ids)} genes)", fontsize=11)
+
+    _save_fig(fig, output_path)
+
+
 def plot_s_value_scatter(
     s_val_df: pd.DataFrame,
     expr_df: pd.DataFrame | None,
@@ -2284,7 +3142,7 @@ def plot_position_effects(
                              transform=axis.transAxes, fontsize=8, ha="center",
                              bbox=dict(boxstyle="round", facecolor="yellow", alpha=0.3))
                 except Exception as e:
-                    logger.debug("Plot generation failed: %s", e)
+                    logger.warning("Data loading failed (plot may be skipped): %s", e)
 
         axis.set_ylabel("Fop", fontsize=10)
         axis.grid(True, alpha=0.3, axis="y")
@@ -4115,7 +4973,7 @@ def _get_gene_positions(
                 if len(pos_df) > 10:
                     return pos_df.reset_index(drop=True)
         except Exception as e:
-            logger.debug("Plot generation failed: %s", e)
+            logger.warning("Data loading failed (plot may be skipped): %s", e)
 
     # Fallback: gene order as position
     if genes_ordered:
@@ -4149,6 +5007,9 @@ def generate_single_genome_plots(
     mahal_cluster_gene_ids: set | None = None,
     mahal_coa_coords: pd.DataFrame | None = None,
     coa_inertia: pd.DataFrame | None = None,
+    stability_results: dict | None = None,
+    rp_gene_ids: set[str] | None = None,
+    mahal_gene_distances: "pd.Series | None" = None,
 ) -> dict[str, Path]:
     """Generate all single-genome plots.
 
@@ -4395,6 +5256,147 @@ def generate_single_genome_plots(
         )
     else:
         logger.info("SKIPPED: bio/ecology plots (no bio/ecology analysis data)")
+
+    # ── COA landscape plot ───────────────────────────────────────────────
+    # Standalone per-gene COA scatter with bootstrap membership frequency
+    # gradient and codon loading biplot overlay.
+    _coa_coords_for_landscape = None
+    _coa_inertia_for_landscape = None
+    _codon_coords = None
+
+    # Prefer Mahalanobis COA coords (they include distance annotations)
+    if mahal_coa_coords is not None and not mahal_coa_coords.empty:
+        _coa_coords_for_landscape = mahal_coa_coords
+        _coa_inertia_for_landscape = coa_inertia
+    elif advanced_results and "coa_coords" in advanced_results:
+        _coa_coords_for_landscape = advanced_results["coa_coords"]
+        _coa_inertia_for_landscape = advanced_results.get("coa_inertia")
+
+    if advanced_results and "coa_codon_coords" in advanced_results:
+        _codon_coords = advanced_results["coa_codon_coords"]
+
+    if _coa_coords_for_landscape is not None and _coa_inertia_for_landscape is not None:
+        try:
+            # Extract membership frequencies from stability results
+            _mem_freq = None
+            if stability_results and "membership_frequencies" in stability_results:
+                _mem_freq = stability_results["membership_frequencies"]
+
+            p = plot_dir / f"{sample_id}_coa_landscape"
+            plot_coa_landscape(
+                _coa_coords_for_landscape,
+                _coa_inertia_for_landscape,
+                p,
+                sample_id=sample_id,
+                coa_codon_coords=_codon_coords,
+                rp_gene_ids=rp_gene_ids,
+                membership_freq=_mem_freq,
+            )
+            outputs["coa_landscape"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("COA landscape plot failed: %s", e)
+    else:
+        logger.info("SKIPPED: COA landscape plot (no COA data)")
+
+    # ── COA KDE density plot ────────────────────────────────────────────
+    if _coa_coords_for_landscape is not None and _coa_inertia_for_landscape is not None:
+        try:
+            p = plot_dir / f"{sample_id}_coa_kde"
+            plot_coa_kde(
+                _coa_coords_for_landscape,
+                _coa_inertia_for_landscape,
+                p,
+                sample_id=sample_id,
+                rp_gene_ids=rp_gene_ids,
+            )
+            outputs["coa_kde"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("COA KDE density plot failed: %s", e)
+
+    # ── Per-gene UMAP grid (2-D, multiple hyperparameters) ──────────────
+    if rscu_gene_df is not None and not rscu_gene_df.empty:
+        try:
+            _mem_freq_umap = None
+            if stability_results and "membership_frequencies" in stability_results:
+                _mem_freq_umap = stability_results["membership_frequencies"]
+
+            p = plot_dir / f"{sample_id}_umap_gene_grid"
+            plot_umap_gene_grid(
+                rscu_gene_df, p,
+                sample_id=sample_id,
+                enc_df=enc_df,
+                expr_df=expr_df,
+                rp_gene_ids=rp_gene_ids,
+                membership_freq=_mem_freq_umap,
+            )
+            outputs["umap_gene_grid"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Per-gene UMAP grid plot failed: %s", e)
+
+        # ── Per-gene 3-D UMAP projections ───────────────────────────────
+        try:
+            p = plot_dir / f"{sample_id}_umap_gene_3d"
+            plot_umap_gene_3d(
+                rscu_gene_df, p,
+                sample_id=sample_id,
+                enc_df=enc_df,
+                rp_gene_ids=rp_gene_ids,
+                membership_freq=_mem_freq_umap,
+            )
+            outputs["umap_gene_3d"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("3-D UMAP plot failed: %s", e)
+    else:
+        logger.info("SKIPPED: UMAP gene plots (no per-gene RSCU)")
+
+    # ── Per-gene scalar metric distributions ────────────────────────────
+    try:
+        p = plot_dir / f"{sample_id}_metric_distributions"
+        plot_gene_metric_distributions(
+            p,
+            sample_id=sample_id,
+            enc_df=enc_df,
+            expr_df=expr_df,
+            mahal_distances=mahal_gene_distances,
+            rp_gene_ids=rp_gene_ids,
+        )
+        outputs["metric_distributions"] = p.with_suffix(".png")
+    except Exception as e:
+        logger.warning("Metric distributions plot failed: %s", e)
+
+    # ── Codon usage similarity network ──────────────────────────────────
+    if rscu_gene_df is not None and not rscu_gene_df.empty:
+        try:
+            _mem_freq_net = None
+            if stability_results and "membership_frequencies" in stability_results:
+                _mem_freq_net = stability_results["membership_frequencies"]
+
+            p = plot_dir / f"{sample_id}_codon_similarity_network"
+            plot_codon_similarity_network(
+                rscu_gene_df, p,
+                sample_id=sample_id,
+                rp_gene_ids=rp_gene_ids,
+                membership_freq=_mem_freq_net,
+            )
+            outputs["codon_similarity_network"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Codon similarity network plot failed: %s", e)
+    else:
+        logger.info("SKIPPED: Codon similarity network (no per-gene RSCU)")
+
+    # ── ENC-GC3 landscape with KDE + expression coloring ────────────────
+    if enc_df is not None and not enc_df.empty and "GC3" in enc_df.columns:
+        try:
+            p = plot_dir / f"{sample_id}_enc_gc3_landscape"
+            plot_enc_gc3_landscape(
+                enc_df, p,
+                sample_id=sample_id,
+                expr_df=expr_df,
+                rp_gene_ids=rp_gene_ids,
+            )
+            outputs["enc_gc3_landscape"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("ENC-GC3 landscape plot failed: %s", e)
 
     return outputs
 
@@ -4861,7 +5863,7 @@ def _load_sample_data(
             try:
                 entry["rscu_median"] = pd.read_csv(p, sep="\t")
             except Exception as e:
-                logger.debug("Plot generation failed: %s", e)
+                logger.warning("Data loading failed (plot may be skipped): %s", e)
 
         # Ribosomal RSCU
         p = paths.get("rscu_ribosomal")
@@ -4869,7 +5871,7 @@ def _load_sample_data(
             try:
                 entry["rscu_ribosomal"] = pd.read_csv(p, sep="\t")
             except Exception as e:
-                logger.debug("Plot generation failed: %s", e)
+                logger.warning("Data loading failed (plot may be skipped): %s", e)
 
         # Mahalanobis cluster RSCU
         p = paths.get("rscu_mahal_cluster")
@@ -4877,7 +5879,7 @@ def _load_sample_data(
             try:
                 entry["rscu_mahal_cluster"] = pd.read_csv(p, sep="\t", index_col=0)
             except Exception as e:
-                logger.debug("Plot generation failed: %s", e)
+                logger.warning("Data loading failed (plot may be skipped): %s", e)
 
         # ENC
         p = paths.get("enc")
@@ -4885,7 +5887,7 @@ def _load_sample_data(
             try:
                 entry["enc"] = pd.read_csv(p, sep="\t")
             except Exception as e:
-                logger.debug("Plot generation failed: %s", e)
+                logger.warning("Data loading failed (plot may be skipped): %s", e)
 
         # Expression
         p = paths.get("expression_combined")
@@ -4893,7 +5895,7 @@ def _load_sample_data(
             try:
                 entry["expression"] = pd.read_csv(p, sep="\t")
             except Exception as e:
-                logger.debug("Plot generation failed: %s", e)
+                logger.warning("Data loading failed (plot may be skipped): %s", e)
 
         # Enrichment results
         enrich = {}
@@ -4902,7 +5904,7 @@ def _load_sample_data(
                 try:
                     enrich[key] = pd.read_csv(ep, sep="\t")
                 except Exception as e:
-                    logger.debug("Plot generation failed: %s", e)
+                    logger.warning("Data loading failed (plot may be skipped): %s", e)
         if enrich:
             entry["enrichment"] = enrich
 
@@ -4914,7 +5916,7 @@ def _load_sample_data(
                     entry["hgt"] = pd.read_csv(p, sep="\t")
                     break
                 except Exception as e:
-                    logger.debug("Plot generation failed: %s", e)
+                    logger.warning("Data loading failed (plot may be skipped): %s", e)
 
         # Phage/mobile elements
         for key in ("bio_phage_mobile_elements_path", "bio_phage_mobile_elements", "phage_mobile_elements"):
@@ -4924,7 +5926,7 @@ def _load_sample_data(
                     entry["phage_mobile"] = pd.read_csv(p, sep="\t")
                     break
                 except Exception as e:
-                    logger.debug("Plot generation failed: %s", e)
+                    logger.warning("Data loading failed (plot may be skipped): %s", e)
 
         # Strand asymmetry
         for key in ("bio_strand_asymmetry_path", "bio_strand_asymmetry", "strand_asymmetry"):
@@ -4934,7 +5936,7 @@ def _load_sample_data(
                     entry["strand_asymmetry"] = pd.read_csv(p, sep="\t")
                     break
                 except Exception as e:
-                    logger.debug("Plot generation failed: %s", e)
+                    logger.warning("Data loading failed (plot may be skipped): %s", e)
 
         # Operon coadaptation
         for key in ("bio_operon_coadaptation_path", "bio_operon_coadaptation", "operon_coadaptation"):
@@ -4944,7 +5946,7 @@ def _load_sample_data(
                     entry["operon_coadaptation"] = pd.read_csv(p, sep="\t")
                     break
                 except Exception as e:
-                    logger.debug("Plot generation failed: %s", e)
+                    logger.warning("Data loading failed (plot may be skipped): %s", e)
 
         # Growth rate
         for key in ("bio_growth_rate_prediction_path", "bio_growth_rate_prediction"):
@@ -4955,7 +5957,7 @@ def _load_sample_data(
                     entry["growth_rate"] = _json.loads(Path(p).read_text())
                     break
                 except Exception as e:
-                    logger.debug("Plot generation failed: %s", e)
+                    logger.warning("Data loading failed (plot may be skipped): %s", e)
                     # Growth rate TSV is also common
                     try:
                         _gr_df = pd.read_csv(p, sep="\t")
@@ -4963,7 +5965,7 @@ def _load_sample_data(
                             entry["growth_rate"] = _gr_df.iloc[0].to_dict()
                         break
                     except Exception as e:
-                        logger.debug("Plot generation failed: %s", e)
+                        logger.warning("Data loading failed (plot may be skipped): %s", e)
 
         # gRodon2 prediction
         for key in ("bio_grodon2_prediction_path", "bio_grodon2_prediction"):
@@ -4975,7 +5977,7 @@ def _load_sample_data(
                         entry["grodon2"] = _gd_df.iloc[0].to_dict()
                     break
                 except Exception as e:
-                    logger.debug("Plot generation failed: %s", e)
+                    logger.warning("Data loading failed (plot may be skipped): %s", e)
 
         # Translational selection - optimal codons
         for key in ("bio_trans_sel_optimal_codons_path", "bio_trans_sel_optimal_codons"):
@@ -4985,7 +5987,7 @@ def _load_sample_data(
                     entry["optimal_codons"] = pd.read_csv(p, sep="\t")
                     break
                 except Exception as e:
-                    logger.debug("Plot generation failed: %s", e)
+                    logger.warning("Data loading failed (plot may be skipped): %s", e)
 
         # Codon frequency table
         p = paths.get("codon_frequency")
@@ -4993,7 +5995,7 @@ def _load_sample_data(
             try:
                 entry["codon_frequency"] = pd.read_csv(p, sep="\t")
             except Exception as e:
-                logger.debug("Plot generation failed: %s", e)
+                logger.warning("Data loading failed (plot may be skipped): %s", e)
 
         data[sid] = entry
 
