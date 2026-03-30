@@ -417,6 +417,39 @@ def run_stability_analysis(
     results["core_ids_path"] = core_path
     results["core_gene_ids"] = core_ids
 
+    # Membership frequencies at recommended multiplier (for weighting)
+    rec_freq = membership_freq.get(recommended_mult, {})
+    results["membership_frequencies"] = rec_freq
+
+    # ── Frequency-weighted RSCU from core genes ──────────────────────
+    # Uses bootstrap membership frequency as the weight for each gene's
+    # codon counts.  Genes at frequency 0.95 contribute 0.95× their
+    # codons; genes at the core threshold boundary contribute less.
+    if ffn_path and ffn_path.exists() and core_ids:
+        try:
+            freq_weights = {
+                gid: rec_freq.get(gid, 0.0)
+                for gid in core_ids
+                if rec_freq.get(gid, 0.0) > 0
+            }
+            if freq_weights:
+                core_rscu = _compute_cluster_rscu(
+                    ffn_path, core_ids, gene_weights=freq_weights,
+                )
+                if not core_rscu.empty:
+                    results["core_rscu"] = core_rscu
+                    rscu_path = stab_dir / f"{sample_id}_core_rscu.tsv"
+                    core_rscu.to_frame("RSCU").to_csv(rscu_path, sep="\t")
+                    results["core_rscu_path"] = rscu_path
+                    logger.info(
+                        "Core RSCU computed by frequency-weighted pooling "
+                        "(%d genes, mean weight %.3f)",
+                        len(freq_weights),
+                        float(np.mean(list(freq_weights.values()))),
+                    )
+        except Exception as e:
+            logger.warning("Frequency-weighted core RSCU failed: %s", e)
+
     # ── Diagnostic plots ─────────────────────────────────────────────
     try:
         _plot_stability_metrics(metrics_df, stab_dir, sample_id)
