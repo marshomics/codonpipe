@@ -80,6 +80,7 @@ def plot_within_metric_violins(
     palette = [colors[c] for c in sorted(colors)]
     order = sorted(metrics_df[condition_col].dropna().unique())
 
+    n_plotted = 0
     for i, (col, label) in enumerate(available):
         ax = axes[i]
         data = metrics_df.dropna(subset=[col, condition_col])
@@ -102,8 +103,9 @@ def plot_within_metric_violins(
         ax.set_xlabel("")
         ax.tick_params(axis="x", rotation=45)
         ax.grid(True, alpha=0.2, axis="y")
+        n_plotted = i + 1
 
-    for j in range(i + 1, len(axes)):
+    for j in range(n_plotted, len(axes)):
         axes[j].set_visible(False)
 
     fig.suptitle("Within-Condition Metric Distributions", fontsize=13, y=1.02)
@@ -287,9 +289,13 @@ def plot_between_metric_comparison(
     colors = _condition_colors(metrics_df[condition_col].dropna().tolist())
     order = sorted(metrics_df[condition_col].dropna().unique())
 
+    n_plotted = 0
     for i, metric in enumerate(sig_metrics):
         ax = axes[i]
         data = metrics_df.dropna(subset=[metric, condition_col])
+        if data.empty:
+            ax.set_visible(False)
+            continue
         sns.boxplot(
             data=data, x=condition_col, y=metric, hue=condition_col,
             order=order, hue_order=order,
@@ -325,8 +331,9 @@ def plot_between_metric_comparison(
         ax.set_xlabel("")
         ax.tick_params(axis="x", rotation=45)
         ax.grid(True, alpha=0.2, axis="y")
+        n_plotted = i + 1
 
-    for j in range(i + 1, len(axes)):
+    for j in range(n_plotted, len(axes)):
         axes[j].set_visible(False)
 
     fig.suptitle("Between-Condition Metric Comparisons", fontsize=13, y=1.02)
@@ -2250,7 +2257,7 @@ def generate_comparative_plots(
 
     Returns dict of plot paths.
     """
-    plot_dir = output_dir / "comparative" / "plots"
+    plot_dir = output_dir / "batch_condition" / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, Path] = {}
 
