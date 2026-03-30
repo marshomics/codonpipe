@@ -204,20 +204,36 @@ def compute_enc(ffn_path: Path, min_length: int = MIN_GENE_LENGTH) -> pd.DataFra
     Uses the Wright (1990) formula.
     """
     rows = []
+    f_zero_count = 0
     for rec in SeqIO.parse(str(ffn_path), "fasta"):
         seq = str(rec.seq)
         if len(seq) < min_length:
             continue
         counts = count_codons(seq)
-        enc = _calculate_enc(counts)
+        enc, had_f_zero = _calculate_enc(counts)
+        if had_f_zero:
+            f_zero_count += 1
         gc3 = _calculate_gc3(seq)
         rows.append({"gene": rec.id, "length": len(seq), "ENC": enc, "GC3": gc3})
+
+    if f_zero_count > 0:
+        logger.warning(
+            "ENC: %d gene(s) had F_avg=0 in the 3-fold degenerate class "
+            "(low codon counts for Ile). ENC for those genes is approximate. "
+            "Consider filtering genes shorter than %d nt if this is unexpected.",
+            f_zero_count, min_length,
+        )
 
     return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["gene", "length", "ENC", "GC3"])
 
 
-def _calculate_enc(codon_counts: Counter) -> float:
-    """Calculate ENC using the Wright (1990) method."""
+def _calculate_enc(codon_counts: Counter) -> tuple[float, bool]:
+    """Calculate ENC using the Wright (1990) method.
+
+    Returns:
+        Tuple of (ENC value, had_f_zero) where *had_f_zero* is True if
+        any degeneracy class had F̄ = 0 (a low-count artefact).
+    """
     # Group by number of synonymous codons (degeneracy class)
     # k=1: Met, Trp (skip)
     # k=2: Phe, Tyr, His, Gln, Asn, Lys, Asp, Glu, Cys
@@ -247,6 +263,7 @@ def _calculate_enc(codon_counts: Counter) -> float:
     # Wright (1990): Nc = 2 + 9/F̄₂ + 1/F̄₃ + 5/F̄₄ + 3/F̄₆
     enc = 2.0  # Met + Trp always contribute 1 each
     n_families = {2: 9, 3: 1, 4: 5, 6: 3}
+    had_f_zero = False
 
     for k, f_list in f_values.items():
         if f_list:
@@ -260,11 +277,11 @@ def _calculate_enc(codon_counts: Counter) -> float:
                 # drove F̂ to 0.  This is a data edge-case (very low
                 # counts).  We fall back to assuming no bias (F = 1/k)
                 # so the contribution is n_families[k] / (1/k) = n_families[k] * k.
-                logger.warning(
-                    "ENC: F_avg=0 for %d-fold degenerate class — likely a "
-                    "low-count artefact. Falling back to no-bias assumption "
-                    "(F=1/%d). Consider filtering genes shorter than %d nt.",
-                    k, k, MIN_GENE_LENGTH,
+                had_f_zero = True
+                logger.debug(
+                    "ENC: F_avg=0 for %d-fold degenerate class — low-count "
+                    "artefact, falling back to no-bias assumption (F=1/%d)",
+                    k, k,
                 )
                 enc += n_families[k] * k
         else:
@@ -277,7 +294,7 @@ def _calculate_enc(codon_counts: Counter) -> float:
             logger.debug("ENC: no observed amino acids for %d-fold degenerate class; "
                         "assuming no bias (F=1/%d)", k, k)
 
-    return min(enc, 61.0)
+    return min(enc, 61.0), had_f_zero
 
 
 def _calculate_gc3(sequence: str) -> float:
