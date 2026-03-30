@@ -383,8 +383,8 @@ def _plot_coa_mahalanobis(
                 linestyle="--", alpha=0.7, label=f"Threshold (d={threshold:.1f})",
             )
             ax.add_patch(ellipse)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Could not draw threshold ellipse: %s", e)
 
     # RP centroid
     ax.scatter(
