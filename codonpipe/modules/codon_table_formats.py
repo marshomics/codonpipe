@@ -554,18 +554,18 @@ def generate_all_codon_tables(
             logger.info("Saved adaptation weights to %s", weights_path)
 
             # Extract optimal codons (weight > 0)
-            # Sort by weight descending to deterministically select the most-preferred codon
+            # Sort by weight descending, then by codon alphabetically for deterministic tiebreaker
             optimal_sorted = (
                 weights_df[weights_df["is_optimal"]]
-                .sort_values("weight", ascending=False)
+                .sort_values(["weight", "codon"], ascending=[False, True])
             )
             # Check for ties: same amino acid with identical top weight
             for aa_name in optimal_sorted["amino_acid"].unique():
                 aa_rows = optimal_sorted[optimal_sorted["amino_acid"] == aa_name]
                 if len(aa_rows) > 1 and aa_rows.iloc[0]["weight"] == aa_rows.iloc[1]["weight"]:
-                    logger.warning(
+                    logger.debug(
                         "Tied optimal codon weights for %s (weight=%.4f); "
-                        "selecting %s arbitrarily",
+                        "selecting %s (alphabetically first among ties)",
                         aa_name, aa_rows.iloc[0]["weight"], aa_rows.iloc[0]["codon"],
                     )
             optimal_codons = dict(
@@ -598,10 +598,20 @@ def generate_all_codon_tables(
             logger.info("Saved Mahalanobis-cluster adaptation weights to %s", mahal_w_path)
 
             # Extract Mahalanobis-derived optimal codons and compute CBI
+            # Sort by weight descending, then by codon alphabetically for deterministic tiebreaker
             mahal_opt_sorted = (
                 mahal_weights_df[mahal_weights_df["is_optimal"]]
-                .sort_values("weight", ascending=False)
+                .sort_values(["weight", "codon"], ascending=[False, True])
             )
+            # Check for ties: same amino acid with identical top weight
+            for aa_name in mahal_opt_sorted["amino_acid"].unique():
+                aa_rows = mahal_opt_sorted[mahal_opt_sorted["amino_acid"] == aa_name]
+                if len(aa_rows) > 1 and aa_rows.iloc[0]["weight"] == aa_rows.iloc[1]["weight"]:
+                    logger.debug(
+                        "Tied Mahal optimal codon weights for %s (weight=%.4f); "
+                        "selecting %s (alphabetically first among ties)",
+                        aa_name, aa_rows.iloc[0]["weight"], aa_rows.iloc[0]["codon"],
+                    )
             mahal_optimal_codons = dict(
                 mahal_opt_sorted
                 .drop_duplicates(subset=["amino_acid"])
