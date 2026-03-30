@@ -545,6 +545,52 @@ def run_single_genome(
         except Exception as e:
             logger.warning("Stability analysis failed: %s. Continuing.", e, exc_info=True)
 
+    # ── Promote stability core set when available ────────────────────────────
+    # When bootstrap stability analysis has been run, the core gene set
+    # (genes above core_threshold membership frequency) replaces the
+    # Mahalanobis cluster for MELP scoring, gRodon2, and enrichment.
+    # The frequency-weighted RSCU replaces the distance-weighted RSCU.
+    # Safeguard: only apply if core set has >= _MIN_CORE_FOR_OVERRIDE genes.
+    _MIN_CORE_FOR_OVERRIDE = 30
+    stability_core_ids = stability_results.get("core_gene_ids")
+    stability_core_rscu = stability_results.get("core_rscu")
+    stability_core_ids_path = stability_results.get("core_ids_path")
+
+    if (
+        stability_core_ids
+        and len(stability_core_ids) >= _MIN_CORE_FOR_OVERRIDE
+    ):
+        logger.info(
+            "Stability core set (%d genes, threshold=%.2f) replaces "
+            "Mahalanobis cluster (%s genes) for MELP/gRodon2/enrichment",
+            len(stability_core_ids),
+            stability_core_threshold,
+            len(mahal_cluster_gene_ids) if mahal_cluster_gene_ids else 0,
+        )
+        mahal_cluster_gene_ids = stability_core_ids
+        if stability_core_ids_path:
+            mahal_results["mahal_cluster_ids_path"] = stability_core_ids_path
+        if stability_core_rscu is not None and not stability_core_rscu.empty:
+            mahal_cluster_rscu = stability_core_rscu
+
+        # Re-annotate expression table with updated cluster membership
+        if expr_df is not None and not expr_df.empty:
+            try:
+                expr_df[COL_IN_MAHAL_CLUSTER] = expr_df[COL_GENE].isin(stability_core_ids)
+            except Exception:
+                pass
+    elif stability_core_ids is not None and len(stability_core_ids) < _MIN_CORE_FOR_OVERRIDE:
+        logger.warning(
+            "Stability core set too small (%d < %d genes); keeping "
+            "Mahalanobis cluster for MELP/gRodon2. Consider lowering "
+            "--stability-core-threshold (currently %.2f).",
+            len(stability_core_ids), _MIN_CORE_FOR_OVERRIDE,
+            stability_core_threshold,
+        )
+
+    # Refresh the cluster IDs path reference for Step 9b
+    mahal_cluster_ids_path = mahal_results.get("mahal_cluster_ids_path")
+
     # Save Mahalanobis cluster RSCU to rscu/ directory alongside genome and RP RSCU
     if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty:
         try:
