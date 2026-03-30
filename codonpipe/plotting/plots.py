@@ -27,9 +27,27 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
 from codonpipe.plotting.utils import DPI, FORMATS, apply_style as _apply_style, save_fig as _save_fig
-from codonpipe.utils.codon_tables import AMINO_ACID_FAMILIES, RSCU_COLUMN_NAMES
+from codonpipe.utils.codon_tables import AMINO_ACID_FAMILIES, RSCU_COLUMN_NAMES, RSCU_COL_TO_CODON
 
 logger = logging.getLogger("codonpipe")
+
+
+def _mahal_rscu_to_freq_df(mahal_rscu: "pd.Series") -> pd.DataFrame:
+    """Convert a Mahalanobis cluster RSCU Series to the freq_df format expected by heatmap plots.
+
+    The input Series is indexed by RSCU column names (e.g. 'Phe-UUU') with
+    RSCU values.  Returns a DataFrame with columns ``codon``, ``amino_acid``,
+    ``rscu`` matching the schema produced by ``compute_codon_frequency_table``.
+    """
+    rows = []
+    for col_name, rscu_val in mahal_rscu.items():
+        codon = RSCU_COL_TO_CODON.get(col_name)
+        if codon is None:
+            continue
+        # amino_acid is the family prefix before the hyphen (e.g. 'Phe', 'Ser4')
+        aa = col_name.split("-")[0]
+        rows.append({"codon": codon, "amino_acid": aa, "rscu": rscu_val})
+    return pd.DataFrame(rows)
 
 
 def _safe_label(value, fallback: str = "", maxlen: int = 50) -> str:
@@ -216,6 +234,223 @@ def plot_rscu_heatmap_rounded(
     if sample_id:
         title += f"\n{sample_id}"
     ax.set_title(title, fontsize=12, fontweight="bold", pad=15)
+
+    # Colorbar
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cb = fig.colorbar(sm, cax=cax, orientation="vertical")
+    cb.set_label("RSCU", fontsize=9)
+    cb.ax.tick_params(labelsize=8)
+    cb.ax.axhline(y=1.0, color="black", linewidth=0.8, linestyle="-")
+    cb.ax.text(
+        1.6, 1.0, "= 1.0\n(no bias)", transform=cb.ax.get_yaxis_transform(),
+        fontsize=7, va="center", ha="left", color="#555555",
+    )
+
+    _save_fig(fig, output_path)
+
+
+def plot_rscu_heatmap_rounded_comparison(
+    freq_dfs: dict[str, pd.DataFrame],
+    output_path: Path,
+):
+    """Stacked rounded-cell RSCU heatmap comparing exactly two genomes.
+
+    Same width as the single-genome heatmap: codons occupy the same columns.
+    For each amino acid, two sub-rows are drawn (one per genome) so RSCU
+    values can be compared codon-by-codon.  Codon labels appear on the top
+    sub-row only; RSCU values are printed in both.
+
+    Args:
+        freq_dfs: Dict mapping sample_id → DataFrame with columns
+            ``codon``, ``amino_acid``, ``rscu`` (same schema as
+            ``compute_codon_frequency_table`` or ``_mahal_rscu_to_freq_df``).
+        output_path: Base path for saving (extensions appended).
+    """
+    if len(freq_dfs) != 2:
+        return
+
+    _apply_style()
+
+    sample_ids = list(freq_dfs.keys())
+    dfs = {}
+    for sid, raw in freq_dfs.items():
+        if raw is None or raw.empty or "rscu" not in raw.columns:
+            return
+        d = raw.dropna(subset=["rscu"]).copy()
+        d = d[~d["amino_acid"].isin(("*", "Met", "Trp"))]
+        d["AA"] = d["amino_acid"].map(_THREE_TO_ONE)
+        d = d.dropna(subset=["AA"])
+        if d.empty:
+            return
+        dfs[sid] = d
+
+    # Union of amino acids present in either genome
+    all_aas = set()
+    for d in dfs.values():
+        all_aas |= set(d["AA"].unique())
+
+    group_order = ["Nonpolar", "Polar", "Positive", "Negative"]
+    aa_ordered = []
+    for grp in group_order:
+        aa_ordered.extend(
+            aa for aa in _AA_ORDER if _AA_TO_GROUP.get(aa) == grp and aa in all_aas
+        )
+    if not aa_ordered:
+        return
+
+    # Shared colormap
+    global_max = max(d["rscu"].max() for d in dfs.values())
+    vmax = min(max(global_max * 1.05, 3.0), 5.0)
+    colors_below = plt.cm.Blues_r(np.linspace(0.0, 0.7, 128))
+    colors_above = plt.cm.Reds(np.linspace(0.0, 0.75, 128))
+    cmap = mcolors.LinearSegmentedColormap.from_list(
+        "rscu_diverging", np.vstack([colors_below, colors_above]),
+    )
+    norm = mcolors.TwoSlopeNorm(vmin=0, vcenter=1.0, vmax=vmax)
+
+    # Layout: two sub-rows per amino acid, stacked vertically.
+    cell_h, cell_w = 0.85, 0.85
+    sub_row_step = cell_h + 0.10  # vertical step between the two sub-rows
+    aa_block_height = 2 * cell_h + 0.10  # total height of one amino acid pair
+    group_gap = 0.4  # extra space between biochemical groups
+
+    # Compute y positions — each aa maps to the top of its block
+    y_pos = 0.0
+    y_positions: dict[str, float] = {}
+    group_boundaries: list[float] = []
+    current_group = None
+    for aa in aa_ordered:
+        grp = _AA_TO_GROUP.get(aa, "")
+        if grp != current_group:
+            if current_group is not None:
+                group_boundaries.append(y_pos - group_gap * 0.4)
+                y_pos += group_gap
+            current_group = grp
+        y_positions[aa] = y_pos
+        y_pos += aa_block_height + 0.25  # 0.25 spacing between amino acids
+
+    fig_height = max(12, y_pos * 0.55 + 2)
+    fig = plt.figure(figsize=(10, fig_height))
+    gs = gridspec.GridSpec(1, 2, width_ratios=[30, 1], wspace=0.03)
+    ax = fig.add_subplot(gs[0])
+    cax = fig.add_subplot(gs[1])
+
+    # Build a consistent codon order per amino acid from the union of both genomes
+    aa_codon_order: dict[str, list[str]] = {}
+    for aa in aa_ordered:
+        codons = set()
+        for d in dfs.values():
+            codons |= set(d.loc[d["AA"] == aa, "codon"])
+        aa_codon_order[aa] = sorted(codons)
+
+    # Draw cells
+    for genome_idx, sid in enumerate(sample_ids):
+        df = dfs[sid]
+        rscu_col = "RSCU" if "RSCU" in df.columns else "rscu"
+        for aa in aa_ordered:
+            sub = df[df["AA"] == aa].set_index("codon")
+            y_base = y_positions[aa] + genome_idx * sub_row_step
+            for j, codon in enumerate(aa_codon_order[aa]):
+                if codon not in sub.index:
+                    continue
+                rscu = sub.loc[codon, rscu_col]
+                if isinstance(rscu, pd.Series):
+                    rscu = rscu.iloc[0]
+                color = cmap(norm(rscu))
+                rect = FancyBboxPatch(
+                    (j * 1.0 + 0.075, y_base + 0.075), cell_w, cell_h,
+                    boxstyle="round,pad=0.02",
+                    facecolor=color, edgecolor="white", linewidth=1.2,
+                )
+                ax.add_patch(rect)
+
+                text_color = "white" if (rscu > 2.5 or rscu < 0.2) else "#333333"
+                pfx = [pe.withStroke(linewidth=0.3, foreground="white")] if rscu > 2.5 else []
+
+                # Codon label only on the top sub-row (genome_idx == 0)
+                if genome_idx == 0:
+                    ax.text(
+                        j * 1.0 + 0.075 + cell_w / 2,
+                        y_base + 0.075 + cell_h * 0.62,
+                        codon, ha="center", va="center",
+                        fontsize=8, fontweight="bold", fontfamily="monospace",
+                        color=text_color, path_effects=pfx,
+                    )
+                    ax.text(
+                        j * 1.0 + 0.075 + cell_w / 2,
+                        y_base + 0.075 + cell_h * 0.28,
+                        f"{rscu:.2f}", ha="center", va="center",
+                        fontsize=6.5, color=text_color, alpha=0.85,
+                    )
+                else:
+                    # Bottom sub-row: RSCU value centred vertically
+                    ax.text(
+                        j * 1.0 + 0.075 + cell_w / 2,
+                        y_base + 0.075 + cell_h * 0.5,
+                        f"{rscu:.2f}", ha="center", va="center",
+                        fontsize=6.5, color=text_color, alpha=0.85,
+                    )
+
+    # Y-axis labels (amino acid names, centred on the pair of sub-rows)
+    for aa in aa_ordered:
+        y_top = y_positions[aa]
+        y_mid = y_top + aa_block_height / 2
+        grp = _AA_TO_GROUP.get(aa, "")
+        name = _AA_NAMES.get(aa, aa)
+        ax.text(
+            -0.3, y_mid, f"{name} ({aa})",
+            ha="right", va="center", fontsize=8.5, fontweight="bold",
+            color=_GROUP_COLORS.get(grp, "#333333"),
+        )
+
+    # Group labels on far left
+    for grp in group_order:
+        aas_in_grp = [aa for aa in aa_ordered if _AA_TO_GROUP.get(aa) == grp]
+        if aas_in_grp:
+            y_start = y_positions[aas_in_grp[0]]
+            y_end = y_positions[aas_in_grp[-1]] + aa_block_height
+            y_mid = (y_start + y_end) / 2
+            ax.text(
+                -2.8, y_mid, grp, ha="center", va="center", fontsize=9,
+                fontweight="bold", color=_GROUP_COLORS[grp], rotation=90,
+            )
+            ax.plot(
+                [-2.2, -2.2], [y_start + 0.1, y_end - 0.1],
+                color=_GROUP_COLORS[grp], linewidth=1.5, alpha=0.6, clip_on=False,
+            )
+
+    for yb in group_boundaries:
+        ax.axhline(y=yb, color="#cccccc", linewidth=0.5, linestyle="-", alpha=0.5)
+
+    # Legend identifying the two sub-rows
+    _sample_colors = ["#2b6cb0", "#c05621"]
+    legend_handles = []
+    for idx, sid in enumerate(sample_ids):
+        patch = FancyBboxPatch(
+            (0, 0), 1, 1, boxstyle="round,pad=0.02",
+            facecolor=_sample_colors[idx], edgecolor="none", alpha=0.7,
+        )
+        legend_handles.append(plt.Line2D(
+            [0], [0], marker="s", color="w",
+            markerfacecolor=_sample_colors[idx], markersize=8,
+            label=f"{'Top' if idx == 0 else 'Bottom'}: {sid}",
+        ))
+    ax.legend(
+        handles=legend_handles, loc="upper right", fontsize=8,
+        framealpha=0.8, edgecolor="#cccccc",
+    )
+
+    ax.set_xlim(-3.2, 6 * 1.0 + 0.2)
+    ax.set_ylim(-0.5, y_pos + 0.3)
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    ax.set_title(
+        "RSCU Comparison (Mahalanobis cluster)",
+        fontsize=12, fontweight="bold", pad=15,
+    )
 
     # Colorbar
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
@@ -3129,7 +3364,6 @@ def generate_single_genome_plots(
     bio_ecology_results: dict[str, pd.DataFrame | dict] | None = None,
     gff_path: Path | None = None,
     mahal_cluster_rscu: "pd.Series | None" = None,
-    mahal_rp_cluster: int | None = None,
     mahal_cluster_size: int | None = None,
 ) -> dict[str, Path]:
     """Generate all single-genome plots.
@@ -3153,15 +3387,26 @@ def generate_single_genome_plots(
     else:
         logger.info("SKIPPED: codon frequency bar plot (no frequency data)")
 
-    if freq_df is not None and not freq_df.empty:
+    # Prefer Mahalanobis-cluster RSCU for the rounded heatmap; fall back to
+    # genome-wide frequency data when clustering was skipped or failed.
+    _heatmap_df = None
+    _heatmap_label = sample_id
+    if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty:
+        _heatmap_df = _mahal_rscu_to_freq_df(mahal_cluster_rscu)
+        _n = mahal_cluster_size if mahal_cluster_size else "?"
+        _heatmap_label = f"{sample_id} (Mahalanobis cluster, n={_n})"
+    elif freq_df is not None and not freq_df.empty:
+        _heatmap_df = freq_df
+
+    if _heatmap_df is not None and not _heatmap_df.empty:
         try:
             p = plot_dir / f"{sample_id}_rscu_heatmap_rounded"
-            plot_rscu_heatmap_rounded(freq_df, p, sample_id)
+            plot_rscu_heatmap_rounded(_heatmap_df, p, _heatmap_label)
             outputs["rscu_heatmap_rounded"] = p.with_suffix(".png")
         except Exception as e:
             logger.warning("Rounded RSCU heatmap failed: %s", e)
     else:
-        logger.info("SKIPPED: rounded RSCU heatmap (no frequency data)")
+        logger.info("SKIPPED: rounded RSCU heatmap (no RSCU data)")
 
     if rscu_all is not None:
         try:
@@ -3193,23 +3438,6 @@ def generate_single_genome_plots(
     else:
         logger.info("SKIPPED: RSCU heatmap (no per-gene RSCU data)")
 
-    # Mahalanobis cluster RSCU rounded heatmap — shows the translationally optimised
-    # cluster's pooled codon usage, placed alongside the genome-wide heatmaps
-    # for direct visual comparison.
-    if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty:
-        try:
-            from codonpipe.modules.mahal_clustering import _plot_mahal_cluster_rscu_heatmap
-            p = plot_dir / f"{sample_id}_mahal_cluster_rscu_heatmap"
-            _plot_mahal_cluster_rscu_heatmap(
-                mahal_cluster_rscu, p, sample_id,
-                cluster_label=mahal_rp_cluster if mahal_rp_cluster is not None else 0,
-                n_genes=mahal_cluster_size if mahal_cluster_size is not None else 0,
-            )
-            outputs["mahal_cluster_rscu_heatmap"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Mahalanobis cluster RSCU heatmap failed: %s", e)
-    else:
-        logger.info("SKIPPED: Mahalanobis cluster RSCU heatmap (no Mahalanobis cluster data)")
 
     if enc_df is not None and not enc_df.empty:
         try:
