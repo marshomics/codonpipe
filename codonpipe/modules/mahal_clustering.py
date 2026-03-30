@@ -828,6 +828,7 @@ def run_mahal_clustering(
     coa_with_assignments = coa_with_assignments.merge(assign_merge, on="gene", how="left")
     results["mahal_coa_coords"] = coa_with_assignments
     results["mahal_coa_inertia"] = coa_inertia
+    results["mahal_gene_distances"] = pd.Series(distances, index=gene_ids, name="mahalanobis_distance")
 
     # ── Step 10: Diagnostic plots ─────────────────────────────────────
     try:
