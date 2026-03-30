@@ -1284,13 +1284,10 @@ def run_bio_ecology_analyses(
         # already-optimised Mahalanobis cluster, the HE-vs-background
         # contrast shrinks dramatically and the model underestimates
         # growth rate (e.g. predicting ~15 h for E. coli instead of <1 h).
-        bg_ids_path = None
-
         grodon_result = run_grodon(
             ffn_path, output_dir, sample_id,
             rp_ids_file=rp_ids_file,
             he_ids_file=he_ids_path,
-            background_ids_file=bg_ids_path,
         )
 
         # Clean up temp HE IDs file
