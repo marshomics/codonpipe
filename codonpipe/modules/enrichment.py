@@ -235,9 +235,11 @@ def hypergeometric_enrichment(
         return pd.DataFrame()
 
     rows = []
+    filtered_count = 0
     for pw in pathways_to_test:
         n = len(bg_pathway_kos[pw])  # pathway size in background
         if n < 3:
+            filtered_count += 1
             continue  # Skip pathways with fewer than 3 genes to avoid spurious enrichment
         k = len(test_pathway_kos[pw])  # hits in test set
 
@@ -247,6 +249,8 @@ def hypergeometric_enrichment(
 
         expected = (n / M) * N if M > 0 else 0
         fold = k / expected if expected > 0 else np.inf
+        # Cap fold enrichment to avoid inf values
+        fold = min(fold, 100.0)
 
         pw_name = (pathway_names or {}).get(pw, "")
         rows.append({
@@ -260,6 +264,12 @@ def hypergeometric_enrichment(
             "p_value": pval,
             "test_kos_in_pathway": ",".join(sorted(test_pathway_kos[pw])),
         })
+
+    if filtered_count > 0:
+        logger.debug(
+            "Filtered %d pathways with fewer than 3 genes during enrichment analysis",
+            filtered_count,
+        )
 
     result = pd.DataFrame(rows).sort_values("p_value").reset_index(drop=True)
 
