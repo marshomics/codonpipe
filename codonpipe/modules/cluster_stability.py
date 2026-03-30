@@ -22,19 +22,14 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cosine as cosine_dist
-from scipy.stats import chi2
-
-from Bio import SeqIO
 
 from codonpipe.modules.advanced_analyses import compute_coa_on_rscu
 from codonpipe.modules.mahal_clustering import (
     _compute_mahalanobis_distances,
-    _distance_to_membership,
     _fit_robust_rp_reference,
     _select_n_axes,
     _compute_cluster_rscu,
@@ -44,9 +39,8 @@ from codonpipe.modules.mahal_clustering import (
     _RP_OUTLIER_ALPHA,
     _MIN_RP_FOR_ROBUST,
 )
-from codonpipe.modules.rscu import compute_rscu_from_counts, count_codons
-from codonpipe.plotting.utils import DPI, FORMATS, STYLE_PARAMS, save_fig
-from codonpipe.utils.codon_tables import MIN_GENE_LENGTH, RSCU_COLUMN_NAMES
+from codonpipe.plotting.utils import DPI, FORMATS, STYLE_PARAMS
+from codonpipe.utils.codon_tables import RSCU_COLUMN_NAMES
 
 logger = logging.getLogger("codonpipe")
 
@@ -69,49 +63,23 @@ _W_SIZE_PENALTY = 0.15  # penalise very small or very large clusters
 # Core bootstrap engine
 # ---------------------------------------------------------------------------
 
-def _bootstrap_coa_mahal(
+def _prepare_coa_space(
     rscu_gene_df: pd.DataFrame,
     rp_gene_ids: set[str],
-    multiplier: float,
     expr_df: pd.DataFrame | None = None,
-    seed: int = 0,
-) -> tuple[set[str], np.ndarray, float]:
-    """Run one bootstrap replicate: resample genes, COA, Mahalanobis threshold.
-
-    Resamples genes (rows) with replacement, keeping the same gene IDs so
-    that RP anchoring is preserved.  Duplicate rows get unique suffixes to
-    avoid pandas index collisions, but the RP lookup uses the original ID.
+) -> tuple[np.ndarray, list[str], np.ndarray, int] | None:
+    """Run COA once and extract gene coordinates and RP indices.
 
     Returns:
-        cluster_ids: set of *original* gene IDs in the optimized set
-        distances: Mahalanobis distances for the original (non-duplicated) genes
-        threshold: the Mahalanobis threshold used
+        X: (n_genes, n_axes) COA coordinates for all valid genes.
+        gene_ids: list of gene IDs matching rows of X.
+        rp_indices: integer indices into X for RP genes.
+        n_axes: number of COA axes retained.
+    Returns None if COA fails or there are too few genes/axes.
     """
-    rng = np.random.RandomState(seed)
-
-    n = len(rscu_gene_df)
-    idx = rng.choice(n, size=n, replace=True)
-
-    boot_df = rscu_gene_df.iloc[idx].copy()
-    # Keep original gene IDs for RP matching
-    original_genes = boot_df["gene"].values.copy()
-    # Deduplicate index for COA
-    boot_df = boot_df.reset_index(drop=True)
-    boot_df["gene"] = [f"{g}__boot{i}" for i, g in enumerate(original_genes)]
-
-    # Map RP IDs into bootstrap namespace
-    boot_rp_ids = set()
-    boot_to_orig = {}
-    for i, og in enumerate(original_genes):
-        bid = f"{og}__boot{i}"
-        boot_to_orig[bid] = og
-        if og in rp_gene_ids:
-            boot_rp_ids.add(bid)
-
-    # COA
-    coa_results = compute_coa_on_rscu(boot_df, expr_df=None)
+    coa_results = compute_coa_on_rscu(rscu_gene_df, expr_df=expr_df)
     if not coa_results or "coa_coords" not in coa_results:
-        return set(), np.array([]), 0.0
+        return None
 
     coa_coords = coa_results["coa_coords"]
     coa_inertia = coa_results.get("coa_inertia", pd.DataFrame())
@@ -120,20 +88,46 @@ def _bootstrap_coa_mahal(
     axis_cols = [f"Axis{i+1}" for i in range(n_axes) if f"Axis{i+1}" in coa_coords.columns]
     n_axes = len(axis_cols)
     if n_axes < _MIN_COA_AXES:
-        return set(), np.array([]), 0.0
+        return None
 
     gene_ids = coa_coords["gene"].astype(str).tolist()
     X = coa_coords[axis_cols].values
     valid_mask = ~np.isnan(X).any(axis=1)
+    if valid_mask.sum() < _MIN_GENES_FOR_CLUSTERING:
+        return None
     X = X[valid_mask]
     gene_ids = [g for g, v in zip(gene_ids, valid_mask) if v]
 
-    # RP indices in bootstrap space
-    rp_indices = np.array([i for i, g in enumerate(gene_ids) if g in boot_rp_ids])
+    rp_indices = np.array([i for i, g in enumerate(gene_ids) if g in rp_gene_ids])
     if len(rp_indices) < 3:
-        return set(), np.array([]), 0.0
+        return None
 
-    X_rp = X[rp_indices]
+    return X, gene_ids, rp_indices, n_axes
+
+
+def _bootstrap_rp_reference(
+    X: np.ndarray,
+    gene_ids: list[str],
+    rp_indices: np.ndarray,
+    n_axes: int,
+    multiplier: float,
+    seed: int = 0,
+) -> set[str]:
+    """One bootstrap replicate: resample RP genes, refit reference, reclassify.
+
+    The COA coordinates (X) are fixed.  Only the RP anchor is perturbed by
+    resampling RP indices with replacement, which tests sensitivity to the
+    choice and weighting of ribosomal proteins in the reference set.
+
+    Returns:
+        Set of gene IDs classified as optimized under this replicate.
+    """
+    rng = np.random.RandomState(seed)
+
+    n_rp = len(rp_indices)
+    boot_rp_idx = rng.choice(rp_indices, size=n_rp, replace=True)
+    X_rp = X[boot_rp_idx]
+
     centroid, cov, cov_inv, rp_outlier_mask = _fit_robust_rp_reference(
         X_rp, n_axes,
         alpha=_RP_OUTLIER_ALPHA,
@@ -141,7 +135,7 @@ def _bootstrap_coa_mahal(
     )
 
     distances = _compute_mahalanobis_distances(X, centroid, cov_inv)
-    rp_dists = distances[rp_indices]
+    rp_dists = distances[boot_rp_idx]
     rp_dists_clean = rp_dists[~rp_outlier_mask]
     if len(rp_dists_clean) == 0:
         rp_dists_clean = rp_dists
@@ -150,14 +144,7 @@ def _bootstrap_coa_mahal(
     threshold = multiplier * median_rp_dist
 
     opt_mask = distances <= threshold
-    # Map back to original gene IDs
-    cluster_ids = set()
-    for gid, inside in zip(gene_ids, opt_mask):
-        if inside:
-            orig = boot_to_orig.get(gid, gid)
-            cluster_ids.add(orig)
-
-    return cluster_ids, distances, threshold
+    return {gid for gid, inside in zip(gene_ids, opt_mask) if inside}
 
 
 def _jaccard(a: set, b: set) -> float:
@@ -249,22 +236,36 @@ def run_stability_analysis(
 
     all_gene_ids = rscu_gene_df["gene"].astype(str).tolist()
 
-    # ── Run the reference (non-bootstrap) clustering at each multiplier ──
-    # This gives us the "point estimate" cluster for Jaccard comparison.
+    # ── Run COA once on the full gene set ────────────────────────────
     logger.info(
-        "Stability analysis for %s: %d bootstraps x %d multipliers",
-        sample_id, n_bootstraps, len(multiplier_grid),
+        "Stability analysis for %s: computing COA once, then %d RP-bootstrap "
+        "replicates x %d multipliers (core threshold=%.2f)",
+        sample_id, n_bootstraps, len(multiplier_grid), core_threshold,
     )
 
-    # Storage: multiplier → list of cluster_id sets (one per bootstrap)
+    coa_prep = _prepare_coa_space(rscu_gene_df, rp_gene_ids, expr_df=expr_df)
+    if coa_prep is None:
+        logger.warning(
+            "COA failed or too few genes/RPs for stability analysis of %s",
+            sample_id,
+        )
+        return results
+
+    X, coa_gene_ids, rp_indices, n_axes = coa_prep
+    logger.info(
+        "COA: %d genes, %d axes, %d RP genes in COA space",
+        len(coa_gene_ids), n_axes, len(rp_indices),
+    )
+
+    # ── Bootstrap RP reference at each multiplier ────────────────────
     boot_clusters: dict[float, list[set[str]]] = {m: [] for m in multiplier_grid}
 
     for mult in multiplier_grid:
-        logger.info("  Multiplier %.2f: running %d bootstraps...", mult, n_bootstraps)
+        logger.info("  Multiplier %.2f: running %d RP-bootstrap replicates...", mult, n_bootstraps)
         for b in range(n_bootstraps):
-            cluster_ids, _, _ = _bootstrap_coa_mahal(
-                rscu_gene_df, rp_gene_ids, mult,
-                expr_df=expr_df, seed=b * 1000 + int(mult * 100),
+            cluster_ids = _bootstrap_rp_reference(
+                X, coa_gene_ids, rp_indices, n_axes, mult,
+                seed=b * 1000 + int(mult * 100),
             )
             boot_clusters[mult].append(cluster_ids)
 
