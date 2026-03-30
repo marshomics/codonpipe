@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 from Bio import SeqIO
 
-from codonpipe.utils.io import check_tool, run_cmd
+from codonpipe.utils.io import check_tool, find_gene_id_column, run_cmd
 
 logger = logging.getLogger("codonpipe")
 
@@ -139,18 +139,7 @@ def extract_ribosomal_proteins(
         )
 
     # Find query/protein ID column
-    query_col = None
-    for candidate in ["QUERY_ID", "query_id", "Query", "query", "gene_id", "protein_id"]:
-        if candidate in cog_df.columns:
-            query_col = candidate
-            break
-    if query_col is None:
-        query_col = cog_df.columns[0]
-        logger.warning(
-            "Could not identify gene ID column in %s by name; falling back to "
-            "first column '%s'. If results look wrong, check COGclassifier output format.",
-            cog_result_tsv, query_col,
-        )
+    query_col = find_gene_id_column(cog_df, fallback_to_first=True)
 
     # Filter for ribosomal proteins
     rp_mask = cog_df[cog_col].isin(ribosomal_cogs)
