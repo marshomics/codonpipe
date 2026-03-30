@@ -6,7 +6,7 @@ Modules in this package follow a two-tier error model:
 
 * **Return empty / None** for "nothing to do" conditions that the pipeline
   can gracefully skip.  Examples: no ribosomal proteins found, no KO hits,
-  too few genes for GMM clustering.
+  too few genes for Mahalanobis clustering.
 
 * **Raise an exception** (``RuntimeError``, ``FileNotFoundError``,
   ``ValueError``) for genuine failures that indicate a broken dependency,
