@@ -11,6 +11,7 @@ import pandas as pd
 from scipy import stats as sp_stats
 
 from codonpipe.utils.codon_tables import AMINO_ACID_FAMILIES, RSCU_COLUMN_NAMES
+from codonpipe.utils.statistics import benjamini_hochberg
 
 logger = logging.getLogger("codonpipe")
 
@@ -82,18 +83,7 @@ def pairwise_wilcoxon(
     if correction == "bonferroni":
         result_df["corrected_p_value"] = np.minimum(result_df["p_value"] * n_tests, 1.0)
     elif correction == "fdr_bh":
-        # Benjamini-Hochberg FDR
-        pvals = result_df["p_value"].values
-        sorted_idx = np.argsort(pvals)
-        ranks = np.empty_like(sorted_idx)
-        ranks[sorted_idx] = np.arange(1, n_tests + 1)
-        corrected = np.minimum(pvals * n_tests / ranks, 1.0)
-        # Enforce monotonicity
-        corrected_sorted = corrected[sorted_idx]
-        for i in range(n_tests - 2, -1, -1):
-            corrected_sorted[i] = min(corrected_sorted[i], corrected_sorted[i + 1])
-        corrected[sorted_idx] = corrected_sorted
-        result_df["corrected_p_value"] = corrected
+        result_df["corrected_p_value"] = benjamini_hochberg(result_df["p_value"].values)
     else:
         raise ValueError(f"Unknown correction method: {correction!r}. Use 'fdr_bh' or 'bonferroni'.")
     result_df["significant"] = result_df["corrected_p_value"] < alpha
@@ -195,7 +185,7 @@ def run_batch_statistics(
     Returns:
         Dict of output file paths.
     """
-    stats_dir = output_dir / "statistics"
+    stats_dir = output_dir / "batch_rscu_tests"
     stats_dir.mkdir(parents=True, exist_ok=True)
     outputs = {}
 
