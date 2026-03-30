@@ -13,7 +13,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from codonpipe.utils.codon_tables import MIN_GENE_LENGTH
+from codonpipe.utils.codon_tables import (
+    MIN_GENE_LENGTH,
+    COL_GENE, COL_WIDTH, COL_SAMPLE_ID,
+    COL_MELP, COL_CAI, COL_FOP, EXPRESSION_METRICS,
+    COL_MELP_CLASS, COL_CAI_CLASS, COL_FOP_CLASS, COL_EXPRESSION_CLASS,
+)
 from codonpipe.utils.io import check_tool, run_cmd
 
 logger = logging.getLogger("codonpipe")
@@ -209,7 +214,7 @@ def _rename_score_column(df: pd.DataFrame, target_name: str) -> pd.DataFrame:
     and renames it to *target_name*.  If no suitable column is found, the
     DataFrame is returned unchanged and a warning is logged.
     """
-    meta_cols = {"gene", "width"}
+    meta_cols = {COL_GENE, COL_WIDTH, COL_SAMPLE_ID, "KO"}
     for col in df.columns:
         if col in meta_cols:
             continue
@@ -242,36 +247,45 @@ def _combine_expression(
 
     # Rename the score column.  coRdon outputs a single numeric column
     # alongside 'gene' and 'width'; identify it by excluding those two.
-    melp_df = _rename_score_column(melp_df, "MELP")
-    cai_df = _rename_score_column(cai_df, "CAI")
+    melp_df = _rename_score_column(melp_df, COL_MELP)
+    cai_df = _rename_score_column(cai_df, COL_CAI)
 
     # Merge MELP and CAI on gene
-    combined = melp_df[["gene", "width", "MELP"]].merge(
-        cai_df[["gene", "CAI"]], on="gene", how="outer"
+    combined = melp_df[[COL_GENE, COL_WIDTH, COL_MELP]].merge(
+        cai_df[[COL_GENE, COL_CAI]], on=COL_GENE, how="outer"
     )
 
     # Merge Fop if available
     if fop_path.exists():
         fop_df = pd.read_csv(fop_path, sep="\t")
-        fop_df = _rename_score_column(fop_df, "Fop")
-        if "Fop" in fop_df.columns:
-            combined = combined.merge(fop_df[["gene", "Fop"]], on="gene", how="outer")
+        fop_df = _rename_score_column(fop_df, COL_FOP)
+        if COL_FOP in fop_df.columns:
+            combined = combined.merge(fop_df[[COL_GENE, COL_FOP]], on=COL_GENE, how="outer")
         else:
             logger.warning("Fop output has no usable score column; skipping Fop merge")
 
+    # Fill width from whichever metric provided it (outer merge can leave NaN)
+    if COL_WIDTH in combined.columns:
+        combined[COL_WIDTH] = combined[COL_WIDTH].fillna(0).astype(int)
+
     # Per-metric classification
-    for metric in ["MELP", "CAI", "Fop"]:
+    for metric in EXPRESSION_METRICS:
         if metric in combined.columns:
             combined[f"{metric}_class"] = _classify_by_percentile(combined[metric])
 
     # Primary expression class: prefer MELP (more robust in high-GC organisms),
     # fall back to CAI if MELP unavailable
-    if "MELP_class" in combined.columns:
-        combined["expression_class"] = combined["MELP_class"]
-    elif "CAI_class" in combined.columns:
-        combined["expression_class"] = combined["CAI_class"]
+    if COL_MELP_CLASS in combined.columns:
+        combined[COL_EXPRESSION_CLASS] = combined[COL_MELP_CLASS]
+    elif COL_CAI_CLASS in combined.columns:
+        combined[COL_EXPRESSION_CLASS] = combined[COL_CAI_CLASS]
     else:
-        combined["expression_class"] = "unknown"
+        combined[COL_EXPRESSION_CLASS] = "unknown"
 
-    combined["sample_id"] = sample_id
+    # Outer merges can leave NaN in class columns for genes present in one
+    # metric but not another; fill with "unknown" to avoid downstream surprises.
+    for col in [c for c in combined.columns if c.endswith("_class")]:
+        combined[col] = combined[col].fillna("unknown")
+
+    combined[COL_SAMPLE_ID] = sample_id
     return combined
