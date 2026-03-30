@@ -1016,7 +1016,7 @@ def plot_s_value_scatter(
         ax.legend(fontsize=8)
 
     # Determine S-value reference from the DataFrame if available
-    _s_ref_map = {"gmm_cluster": "GMM cluster", "ace": "ACE consensus", "rp": "ribosomal proteins"}
+    _s_ref_map = {"mahal_cluster": "Mahalanobis cluster", "ace": "ACE consensus", "rp": "ribosomal proteins"}
     _s_ref_raw = merged["S_reference"].iloc[0] if "S_reference" in merged.columns else "rp"
     _s_ref_label = _s_ref_map.get(_s_ref_raw, _s_ref_raw)
 
@@ -3128,9 +3128,9 @@ def generate_single_genome_plots(
     advanced_results: dict[str, pd.DataFrame] | None = None,
     bio_ecology_results: dict[str, pd.DataFrame | dict] | None = None,
     gff_path: Path | None = None,
-    gmm_cluster_rscu: "pd.Series | None" = None,
-    gmm_rp_cluster: int | None = None,
-    gmm_cluster_size: int | None = None,
+    mahal_cluster_rscu: "pd.Series | None" = None,
+    mahal_rp_cluster: int | None = None,
+    mahal_cluster_size: int | None = None,
 ) -> dict[str, Path]:
     """Generate all single-genome plots.
 
@@ -3193,23 +3193,23 @@ def generate_single_genome_plots(
     else:
         logger.info("SKIPPED: RSCU heatmap (no per-gene RSCU data)")
 
-    # GMM cluster RSCU rounded heatmap — shows the translationally optimised
+    # Mahalanobis cluster RSCU rounded heatmap — shows the translationally optimised
     # cluster's pooled codon usage, placed alongside the genome-wide heatmaps
     # for direct visual comparison.
-    if gmm_cluster_rscu is not None and not gmm_cluster_rscu.empty:
+    if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty:
         try:
-            from codonpipe.modules.gmm_clustering import _plot_gmm_cluster_rscu_heatmap
-            p = plot_dir / f"{sample_id}_gmm_cluster_rscu_heatmap"
-            _plot_gmm_cluster_rscu_heatmap(
-                gmm_cluster_rscu, p, sample_id,
-                cluster_label=gmm_rp_cluster if gmm_rp_cluster is not None else 0,
-                n_genes=gmm_cluster_size if gmm_cluster_size is not None else 0,
+            from codonpipe.modules.mahal_clustering import _plot_mahal_cluster_rscu_heatmap
+            p = plot_dir / f"{sample_id}_mahal_cluster_rscu_heatmap"
+            _plot_mahal_cluster_rscu_heatmap(
+                mahal_cluster_rscu, p, sample_id,
+                cluster_label=mahal_rp_cluster if mahal_rp_cluster is not None else 0,
+                n_genes=mahal_cluster_size if mahal_cluster_size is not None else 0,
             )
-            outputs["gmm_cluster_rscu_heatmap"] = p.with_suffix(".png")
+            outputs["mahal_cluster_rscu_heatmap"] = p.with_suffix(".png")
         except Exception as e:
-            logger.warning("GMM cluster RSCU heatmap failed: %s", e)
+            logger.warning("Mahalanobis cluster RSCU heatmap failed: %s", e)
     else:
-        logger.info("SKIPPED: GMM cluster RSCU heatmap (no GMM cluster data)")
+        logger.info("SKIPPED: Mahalanobis cluster RSCU heatmap (no Mahalanobis cluster data)")
 
     if enc_df is not None and not enc_df.empty:
         try:
@@ -3288,18 +3288,18 @@ def generate_single_genome_plots(
     # Enrichment plots
     if enrichment_results:
         # Per-comparison bar plots
-        # Keys are prefixed: "rp_enrichment_MELP_high" or "gmm_enrichment_MELP_high"
+        # Keys are prefixed: "rp_enrichment_MELP_high" or "mahal_enrichment_MELP_high"
         for key, edf in enrichment_results.items():
             if edf.empty:
                 continue
-            # Parse source (rp/gmm) and metric/tier from the key
+            # Parse source (rp/mahal) and metric/tier from the key
             stripped = key
             source = ""
             if stripped.startswith("rp_"):
                 source = "RP-based "
                 stripped = stripped[3:]
-            elif stripped.startswith("gmm_"):
-                source = "GMM-based "
+            elif stripped.startswith("mahal_"):
+                source = "Mahalanobis-based "
                 stripped = stripped[4:]
             elif stripped.startswith("ace_"):
                 source = "ACE-based "
@@ -3639,7 +3639,7 @@ def generate_batch_plots(
 
     Returns dict of plot paths.
     """
-    plot_dir = output_dir / "plots"
+    plot_dir = output_dir / "batch_plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     outputs = {}
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in combined_df.columns]
@@ -5127,7 +5127,7 @@ def generate_pairwise_comparison_plots(
     Returns:
         Dict of output plot paths.
     """
-    plot_dir = output_dir / "comparison" / "plots"
+    plot_dir = output_dir / "batch_pairwise" / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, Path] = {}
 
