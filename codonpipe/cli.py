@@ -68,6 +68,9 @@ def main():
 @click.option("--auto-select-multiplier", is_flag=True,
               help="Automatically use the stability-recommended multiplier instead of "
                    "--mahal-distance-multiplier. Requires --run-stability.")
+@click.option("--stability-core-threshold", type=float, default=0.5, show_default=True,
+              help="Membership frequency threshold for a gene to be 'core'. "
+                   "0.5 = majority-rule consensus; 0.9 = high-confidence subset.")
 @click.option("--kegg-ko-pathway", type=click.Path(exists=True, path_type=Path), default=None,
               help="KO-to-pathway mapping TSV for offline enrichment (auto-downloaded from KEGG if omitted).")
 @click.option("--force", is_flag=True, help="Overwrite existing outputs.")
@@ -99,6 +102,7 @@ def run(
     stability_bootstraps: int,
     stability_multipliers: str | None,
     auto_select_multiplier: bool,
+    stability_core_threshold: float,
     kegg_ko_pathway: Path | None,
     force: bool,
     verbose: bool,
@@ -163,6 +167,7 @@ def run(
             stability_bootstraps=stability_bootstraps,
             stability_multipliers=stab_mult_list,
             auto_select_multiplier=auto_select_multiplier,
+            stability_core_threshold=stability_core_threshold,
             kegg_ko_pathway=kegg_ko_pathway,
             gff_file=gff_file,
             force=force,
@@ -213,6 +218,9 @@ def run(
               help="Comma-separated multiplier values to test (e.g. '1.0,1.5,2.0,2.5,3.0').")
 @click.option("--auto-select-multiplier", is_flag=True,
               help="Automatically use the stability-recommended multiplier. Requires --run-stability.")
+@click.option("--stability-core-threshold", type=float, default=0.5, show_default=True,
+              help="Membership frequency threshold for a gene to be 'core'. "
+                   "0.5 = majority-rule consensus; 0.9 = high-confidence subset.")
 @click.option("--kegg-ko-pathway", type=click.Path(exists=True, path_type=Path), default=None,
               help="KO-to-pathway mapping TSV for offline enrichment.")
 @click.option("--gff", "gff_file", type=click.Path(exists=True, path_type=Path), default=None,
@@ -243,6 +251,7 @@ def batch(
     stability_bootstraps: int,
     stability_multipliers: str | None,
     auto_select_multiplier: bool,
+    stability_core_threshold: float,
     kegg_ko_pathway: Path | None,
     gff_file: Path | None,
     force: bool,
@@ -313,6 +322,7 @@ def batch(
             stability_bootstraps=stability_bootstraps,
             stability_multipliers=stab_mult_list,
             auto_select_multiplier=auto_select_multiplier,
+            stability_core_threshold=stability_core_threshold,
             kegg_ko_pathway=kegg_ko_pathway,
             gff_file=gff_file,
             force=force,
