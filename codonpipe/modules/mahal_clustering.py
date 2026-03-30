@@ -529,6 +529,7 @@ def run_mahal_clustering(
     expr_df: pd.DataFrame | None = None,
     min_k: int = 2,
     max_k: int = 8,
+    distance_multiplier: float = _DISTANCE_MULTIPLIER,
 ) -> dict:
     """RP-anchored Mahalanobis distance clustering for translational optimization.
 
@@ -541,7 +542,7 @@ def run_mahal_clustering(
         2. Select top COA axes by cumulative inertia
         3. Fit robust covariance on RP genes (MinCovDet + two-pass outlier removal)
         4. Compute Mahalanobis distance from cleaned RP centroid to all genes
-        5. Set threshold at 2x median RP Mahalanobis distance
+        5. Set threshold at *distance_multiplier* × median RP Mahalanobis distance
         6. Define optimized gene set as all genes within threshold
         7. Compute mean RSCU from optimized set via concatenated pooling
         8. Export gene IDs and diagnostic plots
@@ -557,6 +558,10 @@ def run_mahal_clustering(
         expr_df: Optional expression table (passed to COA for tier annotation).
         min_k: Unused (kept for signature compatibility).
         max_k: Unused (kept for signature compatibility).
+        distance_multiplier: Threshold = multiplier × median RP Mahalanobis
+            distance.  Default 2.0.  Lower values (e.g. 1.5) produce a
+            tighter cluster retaining only the most strongly optimised genes;
+            higher values (e.g. 3.0) are more permissive.
 
     Returns:
         Dict with:
@@ -676,11 +681,11 @@ def run_mahal_clustering(
         rp_dists_clean = rp_dists_all
 
     median_rp_dist = float(np.median(rp_dists_clean))
-    threshold = _DISTANCE_MULTIPLIER * median_rp_dist
+    threshold = distance_multiplier * median_rp_dist
 
     logger.info(
         "Mahalanobis threshold: %.2f x %.2f = %.2f",
-        _DISTANCE_MULTIPLIER, median_rp_dist, threshold,
+        distance_multiplier, median_rp_dist, threshold,
     )
 
     # ── Step 6: Define optimized gene set ─────────────────────────────
