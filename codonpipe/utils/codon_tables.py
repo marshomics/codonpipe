@@ -114,6 +114,45 @@ for _aa, _codons in AA_CODON_GROUPS.items():
 MIN_GENE_LENGTH = 240
 
 
+# ── Canonical column names shared across modules ──────────────────────────
+# Defining these once prevents silent breakage when modules are updated
+# independently.  Import these constants instead of hardcoding strings.
+
+# Core DataFrame key columns
+COL_GENE = "gene"
+COL_WIDTH = "width"
+COL_SAMPLE_ID = "sample_id"
+
+# Expression metric score columns (produced by expression.py, consumed everywhere)
+COL_MELP = "MELP"
+COL_CAI = "CAI"
+COL_FOP = "Fop"
+EXPRESSION_METRICS = (COL_MELP, COL_CAI, COL_FOP)
+
+# Expression classification columns
+COL_MELP_CLASS = "MELP_class"
+COL_CAI_CLASS = "CAI_class"
+COL_FOP_CLASS = "Fop_class"
+COL_EXPRESSION_CLASS = "expression_class"
+EXPRESSION_CLASS_COLS = (COL_MELP_CLASS, COL_CAI_CLASS, COL_FOP_CLASS)
+
+# ENC-related columns (produced by rscu.py and advanced_analyses.py)
+COL_ENC = "ENC"
+COL_ENCPRIME = "ENCprime"
+COL_ENC_DIFF = "ENC_diff"
+COL_ENCPRIME_RESIDUAL = "ENCprime_residual"
+
+# GC content columns
+COL_GC3 = "GC3"
+COL_GC12 = "GC12"
+
+# Mahalanobis cluster membership flag
+COL_IN_MAHAL_CLUSTER = "in_mahal_cluster"
+
+# RP-prefixed columns for RP-based scores preserved alongside Mahalanobis-based
+RP_PREFIX = "rp_"
+
+
 def dna_to_rna(seq: str) -> str:
     """Convert a DNA sequence to RNA."""
     return seq.upper().replace("T", "U")
