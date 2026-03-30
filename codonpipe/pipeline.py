@@ -59,6 +59,17 @@ _PIPELINE_COLS = frozenset({
 })
 
 
+def _load_rp_ids(rp_ids_file: Path | None) -> set[str] | None:
+    """Load RP gene IDs from a text file (one per line)."""
+    if rp_ids_file is None or not rp_ids_file.exists():
+        return None
+    return {
+        line.strip()
+        for line in rp_ids_file.read_text().splitlines()
+        if line.strip()
+    }
+
+
 def _validate_prokka_files(prokka_files: dict[str, Path]) -> None:
     """Validate that user-supplied Prokka files exist and are non-empty."""
     for key in ("faa", "ffn"):
@@ -891,6 +902,9 @@ def run_single_genome(
             mahal_cluster_gene_ids=mahal_cluster_gene_ids,
             mahal_coa_coords=mahal_results.get("mahal_coa_coords"),
             coa_inertia=mahal_results.get("mahal_coa_inertia"),
+            stability_results=stability_results if stability_results else None,
+            rp_gene_ids=_load_rp_ids(rp_ids_file) if rp_ids_file else None,
+            mahal_gene_distances=mahal_results.get("mahal_gene_distances"),
         )
         all_outputs.update(plot_outputs)
     except Exception as e:
