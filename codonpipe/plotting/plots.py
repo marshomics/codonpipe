@@ -4708,9 +4708,9 @@ def _generate_bio_ecology_plots(
         logger.info("SKIPPED: codon deviation heatmap (no Mahalanobis cluster RSCU)")
 
     # Binned Mahalanobis distance genome landscape
-    if (hgt_data is not None and rscu_gene_df is not None
-            and enc_df is not None and mahal_cluster_gene_ids):
-        try:
+    try:
+        if (hgt_data is not None and rscu_gene_df is not None
+                and enc_df is not None and mahal_cluster_gene_ids):
             p = plot_dir / f"{sample_id}_binned_mahal_landscape"
             plot_binned_mahal_landscape(
                 enc_df, hgt_data, rscu_gene_df,
@@ -4719,14 +4719,14 @@ def _generate_bio_ecology_plots(
                 output_path=p, sample_id=sample_id, gff_path=gff_path,
             )
             outputs["binned_mahal_landscape"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Binned Mahalanobis landscape plot failed: %s", e)
-    else:
-        logger.info("SKIPPED: binned Mahalanobis landscape (no HGT/cluster data)")
+        else:
+            logger.info("SKIPPED: binned Mahalanobis landscape (no HGT/cluster data)")
+    except Exception as e:
+        logger.warning("Binned Mahalanobis landscape plot failed: %s", e)
 
     # COA biplot with Mahalanobis distance coloring
-    if mahal_coa_coords is not None and not mahal_coa_coords.empty:
-        try:
+    try:
+        if mahal_coa_coords is not None and not mahal_coa_coords.empty:
             p = plot_dir / f"{sample_id}_coa_mahal_biplot"
             plot_coa_mahal_biplot(
                 mahal_coa_coords,
@@ -4736,14 +4736,14 @@ def _generate_bio_ecology_plots(
                 coa_inertia=coa_inertia,
             )
             outputs["coa_mahal_biplot"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("COA Mahalanobis biplot failed: %s", e)
-    else:
-        logger.info("SKIPPED: COA Mahalanobis biplot (no COA coordinates)")
+        else:
+            logger.info("SKIPPED: COA Mahalanobis biplot (no COA coordinates)")
+    except Exception as e:
+        logger.warning("COA Mahalanobis biplot failed: %s", e)
 
     # Circular genome codon usage map
-    if rscu_gene_df is not None and enc_df is not None:
-        try:
+    try:
+        if rscu_gene_df is not None and enc_df is not None:
             p = plot_dir / f"{sample_id}_circular_cu_map"
             plot_circular_cu_map(
                 rscu_gene_df, enc_df,
@@ -4753,10 +4753,10 @@ def _generate_bio_ecology_plots(
                 output_path=p, sample_id=sample_id, gff_path=gff_path,
             )
             outputs["circular_cu_map"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Circular CU map failed: %s", e)
-    else:
-        logger.info("SKIPPED: circular CU map (no RSCU/ENC data)")
+        else:
+            logger.info("SKIPPED: circular CU map (no RSCU/ENC data)")
+    except Exception as e:
+        logger.warning("Circular CU map failed: %s", e)
 
 
 def generate_batch_plots(
