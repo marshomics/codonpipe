@@ -1240,33 +1240,79 @@ def run_bio_ecology_analyses(
 
     # 2b. gRodon2 growth rate prediction (requires R + gRodon2 package)
     #
-    # When Mahalanobis outputs are available, gRodon2 uses:
-    #   - highly expressed: high-MELP-tier genes (expression_class == "high"),
-    #     identified via scoring against the Mahalanobis cluster reference
-    #   - background: FULL genome CDS set (NOT the Mahalanobis cluster)
-    # gRodon2's CUBHE measures HE bias relative to the genomic average.
-    # Restricting the background to the Mahalanobis cluster collapses the
-    # contrast and severely underestimates growth rate.
+    # HE set: RP genes filtered to those in the Mahalanobis optimal cluster.
+    # This excludes atypical RPs (HGT, pseudogenes, truncated ORFs) that
+    # weaken ConsistencyHE.  Falls back to all RPs if Mahalanobis is
+    # unavailable or the intersection is too small (<10 genes).
+    #
+    # Background: always the FULL genome CDS set.  gRodon2's CUBHE
+    # measures HE bias relative to the genomic average; restricting the
+    # background to the Mahalanobis cluster collapses the contrast.
     logger.info("Running gRodon2 growth rate prediction for %s", sample_id)
     try:
         from codonpipe.modules.grodon import run_grodon
 
-        # gRodon2's HE set: use ribosomal protein IDs, NOT the broad
-        # high-MELP tier.
+        # gRodon2's HE set: ribosomal proteins filtered to those present
+        # in the Mahalanobis optimal cluster.
         #
         # gRodon2's CUBHE/ConsistencyHE/CPB regression was trained with
         # ribosomal proteins (~55 genes) as the HE anchor (Weissman et al.
-        # 2021).  The model coefficients assume that specific, narrow level
-        # of bias.  Substituting the high-MELP tier (often 300-500+ genes)
-        # dilutes CUBHE and causes the model to underestimate growth rate
-        # (e.g. predicting ~6 h for E. coli instead of <1 h).
+        # 2021).  We refine this by intersecting the RP gene list with the
+        # Mahalanobis cluster, which excludes atypical RPs (horizontally
+        # transferred, pseudogenes, truncated at contig boundaries) that
+        # would drag down ConsistencyHE and dilute CUBHE.
         #
-        # The full genome CDS set is always used as background — see the
-        # earlier comment on why Mahalanobis subsetting was removed.
+        # Fallback order:
+        #   1. RP genes ∩ Mahalanobis cluster (best: concordant RPs only)
+        #   2. All RP genes (when Mahalanobis clustering unavailable)
+        #   3. gRodon2's built-in header regex (no RP IDs at all)
+        #
+        # The full genome CDS set is always used as background.
+        import tempfile as _tmpmod
+
+        filtered_he_path = None
+        if (
+            rp_ids_file is not None
+            and Path(rp_ids_file).exists()
+            and mahal_cluster_gene_ids is not None
+            and len(mahal_cluster_gene_ids) > 0
+        ):
+            # Read RP gene IDs and intersect with Mahalanobis cluster
+            with open(rp_ids_file) as f:
+                rp_ids = {line.strip() for line in f if line.strip()}
+            mahal_set = set(mahal_cluster_gene_ids)
+            concordant_rps = sorted(rp_ids & mahal_set)
+
+            if len(concordant_rps) >= 10:
+                he_tmp = _tmpmod.NamedTemporaryFile(
+                    mode="w", suffix="_rp_mahal_ids.txt", delete=False,
+                    dir=eco_dir,
+                )
+                he_tmp.write("\n".join(concordant_rps) + "\n")
+                he_tmp.close()
+                filtered_he_path = Path(he_tmp.name)
+                logger.info(
+                    "gRodon2: using %d/%d RP genes that overlap with "
+                    "Mahalanobis cluster (excluded %d discordant RPs)",
+                    len(concordant_rps), len(rp_ids),
+                    len(rp_ids) - len(concordant_rps),
+                )
+            else:
+                logger.info(
+                    "gRodon2: only %d RP genes overlap with Mahalanobis cluster "
+                    "(need ≥10); falling back to all %d RP genes",
+                    len(concordant_rps), len(rp_ids),
+                )
+
         grodon_result = run_grodon(
             ffn_path, output_dir, sample_id,
             rp_ids_file=rp_ids_file,
+            he_ids_file=filtered_he_path,
         )
+
+        # Clean up temp filtered IDs file
+        if filtered_he_path is not None:
+            filtered_he_path.unlink(missing_ok=True)
 
         if grodon_result is not None:
             grodon_path = grodon_result.pop("path", None)
