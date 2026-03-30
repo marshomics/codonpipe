@@ -56,6 +56,7 @@ logger = logging.getLogger("codonpipe")
 
 _DEFAULT_N_BOOTSTRAPS = 100
 _DEFAULT_MULTIPLIER_GRID = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
+_DEFAULT_CORE_THRESHOLD = 0.5   # membership frequency threshold for "core" genes
 
 # Weights for composite stability score
 _W_JACCARD = 0.35       # higher = more stable membership across bootstraps
@@ -180,6 +181,7 @@ def run_stability_analysis(
     expr_df: pd.DataFrame | None = None,
     n_bootstraps: int = _DEFAULT_N_BOOTSTRAPS,
     multiplier_grid: list[float] | None = None,
+    core_threshold: float = _DEFAULT_CORE_THRESHOLD,
 ) -> dict:
     """Bootstrap stability analysis across a grid of distance multipliers.
 
@@ -190,8 +192,7 @@ def run_stability_analysis(
       gene is inside the optimized set)
     - Pairwise Jaccard stability (mean Jaccard between all bootstrap
       pairs at each multiplier)
-    - Mean membership frequency of genes that are in the set at least
-      50% of the time ("core" genes)
+    - Mean membership frequency of genes above ``core_threshold``
     - RSCU cosine similarity between bootstrap-consensus cluster and RP
     - Composite stability score combining the above
 
@@ -209,6 +210,9 @@ def run_stability_analysis(
         expr_df: Optional expression table.
         n_bootstraps: Number of bootstrap replicates per multiplier.
         multiplier_grid: List of multiplier values to test.
+        core_threshold: Membership frequency threshold for a gene to be
+            considered "core" (default 0.5).  Set to 0.9 for a
+            high-confidence subset.
 
     Returns:
         Dict with stability results, recommended multiplier, per-gene
@@ -291,8 +295,8 @@ def run_stability_analysis(
         freq = membership_freq[mult]
         all_freqs = np.array(list(freq.values()))
 
-        # "Core" genes: present in ≥50% of bootstraps
-        core_mask = all_freqs >= 0.5
+        # "Core" genes: present in ≥core_threshold of bootstraps
+        core_mask = all_freqs >= core_threshold
         n_core = int(core_mask.sum())
         mean_core_freq = float(np.mean(all_freqs[core_mask])) if n_core > 0 else 0.0
 
@@ -302,13 +306,13 @@ def run_stability_analysis(
         std_size = float(np.std(sizes))
 
         # RP coverage: fraction of RPs in the core set
-        rp_in_core = sum(1 for g in rp_gene_ids if freq.get(g, 0) >= 0.5)
+        rp_in_core = sum(1 for g in rp_gene_ids if freq.get(g, 0) >= core_threshold)
         rp_coverage = rp_in_core / len(rp_gene_ids) if rp_gene_ids else 0.0
 
         # RSCU cosine similarity of core genes vs RP-only RSCU
         cosine_sim = np.nan
         if rp_rscu_df is not None and not rp_rscu_df.empty and ffn_path and ffn_path.exists():
-            core_ids = {g for g, f in freq.items() if f >= 0.5}
+            core_ids = {g for g, f in freq.items() if f >= core_threshold}
             if len(core_ids) >= 5:
                 core_rscu = _compute_cluster_rscu(ffn_path, core_ids)
                 if not core_rscu.empty:
@@ -371,6 +375,7 @@ def run_stability_analysis(
     )
     results["recommended_multiplier"] = recommended_mult
     results["composite_score"] = best_score
+    results["core_threshold"] = core_threshold
     results["metrics_df"] = metrics_df
 
     # ── Build per-gene membership frequency table ────────────────────
@@ -381,10 +386,16 @@ def run_stability_analysis(
 
     # Core membership at recommended multiplier
     rec_col = f"freq_m{recommended_mult:.2f}"
-    freq_df["core_at_recommended"] = freq_df[rec_col] >= 0.5
+    freq_df["core_at_recommended"] = freq_df[rec_col] >= core_threshold
+
+    # Stability classes adapt to the chosen core_threshold.  The bins
+    # always produce four categories: absent (< low), unstable (low ..
+    # core_threshold), moderate (core_threshold .. high), stable (>= high).
+    _lo = min(0.1, core_threshold * 0.2)
+    _hi = min(core_threshold + (1.0 - core_threshold) * 0.5, 0.99)
     freq_df["stability_class"] = pd.cut(
         freq_df[rec_col],
-        bins=[-0.01, 0.1, 0.5, 0.9, 1.01],
+        bins=[-0.01, _lo, core_threshold, _hi, 1.01],
         labels=["absent", "unstable", "moderate", "stable"],
     )
     results["membership_freq_df"] = freq_df
@@ -419,7 +430,9 @@ def run_stability_analysis(
         logger.warning("Membership heatmap failed: %s", e)
 
     try:
-        _plot_gene_stability_distribution(freq_df, recommended_mult, stab_dir, sample_id)
+        _plot_gene_stability_distribution(
+            freq_df, recommended_mult, core_threshold, stab_dir, sample_id,
+        )
         results["stability_distribution_plot"] = (
             stab_dir / f"{sample_id}_stability_distribution.png"
         )
@@ -428,8 +441,9 @@ def run_stability_analysis(
 
     logger.info(
         "Stability analysis complete for %s: recommended multiplier=%.2f, "
-        "%d core genes (stable in ≥50%% of %d bootstraps)",
-        sample_id, recommended_mult, len(core_ids), n_bootstraps,
+        "%d core genes (stable in ≥%.0f%% of %d bootstraps)",
+        sample_id, recommended_mult, len(core_ids),
+        core_threshold * 100, n_bootstraps,
     )
 
     return results
@@ -554,6 +568,7 @@ def _plot_membership_heatmap(
 def _plot_gene_stability_distribution(
     freq_df: pd.DataFrame,
     recommended_mult: float,
+    core_threshold: float,
     output_dir: Path,
     sample_id: str,
 ) -> None:
@@ -569,15 +584,19 @@ def _plot_gene_stability_distribution(
     bins = np.linspace(0, 1, 21)
     ax.hist(freqs, bins=bins, color="#2c7bb6", alpha=0.7, edgecolor="white")
 
-    # Mark the 0.5 threshold
-    ax.axvline(0.5, color="#d7191c", linewidth=1.5, linestyle="--", label="Core threshold (0.5)")
+    # Mark the core threshold
+    ax.axvline(
+        core_threshold, color="#d7191c", linewidth=1.5, linestyle="--",
+        label=f"Core threshold ({core_threshold:.2f})",
+    )
 
-    n_core = int((freqs >= 0.5).sum())
+    n_core = int((freqs >= core_threshold).sum())
     n_stable = int((freqs >= 0.9).sum())
     ax.set_xlabel(f"Membership frequency (multiplier={recommended_mult:.2f})")
     ax.set_ylabel("Number of genes")
     ax.set_title(
-        f"{sample_id}: {n_core} core genes (≥0.5), {n_stable} stable (≥0.9)"
+        f"{sample_id}: {n_core} core genes (≥{core_threshold:.2f}), "
+        f"{n_stable} stable (≥0.9)"
     )
     ax.legend(fontsize=8)
 
