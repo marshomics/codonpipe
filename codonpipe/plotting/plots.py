@@ -4669,7 +4669,7 @@ def _generate_bio_ecology_plots(
             )
             outputs["genomic_cu_landscape"] = p.with_suffix(".png")
         except Exception as e:
-            logger.warning("Genomic CU landscape plot failed: %s", e)
+            logger.warning("Genomic CU landscape plot failed: %s", e, exc_info=True)
     else:
         logger.info("SKIPPED: genomic CU landscape plot (no RSCU/ENC data)")
 
@@ -4685,7 +4685,7 @@ def _generate_bio_ecology_plots(
             )
             outputs["mge_vs_core_rscu"] = p.with_suffix(".png")
         except Exception as e:
-            logger.warning("MGE vs core RSCU plot failed: %s", e)
+            logger.warning("MGE vs core RSCU plot failed: %s", e, exc_info=True)
     else:
         logger.info("SKIPPED: MGE vs core RSCU plot (no HGT data)")
 
@@ -4703,7 +4703,7 @@ def _generate_bio_ecology_plots(
             )
             outputs["codon_deviation_heatmap"] = p.with_suffix(".png")
         except Exception as e:
-            logger.warning("Codon deviation heatmap failed: %s", e)
+            logger.warning("Codon deviation heatmap failed: %s", e, exc_info=True)
     else:
         logger.info("SKIPPED: codon deviation heatmap (no Mahalanobis cluster RSCU)")
 
@@ -4722,7 +4722,7 @@ def _generate_bio_ecology_plots(
         else:
             logger.info("SKIPPED: binned Mahalanobis landscape (no HGT/cluster data)")
     except Exception as e:
-        logger.warning("Binned Mahalanobis landscape plot failed: %s", e)
+        logger.warning("Binned Mahalanobis landscape plot failed: %s", e, exc_info=True)
 
     # COA biplot with Mahalanobis distance coloring
     try:
@@ -4739,7 +4739,7 @@ def _generate_bio_ecology_plots(
         else:
             logger.info("SKIPPED: COA Mahalanobis biplot (no COA coordinates)")
     except Exception as e:
-        logger.warning("COA Mahalanobis biplot failed: %s", e)
+        logger.warning("COA Mahalanobis biplot failed: %s", e, exc_info=True)
 
     # Circular genome codon usage map
     try:
@@ -4756,7 +4756,7 @@ def _generate_bio_ecology_plots(
         else:
             logger.info("SKIPPED: circular CU map (no RSCU/ENC data)")
     except Exception as e:
-        logger.warning("Circular CU map failed: %s", e)
+        logger.warning("Circular CU map failed: %s", e, exc_info=True)
 
 
 def generate_batch_plots(
