@@ -312,17 +312,17 @@ def is_grodon_available() -> bool:
 
 _R_SCRIPT = r"""
 # gRodon2 wrapper called by CodonPipe
-# Arguments: <cds_fasta> <output_json> [<he_ids_file>] [<background_ids_file>]
+# Arguments: <cds_fasta> <output_json> [<he_ids_file>]
 #
 # he_ids_file (optional): Gene IDs (one per line) to mark as highly expressed.
 #   When provided these replace gRodon2's built-in RP regex. Typically the
 #   high-MELP tier genes scored against the Mahalanobis-defined reference.
 #
-# background_ids_file (optional): Gene IDs (one per line) that define the
-#   background gene set.  When provided the input FASTA is subsetted to only
-#   these genes BEFORE computing CUBHE and CPB, so the "genome average" that
-#   gRodon2 measures against is the Mahalanobis-defined optimised set rather
-#   than the full CDS complement.  The he_ids must be a subset of these.
+# The FULL genome CDS set is always used as the background.  gRodon2's
+# CUBHE measures HE codon bias relative to the genomic average; restricting
+# the background to an already-optimised subset (e.g. the Mahalanobis
+# cluster) collapses the HE-vs-background contrast and causes the model
+# to severely underestimate growth rate.
 
 # Ensure user library is on the search path even when .Renviron is absent
 local({
@@ -342,29 +342,12 @@ args <- commandArgs(trailingOnly = TRUE)
 cds_fasta       <- args[1]
 output_json     <- args[2]
 he_ids_file     <- if (length(args) >= 3 && nchar(args[3]) > 0) args[3] else NULL
-bg_ids_file     <- if (length(args) >= 4 && nchar(args[4]) > 0) args[4] else NULL
 
 genes <- readDNAStringSet(cds_fasta)
 
 # Extract the gene ID (first whitespace-delimited token) from each FASTA header
 gene_ids <- sub("\\s.*", "", names(genes))
-
-# ── Optional: subset to background (Mahalanobis-defined) gene set ──
 n_total <- length(genes)
-if (!is.null(bg_ids_file) && file.exists(bg_ids_file)) {
-  bg_ids <- readLines(bg_ids_file)
-  bg_ids <- trimws(bg_ids[nchar(trimws(bg_ids)) > 0])
-  keep <- gene_ids %in% bg_ids
-  if (sum(keep) < 10) {
-    cat(sprintf("WARNING: only %d/%d CDS matched background IDs; using full genome\n",
-                sum(keep), n_total))
-  } else {
-    genes    <- genes[keep]
-    gene_ids <- gene_ids[keep]
-    cat(sprintf("Subsetting to %d/%d Mahalanobis-defined background genes\n",
-                length(genes), n_total))
-  }
-}
 
 # ── Mark highly expressed genes ──
 if (!is.null(he_ids_file) && file.exists(he_ids_file)) {
@@ -435,9 +418,13 @@ def run_grodon(
     sample_id: str,
     rp_ids_file: Path | str | None = None,
     he_ids_file: Path | str | None = None,
-    background_ids_file: Path | str | None = None,
 ) -> dict | None:
     """Run gRodon2 growth rate prediction on a CDS FASTA file.
+
+    The full genome CDS set is always used as the background for CUBHE/CPB
+    computation.  The HE gene set can be supplied explicitly (high-MELP
+    tier from Mahalanobis-based scoring) or via RP IDs; if neither is
+    given, gRodon2 falls back to its built-in ribosomal protein regex.
 
     Args:
         ffn_path: Path to CDS nucleotide FASTA (in-frame coding sequences).
@@ -450,11 +437,6 @@ def run_grodon(
             IDs (one per line).  When provided, takes precedence over
             *rp_ids_file* for marking the HE set.  Typically contains
             high-MELP-tier genes scored against the Mahalanobis reference.
-        background_ids_file: Optional path to a file listing the background
-            gene set (one gene ID per line).  When provided, the input FASTA
-            is subsetted to only these genes before computing CUBHE and CPB,
-            so the "genome average" is the Mahalanobis-defined optimised set
-            rather than the full CDS complement.
 
     Returns:
         Dict with gRodon2 results (doubling time, CI, codon stats),
@@ -487,15 +469,10 @@ def run_grodon(
     elif rp_ids_file is not None and Path(rp_ids_file).exists():
         effective_he = str(rp_ids_file)
 
-    effective_bg = None
-    if background_ids_file is not None and Path(background_ids_file).exists():
-        effective_bg = str(background_ids_file)
-
     try:
         cmd = ["Rscript", "--no-save", "--no-restore", r_script_path,
                str(ffn_path), json_out_path,
-               effective_he or "",
-               effective_bg or ""]
+               effective_he or ""]
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -560,9 +537,7 @@ def run_grodon(
             in_training_range = False
 
         # Determine the reference mode for provenance tracking
-        if effective_bg and effective_he:
-            ref_mode = "mahalanobis_melp"
-        elif effective_he:
+        if effective_he:
             ref_mode = "melp_he"
         elif rp_ids_file and Path(rp_ids_file).exists():
             ref_mode = "rp_ids"
