@@ -18,6 +18,7 @@ from scipy import stats as sp_stats
 from scipy.spatial.distance import pdist, squareform
 
 from codonpipe.utils.codon_tables import RSCU_COLUMN_NAMES
+from codonpipe.utils.statistics import benjamini_hochberg
 
 logger = logging.getLogger("codonpipe")
 
@@ -105,11 +106,11 @@ def collect_sample_metrics(
         # --- High-expression gene RSCU profile ---
         _read_high_expression_rscu(paths, row)
 
-        # --- GMM RP-cluster RSCU profile ---
-        _read_gmm_cluster_rscu(paths, row)
+        # --- Mahalanobis RP-cluster RSCU profile ---
+        _read_mahal_cluster_rscu(paths, row)
 
-        # --- GMM clustering summary ---
-        _read_gmm_summary(paths, row)
+        # --- Mahalanobis clustering summary ---
+        _read_mahal_summary(paths, row)
 
         # --- Pathway enrichment summary ---
         _read_enrichment_summary(paths, row)
@@ -413,35 +414,35 @@ def _read_high_expression_rscu(paths: dict, row: dict) -> None:
             pass
 
 
-def _read_gmm_cluster_rscu(paths: dict, row: dict) -> None:
-    """Read GMM RP-cluster RSCU profile."""
-    for key in ("gmm_gmm_cluster_rscu_path", "gmm_cluster_rscu_path"):
+def _read_mahal_cluster_rscu(paths: dict, row: dict) -> None:
+    """Read Mahalanobis RP-cluster RSCU profile."""
+    for key in ("mahal_mahal_cluster_rscu_path", "mahal_cluster_rscu_path"):
         p = paths.get(key)
         if p and Path(p).exists():
             try:
                 df = pd.read_csv(p, sep="\t", index_col=0)
                 for col_name in RSCU_COLUMN_NAMES:
                     if col_name in df.index:
-                        row[f"gmm_{col_name}"] = df.loc[col_name, "RSCU"]
+                        row[f"mahal_{col_name}"] = df.loc[col_name, "RSCU"]
                 return
             except Exception:
                 pass
 
     # Fallback: try codon table format output
-    p = paths.get("gmm_cluster_rscu")
+    p = paths.get("mahal_cluster_rscu")
     if p and Path(p).exists():
         try:
             df = pd.read_csv(p, sep="\t")
             rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
             for c in rscu_cols:
-                row[f"gmm_{c}"] = df[c].iloc[0] if len(df) > 0 else np.nan
+                row[f"mahal_{c}"] = df[c].iloc[0] if len(df) > 0 else np.nan
         except Exception:
             pass
 
 
-def _read_gmm_summary(paths: dict, row: dict) -> None:
-    """Read GMM clustering summary (best_k, cluster size, cosine similarity)."""
-    for key in ("gmm_gmm_summary_path", "gmm_summary_path"):
+def _read_mahal_summary(paths: dict, row: dict) -> None:
+    """Read Mahalanobis clustering summary (best_k, cluster size, cosine similarity)."""
+    for key in ("mahal_mahal_summary_path", "mahal_summary_path"):
         p = paths.get(key)
         if p and Path(p).exists():
             try:
@@ -451,7 +452,7 @@ def _read_gmm_summary(paths: dict, row: dict) -> None:
                     for col in ("best_k", "rp_cluster_size", "rp_genes_in_cluster",
                                 "non_rp_in_cluster", "rp_cosine_similarity"):
                         if col in df.columns:
-                            row[f"gmm_{col}"] = r[col]
+                            row[f"mahal_{col}"] = r[col]
                 return
             except Exception:
                 pass
@@ -688,19 +689,9 @@ def between_condition_tests(
     for test_type in result["test"].unique():
         mask = result["test"] == test_type
         pvals = result.loc[mask, "p_value"].values
-        n_tests = len(pvals)
-        if n_tests == 0:
+        if len(pvals) == 0:
             continue
-        sorted_idx = np.argsort(pvals)
-        ranks = np.empty_like(sorted_idx)
-        ranks[sorted_idx] = np.arange(1, n_tests + 1)
-        corrected = np.minimum(pvals * n_tests / ranks, 1.0)
-        # Enforce monotonicity
-        corrected_sorted = corrected[sorted_idx]
-        for i in range(n_tests - 2, -1, -1):
-            corrected_sorted[i] = min(corrected_sorted[i], corrected_sorted[i + 1])
-        corrected[sorted_idx] = corrected_sorted
-        result.loc[mask, "corrected_p"] = corrected
+        result.loc[mask, "corrected_p"] = benjamini_hochberg(pvals)
 
     result["significant"] = result["corrected_p"] < 0.05
     return result
@@ -828,18 +819,7 @@ def between_condition_rscu_tests(
     # BH FDR per comparison pair
     for (g1, g2), grp in result.groupby(["group1", "group2"]):
         idx = grp.index
-        pvals = grp["p_value"].values
-        n = len(pvals)
-        sorted_i = np.argsort(pvals)
-        ranks = np.empty_like(sorted_i)
-        ranks[sorted_i] = np.arange(1, n + 1)
-        corrected = np.minimum(pvals * n / ranks, 1.0)
-        # Enforce monotonicity
-        corrected_sorted = corrected[sorted_i]
-        for j in range(n - 2, -1, -1):
-            corrected_sorted[j] = min(corrected_sorted[j], corrected_sorted[j + 1])
-        corrected[sorted_i] = corrected_sorted
-        result.loc[idx, "corrected_p"] = corrected
+        result.loc[idx, "corrected_p"] = benjamini_hochberg(grp["p_value"].values)
 
     result["significant"] = result["corrected_p"] < 0.05
     return result
@@ -1055,18 +1035,7 @@ def between_condition_expression_class_rscu(
     # BH FDR per comparison pair
     for (g1, g2), grp in result.groupby(["group1", "group2"]):
         idx = grp.index
-        pvals = grp["p_value"].values
-        n = len(pvals)
-        sorted_i = np.argsort(pvals)
-        ranks = np.empty_like(sorted_i)
-        ranks[sorted_i] = np.arange(1, n + 1)
-        corrected = np.minimum(pvals * n / ranks, 1.0)
-        # Enforce monotonicity
-        corrected_sorted = corrected[sorted_i]
-        for j in range(n - 2, -1, -1):
-            corrected_sorted[j] = min(corrected_sorted[j], corrected_sorted[j + 1])
-        corrected[sorted_i] = corrected_sorted
-        result.loc[idx, "p_adjusted"] = corrected
+        result.loc[idx, "p_adjusted"] = benjamini_hochberg(grp["p_value"].values)
 
     result["significant"] = result["p_adjusted"] < 0.05
     return result.sort_values("p_adjusted")
@@ -1145,26 +1114,28 @@ def between_condition_enrichment_comparison(
         for pw in sorted(all_pathways.keys()):
             # Build contingency table: rows = [enriched, not_enriched], cols = conditions
             contingency = []
+            skip_pw = False
             for cond in cond_list:
                 n_enriched = cond_pathways[cond].get(pw, 0)
                 n_total = cond_n_samples[cond]
                 if n_total == 0:
+                    skip_pw = True
                     break
                 contingency.append([n_enriched, n_total - n_enriched])
-            else:
-                if len(contingency) == len(cond_list):
-                    try:
-                        chi2, p_val, dof, expected = sp_stats.chi2_contingency(np.array(contingency).T)
-                        rows.append({
-                            "pathway": pw,
-                            "pathway_name": all_pathways.get(pw, ""),
-                            "test": "chi_squared",
-                            "group1": "omnibus",
-                            "group2": "omnibus",
-                            "p_value": p_val,
-                        })
-                    except (ValueError, RuntimeError):
-                        pass
+            if skip_pw or len(contingency) != len(cond_list):
+                continue
+            try:
+                chi2, p_val, dof, expected = sp_stats.chi2_contingency(np.array(contingency).T)
+                rows.append({
+                    "pathway": pw,
+                    "pathway_name": all_pathways.get(pw, ""),
+                    "test": "chi_squared",
+                    "group1": "omnibus",
+                    "group2": "omnibus",
+                    "p_value": p_val,
+                })
+            except (ValueError, RuntimeError):
+                pass
 
     # Pairwise Fisher's exact test for all pairs
     for g1, g2 in itertools.combinations(cond_list, 2):
@@ -1208,19 +1179,7 @@ def between_condition_enrichment_comparison(
 
     result = pd.DataFrame(rows)
     # BH FDR globally across all tests
-    n = len(result)
-    if n > 1:
-        order = np.argsort(result["p_value"].values)
-        ranks = np.empty_like(order)
-        ranks[order] = np.arange(1, n + 1)
-        fdr = np.minimum(result["p_value"].values * n / ranks, 1.0)
-        sorted_fdr = fdr[order]
-        for k in range(n - 2, -1, -1):
-            sorted_fdr[k] = min(sorted_fdr[k], sorted_fdr[k + 1])
-        fdr[order] = sorted_fdr
-        result["p_adjusted"] = np.round(fdr, 6)
-    else:
-        result["p_adjusted"] = result["p_value"]
+    result["p_adjusted"] = np.round(benjamini_hochberg(result["p_value"].values), 6)
     result["significant"] = result["p_adjusted"] < 0.05
 
     return result.sort_values("p_adjusted")
@@ -1358,15 +1317,7 @@ def between_condition_strand_asymmetry_patterns(
         n = len(pvals)
         if n == 0:
             continue
-        order = np.argsort(pvals)
-        ranks = np.empty_like(order)
-        ranks[order] = np.arange(1, n + 1)
-        fdr = np.minimum(pvals * n / ranks, 1.0)
-        sorted_fdr = fdr[order]
-        for k in range(n - 2, -1, -1):
-            sorted_fdr[k] = min(sorted_fdr[k], sorted_fdr[k + 1])
-        fdr[order] = sorted_fdr
-        result.loc[idx, "p_adjusted"] = np.round(fdr, 6)
+        result.loc[idx, "p_adjusted"] = np.round(benjamini_hochberg(pvals), 6)
 
     result["significant"] = result["p_adjusted"] < 0.05
     return result.sort_values("p_adjusted")
@@ -1642,7 +1593,7 @@ def run_comparative_analyses(
         (metrics_df, output_paths) — the collected metrics table and a dict
         of written output file paths.
     """
-    comp_dir = output_dir / "comparative"
+    comp_dir = output_dir / "batch_condition"
     comp_dir.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, Path] = {}
 
