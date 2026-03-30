@@ -730,6 +730,9 @@ def run_single_genome(
         gff_path=resolved_gff,
         mahal_cluster_rscu=mahal_cluster_rscu,
         mahal_cluster_size=len(mahal_cluster_gene_ids) if mahal_cluster_gene_ids else None,
+        mahal_cluster_gene_ids=mahal_cluster_gene_ids,
+        mahal_coa_coords=mahal_results.get("mahal_coa_coords"),
+        coa_inertia=mahal_results.get("mahal_coa_inertia"),
     )
     all_outputs.update(plot_outputs)
 
