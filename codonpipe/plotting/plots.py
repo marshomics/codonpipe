@@ -8,6 +8,7 @@ All plots use a consistent style suitable for journal submission.
 from __future__ import annotations
 
 import logging
+import warnings
 from pathlib import Path
 
 import matplotlib
@@ -495,10 +496,18 @@ def plot_codon_frequency_bar(freq_df: pd.DataFrame, output_path: Path, sample_id
     for _, row in df.iterrows():
         colors.append(aa_cmap[row["amino_acid"]])
 
-    ax.bar(range(len(df)), df["per_thousand"], color=colors, edgecolor="none", width=0.8)
+    # Use per_thousand if available (genome-level), fall back to rscu (RP/mahal)
+    if "per_thousand" in df.columns:
+        y_col, y_label = "per_thousand", "Frequency (per thousand codons)"
+    elif "rscu" in df.columns:
+        y_col, y_label = "rscu", "RSCU"
+    else:
+        raise KeyError(f"freq_df has neither 'per_thousand' nor 'rscu' column (columns: {list(df.columns)})")
+
+    ax.bar(range(len(df)), df[y_col], color=colors, edgecolor="none", width=0.8)
     ax.set_xticks(range(len(df)))
     ax.set_xticklabels(df["codon"], rotation=90, fontsize=7)
-    ax.set_ylabel("Frequency (per thousand codons)")
+    ax.set_ylabel(y_label)
     ax.set_xlabel("Codon")
     if sample_id:
         ax.set_title(f"Codon Usage Frequency — {sample_id}")
