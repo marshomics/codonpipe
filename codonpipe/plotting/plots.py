@@ -8,7 +8,6 @@ All plots use a consistent style suitable for journal submission.
 from __future__ import annotations
 
 import logging
-import warnings
 from pathlib import Path
 
 import matplotlib
@@ -32,22 +31,31 @@ from codonpipe.utils.codon_tables import AMINO_ACID_FAMILIES, RSCU_COLUMN_NAMES,
 logger = logging.getLogger("codonpipe")
 
 
-def _mahal_rscu_to_freq_df(mahal_rscu: "pd.Series") -> pd.DataFrame:
-    """Convert a Mahalanobis cluster RSCU Series to the freq_df format expected by heatmap plots.
+def _rscu_to_freq_df(rscu_data) -> pd.DataFrame:
+    """Convert an RSCU Series or dict to the freq_df format expected by heatmap/bar plots.
 
-    The input Series is indexed by RSCU column names (e.g. 'Phe-UUU') with
-    RSCU values.  Returns a DataFrame with columns ``codon``, ``amino_acid``,
-    ``rscu`` matching the schema produced by ``compute_codon_frequency_table``.
+    Accepts a pd.Series (indexed by RSCU column names like 'Phe-UUU') or a
+    dict with the same keys.  Returns a DataFrame with columns ``codon``,
+    ``amino_acid``, ``rscu`` matching the schema produced by
+    ``compute_codon_frequency_table``.
     """
+    items = rscu_data.items() if hasattr(rscu_data, "items") else {}
     rows = []
-    for col_name, rscu_val in mahal_rscu.items():
+    for col_name, rscu_val in items:
         codon = RSCU_COL_TO_CODON.get(col_name)
         if codon is None:
             continue
-        # amino_acid is the family prefix before the hyphen (e.g. 'Phe', 'Ser4')
+        try:
+            val = float(rscu_val)
+        except (TypeError, ValueError):
+            continue
         aa = col_name.split("-")[0]
-        rows.append({"codon": codon, "amino_acid": aa, "rscu": rscu_val})
+        rows.append({"codon": codon, "amino_acid": aa, "rscu": val})
     return pd.DataFrame(rows)
+
+
+# Keep old name as alias for backward compatibility
+_mahal_rscu_to_freq_df = _rscu_to_freq_df
 
 
 def _safe_label(value, fallback: str = "", maxlen: int = 50) -> str:
@@ -253,6 +261,7 @@ def plot_rscu_heatmap_rounded(
 def plot_rscu_heatmap_rounded_comparison(
     freq_dfs: dict[str, pd.DataFrame],
     output_path: Path,
+    title: str = "RSCU Comparison (Mahalanobis cluster)",
 ):
     """Stacked rounded-cell RSCU heatmap comparing exactly two genomes.
 
@@ -448,7 +457,7 @@ def plot_rscu_heatmap_rounded_comparison(
     ax.axis("off")
 
     ax.set_title(
-        "RSCU Comparison (Mahalanobis cluster)",
+        title,
         fontsize=12, fontweight="bold", pad=15,
     )
 
@@ -1442,8 +1451,9 @@ def plot_delta_rscu_heatmap(
     output_path: Path,
     sample_id: str = "",
     metric: str = "CAI",
+    ref_label: str = "genome avg",
 ):
-    """Heatmap of delta RSCU (high-expression minus genome average) per codon.
+    """Heatmap of delta RSCU (high-expression minus reference) per codon.
 
     Positive = favored in highly expressed genes (translationally selected).
     Negative = avoided in highly expressed genes.
@@ -1453,6 +1463,8 @@ def plot_delta_rscu_heatmap(
         output_path: Base path for saving.
         sample_id: Sample name for title.
         metric: Which expression metric was used.
+        ref_label: Label for the reference baseline (e.g. "genome avg",
+            "Mahal. cluster").
     """
     _apply_style()
     if delta_rscu_df.empty:
@@ -1468,7 +1480,7 @@ def plot_delta_rscu_heatmap(
     ax.set_xticks(range(len(df)))
     ax.set_xticklabels(df["codon"].values, rotation=90, fontsize=7)
     ax.axhline(0, color="black", linewidth=0.5)
-    ax.set_ylabel(f"ΔRSCU ({metric} high − genome avg)")
+    ax.set_ylabel(f"ΔRSCU ({metric} high − {ref_label})")
     ax.set_xlabel("Codon")
 
     # Add amino acid group separators
@@ -1482,7 +1494,7 @@ def plot_delta_rscu_heatmap(
         ax.axvline(idx - 0.5, color="gray", linewidth=0.3, alpha=0.5)
 
     if sample_id:
-        ax.set_title(f"ΔRSCU (High-Expression vs Genome Average, {metric}) — {sample_id}")
+        ax.set_title(f"ΔRSCU (high-expression vs {ref_label}, {metric}) — {sample_id}")
 
     fig.tight_layout()
     _save_fig(fig, output_path)
@@ -1567,6 +1579,7 @@ def plot_cog_enrichment(
     cog_enrich_df: pd.DataFrame,
     output_path: Path,
     sample_id: str = "",
+    title: str | None = None,
 ):
     """Grouped bar chart of COG category enrichment in expression tiers.
 
@@ -1574,6 +1587,7 @@ def plot_cog_enrichment(
         cog_enrich_df: DataFrame from compute_cog_enrichment.
         output_path: Base path for saving.
         sample_id: Sample name for title.
+        title: Optional override title.
     """
     _apply_style()
     if cog_enrich_df.empty:
@@ -1620,7 +1634,9 @@ def plot_cog_enrichment(
                        Patch(facecolor="#1f77b4", label="Low-expression")]
     ax.legend(handles=legend_elements, fontsize=8, loc="lower right")
 
-    if sample_id:
+    if title:
+        ax.set_title(title)
+    elif sample_id:
         ax.set_title(f"COG Category Enrichment by Expression Tier — {sample_id}")
 
     fig.tight_layout()
@@ -2258,8 +2274,8 @@ def plot_position_effects(
                     axis.text(0.5, 0.95 - (0.1 if label2 == "5' vs 3'" else 0.05), sig_str,
                              transform=axis.transAxes, fontsize=8, ha="center",
                              bbox=dict(boxstyle="round", facecolor="yellow", alpha=0.3))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Plot generation failed: %s", e)
 
         axis.set_ylabel("Fop", fontsize=10)
         axis.grid(True, alpha=0.3, axis="y")
@@ -2812,23 +2828,24 @@ def plot_rp_vs_he_rscu(
     expr_df: pd.DataFrame,
     output_path: Path,
     sample_id: str = "",
+    ref_label: str = "Ribosomal proteins",
+    ref_color: str = "#4a90d9",
 ):
-    """Grouped bar chart comparing RSCU across ribosomal, high-expression, and genome-average gene sets.
+    """Grouped bar chart comparing RSCU across a reference set, high-expression, and genome-average gene sets.
 
     For each codon (grouped by amino acid family), three bars show:
       - genome-wide median RSCU (gray)
       - high-expression genes median RSCU (orange)
-      - ribosomal protein RSCU (blue)
-
-    This reveals which codons are differentially preferred by the
-    translational apparatus vs. other highly expressed genes.
+      - reference set RSCU (blue by default)
 
     Args:
         rscu_gene_df: Per-gene RSCU table (gene + 59 RSCU columns).
-        rscu_rp: Dict of concatenated ribosomal protein RSCU values.
+        rscu_rp: Dict of concatenated reference RSCU values (RP or Mahalanobis cluster).
         expr_df: Expression table with gene and CAI_class columns.
         output_path: Base path for saving.
         sample_id: Sample identifier.
+        ref_label: Legend label for the reference RSCU bars.
+        ref_color: Bar color for the reference RSCU bars.
     """
     _apply_style()
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns and c in rscu_rp]
@@ -2851,7 +2868,7 @@ def plot_rp_vs_he_rscu(
         return
     he_median = rscu_gene_df.loc[he_mask, rscu_cols].median()
 
-    # Ribosomal RSCU
+    # Reference RSCU
     rp_vals = pd.Series({c: rscu_rp[c] for c in rscu_cols})
 
     # Build grouped data
@@ -2866,14 +2883,14 @@ def plot_rp_vs_he_rscu(
     ax.bar(x, he_median[rscu_cols].values, bar_w,
            label="High-expression", color="#e8853d", edgecolor="white", linewidth=0.3)
     ax.bar(x + bar_w, rp_vals[rscu_cols].values, bar_w,
-           label="Ribosomal proteins", color="#4a90d9", edgecolor="white", linewidth=0.3)
+           label=ref_label, color=ref_color, edgecolor="white", linewidth=0.3)
 
     ax.set_xticks(x)
     ax.set_xticklabels([c.split("-")[-1] for c in rscu_cols], rotation=90, fontsize=6)
     ax.set_ylabel("RSCU")
     ax.axhline(1.0, color="black", linestyle=":", linewidth=0.8, alpha=0.4)
     ax.legend(fontsize=8, loc="upper right")
-    ax.set_title(f"Codon usage: ribosomal vs high-expression genes — {sample_id}")
+    ax.set_title(f"Codon usage: {ref_label.lower()} vs high-expression genes — {sample_id}")
 
     # Add amino acid family separators
     _add_aa_family_spans(ax, rscu_cols, n)
@@ -2888,8 +2905,9 @@ def plot_rp_he_rscu_scatter(
     expr_df: pd.DataFrame,
     output_path: Path,
     sample_id: str = "",
+    ref_label: str = "Ribosomal protein",
 ):
-    """Scatter of ribosomal vs high-expression RSCU per codon.
+    """Scatter of reference-set vs high-expression RSCU per codon.
 
     Each point is one codon.  The diagonal means identical preference.
     Points off the diagonal highlight codons with divergent usage between
@@ -2897,10 +2915,11 @@ def plot_rp_he_rscu_scatter(
 
     Args:
         rscu_gene_df: Per-gene RSCU table.
-        rscu_rp: Concatenated ribosomal RSCU dict.
+        rscu_rp: Concatenated reference RSCU dict (RP or Mahalanobis cluster).
         expr_df: Expression table with CAI_class.
         output_path: Base path for saving.
         sample_id: Sample identifier.
+        ref_label: Axis / title label for the reference set.
     """
     _apply_style()
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns and c in rscu_rp]
@@ -2937,7 +2956,7 @@ def plot_rp_he_rscu_scatter(
         ax.scatter(rp_vals[c], he_median[c], s=50, c=[col_to_color[c]],
                    edgecolors="black", linewidth=0.3, zorder=3)
 
-    # Label outliers (codons where RP and HE differ most)
+    # Label outliers (codons where ref and HE differ most)
     diffs = abs(rp_vals - he_median)
     threshold = diffs.quantile(0.85)
     for c in rscu_cols:
@@ -2953,9 +2972,9 @@ def plot_rp_he_rscu_scatter(
     ax.set_xlim(0, lim_max)
     ax.set_ylim(0, lim_max)
 
-    ax.set_xlabel("Ribosomal protein RSCU")
+    ax.set_xlabel(f"{ref_label} RSCU")
     ax.set_ylabel("High-expression gene RSCU")
-    ax.set_title(f"Ribosomal vs high-expression codon preference — {sample_id}")
+    ax.set_title(f"{ref_label} vs high-expression codon preference — {sample_id}")
 
     # Spearman correlation
     rho, pval = stats.spearmanr(rp_vals[rscu_cols], he_median[rscu_cols])
@@ -2973,19 +2992,20 @@ def plot_rp_he_delta_heatmap(
     expr_df: pd.DataFrame,
     output_path: Path,
     sample_id: str = "",
+    ref_label: str = "Ribosomal",
 ):
-    """Heatmap of ΔRSCU (deviation from genome average) for ribosomal and high-expression genes.
+    """Heatmap of ΔRSCU (deviation from genome average) for a reference set and high-expression genes.
 
-    Two columns per amino acid family: one for ribosomal proteins, one for
-    high-expression genes.  Blue = underused relative to genome, red = overused.
-    Highlights codons under different selection pressures in each class.
+    Two columns: one for the reference set, one for high-expression genes.
+    Blue = underused relative to genome, red = overused.
 
     Args:
         rscu_gene_df: Per-gene RSCU table.
-        rscu_rp: Concatenated ribosomal RSCU dict.
+        rscu_rp: Concatenated reference RSCU dict (RP or Mahalanobis cluster).
         expr_df: Expression table with CAI_class.
         output_path: Base path for saving.
         sample_id: Sample identifier.
+        ref_label: Column header label for the reference set.
     """
     _apply_style()
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns and c in rscu_rp]
@@ -3009,9 +3029,9 @@ def plot_rp_he_delta_heatmap(
     delta_rp = rp_vals - genome_median
     delta_he = he_median - genome_median
 
-    # Build matrix: rows = codons, columns = [RP, HE]
+    # Build matrix: rows = codons, columns = [ref, HE]
     mat = pd.DataFrame({
-        "Ribosomal": delta_rp[rscu_cols].values,
+        ref_label: delta_rp[rscu_cols].values,
         "High-expression": delta_he[rscu_cols].values,
     }, index=[c.split("-")[-1] for c in rscu_cols])
 
@@ -3024,7 +3044,7 @@ def plot_rp_he_delta_heatmap(
         annot=True, fmt=".2f", annot_kws={"size": 6},
     )
     ax.set_ylabel("Codon")
-    ax.set_title(f"ΔRSCU from genome average — {sample_id}", fontsize=11)
+    ax.set_title(f"ΔRSCU from genome average ({ref_label.lower()} ref) — {sample_id}", fontsize=11)
     ax.tick_params(axis="y", labelsize=7)
 
     fig.tight_layout()
@@ -3173,10 +3193,12 @@ def plot_mge_vs_core_rscu(
     expr_df: pd.DataFrame | None,
     output_path: Path,
     sample_id: str = "",
+    mahal_cluster_rscu: dict[str, float] | None = None,
 ):
     """Violin plots comparing codon usage metrics between MGE-associated and core genome genes.
 
-    Four panels: ENC, GC3, Mahalanobis distance, and CAI (if available).
+    Panels: ENC, GC3, Mahalanobis distance, expression metric (if available),
+    and Euclidean distance from Mahalanobis cluster RSCU (if provided).
     Genes are split into MGE (mobilome + phage), other HGT candidates, and
     core genome.  Mann-Whitney p-values annotated.
 
@@ -3188,6 +3210,9 @@ def plot_mge_vs_core_rscu(
         expr_df: Expression table (optional, for CAI).
         output_path: Base path for saving.
         sample_id: Sample identifier.
+        mahal_cluster_rscu: Optional Mahalanobis cluster RSCU dict. When
+            provided, a per-gene Euclidean distance to the cluster RSCU
+            is added as an extra panel.
     """
     _apply_style()
     if hgt_df is None or hgt_df.empty:
@@ -3224,6 +3249,20 @@ def plot_mge_vs_core_rscu(
     if _expr_col is not None:
         merged = merged.merge(expr_df[["gene", _expr_col]], on="gene", how="left")
 
+    # Per-gene Euclidean distance from Mahalanobis cluster RSCU
+    if mahal_cluster_rscu is not None and rscu_gene_df is not None:
+        _mc_cols = [c for c in RSCU_COLUMN_NAMES
+                    if c in rscu_gene_df.columns and c in mahal_cluster_rscu]
+        if len(_mc_cols) >= 10:
+            _mc_ref = np.array([mahal_cluster_rscu[c] for c in _mc_cols])
+            _gene_rscu = rscu_gene_df.set_index("gene")[_mc_cols]
+            _dists = np.sqrt(((_gene_rscu.values - _mc_ref) ** 2).sum(axis=1))
+            _dist_df = pd.DataFrame({
+                "gene": _gene_rscu.index,
+                "mahal_cluster_rscu_dist": _dists,
+            })
+            merged = merged.merge(_dist_df, on="gene", how="left")
+
     def _assign_class(gene):
         if gene in mge_genes:
             return "MGE/phage"
@@ -3244,6 +3283,8 @@ def plot_mge_vs_core_rscu(
         panels.append(("mahalanobis_dist", "Mahalanobis distance"))
     if _expr_col is not None and _expr_col in merged.columns:
         panels.append((_expr_col, _expr_col))
+    if "mahal_cluster_rscu_dist" in merged.columns:
+        panels.append(("mahal_cluster_rscu_dist", "Dist. from Mahal. cluster RSCU"))
 
     if not panels:
         return
@@ -3333,8 +3374,8 @@ def _get_gene_positions(
                 pos_df = pos_df[pos_df["gene"].isin(gene_set)].sort_values("position")
                 if len(pos_df) > 10:
                     return pos_df.reset_index(drop=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Plot generation failed: %s", e)
 
     # Fallback: gene order as position
     if genes_ordered:
@@ -3377,56 +3418,48 @@ def generate_single_genome_plots(
     # Each plot is wrapped in try/except so one failure doesn't crash
     # the entire genome pipeline — analytical data is already saved to disk.
 
-    if freq_df is not None and not freq_df.empty:
-        try:
-            p = plot_dir / f"{sample_id}_codon_frequency"
-            plot_codon_frequency_bar(freq_df, p, sample_id)
-            outputs["codon_frequency_bar"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Codon frequency bar plot failed: %s", e)
-    else:
-        logger.info("SKIPPED: codon frequency bar plot (no frequency data)")
+    # ── Three-version RSCU plots ──────────────────────────────────────
+    # Build a list of (suffix, label, freq_df, rscu_dict) tuples for each
+    # RSCU source so that codon_frequency_bar, rscu_heatmap_rounded, and
+    # rscu_bar are each produced in up to three variants.
+    _mahal_n = mahal_cluster_size if mahal_cluster_size else "?"
+    _rscu_variants: list[tuple[str, str, pd.DataFrame | None, dict | None]] = [
+        ("genome", "All CDS", freq_df, rscu_all),
+        ("ribosomal", "Ribosomal Proteins",
+         _rscu_to_freq_df(rscu_rp) if rscu_rp else None,
+         rscu_rp),
+        ("mahal", f"Mahalanobis cluster (n={_mahal_n})",
+         _rscu_to_freq_df(mahal_cluster_rscu) if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty else None,
+         dict(mahal_cluster_rscu) if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty else None),
+    ]
 
-    # Prefer Mahalanobis-cluster RSCU for the rounded heatmap; fall back to
-    # genome-wide frequency data when clustering was skipped or failed.
-    _heatmap_df = None
-    _heatmap_label = sample_id
-    if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty:
-        _heatmap_df = _mahal_rscu_to_freq_df(mahal_cluster_rscu)
-        _n = mahal_cluster_size if mahal_cluster_size else "?"
-        _heatmap_label = f"{sample_id} (Mahalanobis cluster, n={_n})"
-    elif freq_df is not None and not freq_df.empty:
-        _heatmap_df = freq_df
+    for suffix, label, var_freq_df, var_rscu_dict in _rscu_variants:
+        # Codon frequency bar
+        if var_freq_df is not None and not var_freq_df.empty:
+            try:
+                p = plot_dir / f"{sample_id}_codon_frequency_{suffix}"
+                plot_codon_frequency_bar(var_freq_df, p, f"{sample_id} — {label}")
+                outputs[f"codon_frequency_bar_{suffix}"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Codon frequency bar plot (%s) failed: %s", suffix, e)
 
-    if _heatmap_df is not None and not _heatmap_df.empty:
-        try:
-            p = plot_dir / f"{sample_id}_rscu_heatmap_rounded"
-            plot_rscu_heatmap_rounded(_heatmap_df, p, _heatmap_label)
-            outputs["rscu_heatmap_rounded"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Rounded RSCU heatmap failed: %s", e)
-    else:
-        logger.info("SKIPPED: rounded RSCU heatmap (no RSCU data)")
+        # Rounded-cell RSCU heatmap
+        if var_freq_df is not None and not var_freq_df.empty:
+            try:
+                p = plot_dir / f"{sample_id}_rscu_heatmap_rounded_{suffix}"
+                plot_rscu_heatmap_rounded(var_freq_df, p, f"{sample_id} — {label}")
+                outputs[f"rscu_heatmap_rounded_{suffix}"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Rounded RSCU heatmap (%s) failed: %s", suffix, e)
 
-    if rscu_all is not None:
-        try:
-            p = plot_dir / f"{sample_id}_rscu_all"
-            plot_rscu_bar(rscu_all, p, sample_id, "All CDS")
-            outputs["rscu_bar_all"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("RSCU bar plot (all CDS) failed: %s", e)
-    else:
-        logger.info("SKIPPED: RSCU bar plot — all CDS (no RSCU data)")
-
-    if rscu_rp is not None:
-        try:
-            p = plot_dir / f"{sample_id}_rscu_ribosomal"
-            plot_rscu_bar(rscu_rp, p, sample_id, "Ribosomal Proteins")
-            outputs["rscu_bar_rp"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("RSCU bar plot (ribosomal) failed: %s", e)
-    else:
-        logger.info("SKIPPED: RSCU bar plot — ribosomal proteins (no ribosomal RSCU data)")
+        # RSCU bar chart
+        if var_rscu_dict:
+            try:
+                p = plot_dir / f"{sample_id}_rscu_{suffix}"
+                plot_rscu_bar(var_rscu_dict, p, sample_id, label)
+                outputs[f"rscu_bar_{suffix}"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("RSCU bar plot (%s) failed: %s", suffix, e)
 
     if rscu_gene_df is not None and not rscu_gene_df.empty:
         try:
@@ -3486,32 +3519,54 @@ def generate_single_genome_plots(
     else:
         logger.info("SKIPPED: expression distribution and tier plots (no expression data)")
 
-    # ── Ribosomal vs high-expression codon usage plots ──────────────
-    if (rscu_gene_df is not None and not rscu_gene_df.empty
-            and rscu_rp is not None
-            and expr_df is not None and not expr_df.empty):
-        try:
-            p = plot_dir / f"{sample_id}_rp_vs_he_rscu"
-            plot_rp_vs_he_rscu(rscu_gene_df, rscu_rp, expr_df, p, sample_id)
-            outputs["rp_vs_he_rscu"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("RP vs HE RSCU bar plot failed: %s", e)
+    # ── Reference-set vs high-expression codon usage plots ──────────
+    # Two versions: RP reference and Mahalanobis cluster reference.
+    _ref_variants: list[tuple[str, str, str, dict | None]] = [
+        ("rp", "Ribosomal proteins", "Ribosomal", rscu_rp),
+    ]
+    if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty:
+        _mahal_dict = dict(mahal_cluster_rscu)
+        _ref_variants.append(
+            ("mahal", f"Mahalanobis cluster (n={_mahal_n})", "Mahal. cluster", _mahal_dict),
+        )
+
+    for _ref_sfx, _ref_bar_label, _ref_short, _ref_rscu in _ref_variants:
+        if (rscu_gene_df is None or rscu_gene_df.empty
+                or _ref_rscu is None
+                or expr_df is None or expr_df.empty):
+            logger.info("SKIPPED: %s vs high-expression plots (missing data)", _ref_sfx)
+            continue
 
         try:
-            p = plot_dir / f"{sample_id}_rp_he_rscu_scatter"
-            plot_rp_he_rscu_scatter(rscu_gene_df, rscu_rp, expr_df, p, sample_id)
-            outputs["rp_he_rscu_scatter"] = p.with_suffix(".png")
+            p = plot_dir / f"{sample_id}_{_ref_sfx}_vs_he_rscu"
+            plot_rp_vs_he_rscu(
+                rscu_gene_df, _ref_rscu, expr_df, p, sample_id,
+                ref_label=_ref_bar_label,
+                ref_color="#4a90d9" if _ref_sfx == "rp" else "#6a9f58",
+            )
+            outputs[f"{_ref_sfx}_vs_he_rscu"] = p.with_suffix(".png")
         except Exception as e:
-            logger.warning("RP vs HE RSCU scatter failed: %s", e)
+            logger.warning("%s vs HE RSCU bar plot failed: %s", _ref_sfx, e)
 
         try:
-            p = plot_dir / f"{sample_id}_rp_he_delta_heatmap"
-            plot_rp_he_delta_heatmap(rscu_gene_df, rscu_rp, expr_df, p, sample_id)
-            outputs["rp_he_delta_heatmap"] = p.with_suffix(".png")
+            p = plot_dir / f"{sample_id}_{_ref_sfx}_he_rscu_scatter"
+            plot_rp_he_rscu_scatter(
+                rscu_gene_df, _ref_rscu, expr_df, p, sample_id,
+                ref_label=_ref_bar_label,
+            )
+            outputs[f"{_ref_sfx}_he_rscu_scatter"] = p.with_suffix(".png")
         except Exception as e:
-            logger.warning("RP/HE ΔRSCU heatmap failed: %s", e)
-    else:
-        logger.info("SKIPPED: ribosomal vs high-expression plots (missing RSCU, RP, or expression data)")
+            logger.warning("%s vs HE RSCU scatter failed: %s", _ref_sfx, e)
+
+        try:
+            p = plot_dir / f"{sample_id}_{_ref_sfx}_he_delta_heatmap"
+            plot_rp_he_delta_heatmap(
+                rscu_gene_df, _ref_rscu, expr_df, p, sample_id,
+                ref_label=_ref_short,
+            )
+            outputs[f"{_ref_sfx}_he_delta_heatmap"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("%s/HE ΔRSCU heatmap failed: %s", _ref_sfx, e)
 
     # Enrichment plots
     if enrichment_results:
@@ -3581,10 +3636,16 @@ def generate_single_genome_plots(
 
     # ── Bio/Ecology plots ────────────────────────────────────────────────
     if bio_ecology_results:
+        _mahal_dict_for_bio = (
+            dict(mahal_cluster_rscu)
+            if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty
+            else None
+        )
         _generate_bio_ecology_plots(
             bio_ecology_results, plot_dir, sample_id, outputs,
             rscu_gene_df=rscu_gene_df, enc_df=enc_df,
             expr_df=expr_df, gff_path=gff_path,
+            mahal_cluster_rscu=_mahal_dict_for_bio,
         )
     else:
         logger.info("SKIPPED: bio/ecology plots (no bio/ecology analysis data)")
@@ -3677,7 +3738,7 @@ def _generate_advanced_plots(
     else:
         logger.info("SKIPPED: PR2 plot (no PR2 data)")
 
-    # Delta RSCU heatmaps
+    # Delta RSCU heatmaps — genome-average baseline
     for metric in ["CAI", "MELP", "Fop"]:
         key = f"delta_rscu_{metric}"
         if key in adv:
@@ -3687,6 +3748,20 @@ def _generate_advanced_plots(
                 outputs[f"delta_rscu_{metric.lower()}"] = p.with_suffix(".png")
             except Exception as e:
                 logger.warning("Delta RSCU %s plot failed: %s", metric, e)
+
+    # Delta RSCU heatmaps — Mahalanobis cluster baseline
+    for metric in ["CAI", "MELP", "Fop", "expression"]:
+        key = f"delta_rscu_{metric}_mahal_ref"
+        if key in adv:
+            try:
+                p = plot_dir / f"{sample_id}_delta_rscu_{metric.lower()}_mahal_ref"
+                plot_delta_rscu_heatmap(
+                    adv[key], p, sample_id, metric,
+                    ref_label="Mahal. cluster",
+                )
+                outputs[f"delta_rscu_{metric.lower()}_mahal_ref"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Delta RSCU %s (Mahal. ref) plot failed: %s", metric, e)
 
     # tRNA-codon correlation
     if "trna_codon_correlation" in adv:
@@ -3699,15 +3774,26 @@ def _generate_advanced_plots(
     else:
         logger.info("SKIPPED: tRNA-codon correlation plot (no tRNA data)")
 
-    # COG enrichment
-    if "cog_enrichment" in adv:
-        try:
-            p = plot_dir / f"{sample_id}_cog_enrichment"
-            plot_cog_enrichment(adv["cog_enrichment"], p, sample_id)
-            outputs["cog_enrichment"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("COG enrichment plot failed: %s", e)
-    else:
+    # COG enrichment — RP-based and Mahalanobis-based variants
+    _cog_variants = [
+        ("cog_enrichment_rp", "RP-based tiers"),
+        ("cog_enrichment", "RP-based tiers"),  # fallback if _rp key absent
+        ("cog_enrichment_mahal", "Mahalanobis-based tiers"),
+    ]
+    _cog_plotted = set()
+    for cog_key, cog_label in _cog_variants:
+        if cog_key in adv and cog_key not in _cog_plotted:
+            try:
+                p = plot_dir / f"{sample_id}_{cog_key}"
+                plot_cog_enrichment(
+                    adv[cog_key], p, sample_id,
+                    title=f"COG Enrichment ({cog_label}) — {sample_id}",
+                )
+                outputs[cog_key] = p.with_suffix(".png")
+                _cog_plotted.add(cog_key)
+            except Exception as e:
+                logger.warning("COG enrichment plot (%s) failed: %s", cog_key, e)
+    if not _cog_plotted:
         logger.info("SKIPPED: COG enrichment plot (no COG enrichment data)")
 
     # Gene length vs bias
@@ -3731,6 +3817,7 @@ def _generate_bio_ecology_plots(
     enc_df: pd.DataFrame | None = None,
     expr_df: pd.DataFrame | None = None,
     gff_path: Path | None = None,
+    mahal_cluster_rscu: dict[str, float] | None = None,
 ):
     """Generate bio/ecology analysis plots from pre-computed data.
 
@@ -3849,6 +3936,7 @@ def _generate_bio_ecology_plots(
             plot_mge_vs_core_rscu(
                 rscu_gene_df, enc_df, hgt_data, phage_data, expr_df,
                 p, sample_id,
+                mahal_cluster_rscu=mahal_cluster_rscu,
             )
             outputs["mge_vs_core_rscu"] = p.with_suffix(".png")
         except Exception as e:
@@ -3952,32 +4040,40 @@ def _load_sample_data(
         if p and Path(p).exists():
             try:
                 entry["rscu_median"] = pd.read_csv(p, sep="\t")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Plot generation failed: %s", e)
 
         # Ribosomal RSCU
         p = paths.get("rscu_ribosomal")
         if p and Path(p).exists():
             try:
                 entry["rscu_ribosomal"] = pd.read_csv(p, sep="\t")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Plot generation failed: %s", e)
+
+        # Mahalanobis cluster RSCU
+        p = paths.get("rscu_mahal_cluster")
+        if p and Path(p).exists():
+            try:
+                entry["rscu_mahal_cluster"] = pd.read_csv(p, sep="\t", index_col=0)
+            except Exception as e:
+                logger.debug("Plot generation failed: %s", e)
 
         # ENC
         p = paths.get("enc")
         if p and Path(p).exists():
             try:
                 entry["enc"] = pd.read_csv(p, sep="\t")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Plot generation failed: %s", e)
 
         # Expression
         p = paths.get("expression_combined")
         if p and Path(p).exists():
             try:
                 entry["expression"] = pd.read_csv(p, sep="\t")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Plot generation failed: %s", e)
 
         # Enrichment results
         enrich = {}
@@ -3985,8 +4081,8 @@ def _load_sample_data(
             if key.startswith("enrichment_") and ep and Path(ep).exists():
                 try:
                     enrich[key] = pd.read_csv(ep, sep="\t")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Plot generation failed: %s", e)
         if enrich:
             entry["enrichment"] = enrich
 
@@ -3997,8 +4093,8 @@ def _load_sample_data(
                 try:
                     entry["hgt"] = pd.read_csv(p, sep="\t")
                     break
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Plot generation failed: %s", e)
 
         # Phage/mobile elements
         for key in ("bio_phage_mobile_elements_path", "bio_phage_mobile_elements", "phage_mobile_elements"):
@@ -4007,8 +4103,8 @@ def _load_sample_data(
                 try:
                     entry["phage_mobile"] = pd.read_csv(p, sep="\t")
                     break
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Plot generation failed: %s", e)
 
         # Strand asymmetry
         for key in ("bio_strand_asymmetry_path", "bio_strand_asymmetry", "strand_asymmetry"):
@@ -4017,8 +4113,8 @@ def _load_sample_data(
                 try:
                     entry["strand_asymmetry"] = pd.read_csv(p, sep="\t")
                     break
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Plot generation failed: %s", e)
 
         # Operon coadaptation
         for key in ("bio_operon_coadaptation_path", "bio_operon_coadaptation", "operon_coadaptation"):
@@ -4027,8 +4123,8 @@ def _load_sample_data(
                 try:
                     entry["operon_coadaptation"] = pd.read_csv(p, sep="\t")
                     break
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Plot generation failed: %s", e)
 
         # Growth rate
         for key in ("bio_growth_rate_prediction_path", "bio_growth_rate_prediction"):
@@ -4038,15 +4134,16 @@ def _load_sample_data(
                     import json as _json
                     entry["growth_rate"] = _json.loads(Path(p).read_text())
                     break
-                except Exception:
+                except Exception as e:
+                    logger.debug("Plot generation failed: %s", e)
                     # Growth rate TSV is also common
                     try:
                         _gr_df = pd.read_csv(p, sep="\t")
                         if not _gr_df.empty:
                             entry["growth_rate"] = _gr_df.iloc[0].to_dict()
                         break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Plot generation failed: %s", e)
 
         # gRodon2 prediction
         for key in ("bio_grodon2_prediction_path", "bio_grodon2_prediction"):
@@ -4057,8 +4154,8 @@ def _load_sample_data(
                     if not _gd_df.empty:
                         entry["grodon2"] = _gd_df.iloc[0].to_dict()
                     break
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Plot generation failed: %s", e)
 
         # Translational selection - optimal codons
         for key in ("bio_trans_sel_optimal_codons_path", "bio_trans_sel_optimal_codons"):
@@ -4067,45 +4164,87 @@ def _load_sample_data(
                 try:
                     entry["optimal_codons"] = pd.read_csv(p, sep="\t")
                     break
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Plot generation failed: %s", e)
 
         # Codon frequency table
         p = paths.get("codon_frequency")
         if p and Path(p).exists():
             try:
                 entry["codon_frequency"] = pd.read_csv(p, sep="\t")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Plot generation failed: %s", e)
 
         data[sid] = entry
 
     return data
 
 
+def _extract_rscu_profiles(
+    sample_data: dict[str, dict],
+    source: str,
+) -> dict[str, dict[str, float]]:
+    """Extract per-sample RSCU profiles from loaded sample data.
+
+    Args:
+        sample_data: Per-sample data from ``_load_sample_data``.
+        source: One of ``"genome"`` (median RSCU), ``"ribosomal"``, or
+            ``"mahal"`` (Mahalanobis cluster).
+
+    Returns:
+        Dict mapping sample_id → {RSCU_col_name: value}.
+    """
+    key_map = {
+        "genome": "rscu_median",
+        "ribosomal": "rscu_ribosomal",
+        "mahal": "rscu_mahal_cluster",
+    }
+    data_key = key_map.get(source, source)
+    profiles: dict[str, dict[str, float]] = {}
+
+    for sid, entry in sorted(sample_data.items()):
+        df = entry.get(data_key)
+        if df is None:
+            continue
+        rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
+        if rscu_cols and len(df) > 0:
+            profiles[sid] = {c: df[c].iloc[0] for c in rscu_cols}
+        elif "RSCU" in df.columns:
+            # Mahalanobis format: RSCU column names as index, single RSCU column
+            idx_cols = [c for c in df.index if c in RSCU_COLUMN_NAMES]
+            if idx_cols:
+                profiles[sid] = {c: float(df.loc[c, "RSCU"]) for c in idx_cols}
+
+    return profiles
+
+
 def plot_pairwise_rscu_overlay(
     sample_data: dict[str, dict],
     output_path: Path,
+    profiles: dict[str, dict[str, float]] | None = None,
+    title: str = "Genome-wide RSCU comparison",
 ):
     """Overlaid RSCU bar chart comparing all genomes.
 
-    Each genome's genome-wide median RSCU is plotted as a semi-transparent
-    colored bar.  Shared preferences appear as tall stacked bars; divergent
-    codons show up as mismatched heights.
+    Each genome's RSCU is plotted as a semi-transparent colored bar.
 
     Args:
         sample_data: Per-sample data from _load_sample_data().
         output_path: Base path for saving.
+        profiles: Pre-extracted RSCU profiles.  When provided, ``sample_data``
+            is ignored for profile extraction.
+        title: Plot title.
     """
     _apply_style()
-    sids = sorted(sample_data.keys())
-    profiles = {}
-    for sid in sids:
-        df = sample_data[sid].get("rscu_median")
-        if df is not None:
-            rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
-            if rscu_cols and len(df) > 0:
-                profiles[sid] = {c: df[c].iloc[0] for c in rscu_cols}
+    if profiles is None:
+        sids = sorted(sample_data.keys())
+        profiles = {}
+        for sid in sids:
+            df = sample_data[sid].get("rscu_median")
+            if df is not None:
+                rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
+                if rscu_cols and len(df) > 0:
+                    profiles[sid] = {c: df[c].iloc[0] for c in rscu_cols}
 
     if len(profiles) < 2:
         return
@@ -4131,7 +4270,7 @@ def plot_pairwise_rscu_overlay(
     ax.set_xticklabels([c.split("-")[-1] for c in common_cols], rotation=90, fontsize=6)
     ax.axhline(1.0, color="black", linestyle=":", linewidth=0.8, alpha=0.4)
     ax.set_ylabel("RSCU")
-    ax.set_title("Genome-wide RSCU comparison")
+    ax.set_title(title)
     ax.legend(fontsize=7, loc="upper right", ncol=min(n_samples, 4))
 
     _add_aa_family_spans(ax, common_cols, n)
@@ -4142,6 +4281,8 @@ def plot_pairwise_rscu_overlay(
 def plot_pairwise_rscu_delta_heatmap(
     sample_data: dict[str, dict],
     output_path: Path,
+    profiles: dict[str, dict[str, float]] | None = None,
+    title: str = "Pairwise RSCU differences",
 ):
     """Heatmap of ΔRSCU between genomes.
 
@@ -4153,16 +4294,20 @@ def plot_pairwise_rscu_delta_heatmap(
     Args:
         sample_data: Per-sample data from _load_sample_data().
         output_path: Base path for saving.
+        profiles: Pre-extracted RSCU profiles.  When provided, ``sample_data``
+            is ignored for profile extraction.
+        title: Plot title.
     """
     _apply_style()
-    sids = sorted(sample_data.keys())
-    profiles = {}
-    for sid in sids:
-        df = sample_data[sid].get("rscu_median")
-        if df is not None:
-            rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
-            if rscu_cols and len(df) > 0:
-                profiles[sid] = {c: df[c].iloc[0] for c in rscu_cols}
+    if profiles is None:
+        sids = sorted(sample_data.keys())
+        profiles = {}
+        for sid in sids:
+            df = sample_data[sid].get("rscu_median")
+            if df is not None:
+                rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
+                if rscu_cols and len(df) > 0:
+                    profiles[sid] = {c: df[c].iloc[0] for c in rscu_cols}
 
     if len(profiles) < 2:
         return
@@ -4172,11 +4317,11 @@ def plot_pairwise_rscu_delta_heatmap(
         return
 
     # Build pairwise difference columns
+    sids = sorted(profiles.keys())
     pairs = []
     for i in range(len(sids)):
         for j in range(i + 1, len(sids)):
-            if sids[i] in profiles and sids[j] in profiles:
-                pairs.append((sids[i], sids[j]))
+            pairs.append((sids[i], sids[j]))
 
     if not pairs:
         return
@@ -4201,7 +4346,7 @@ def plot_pairwise_rscu_delta_heatmap(
         annot=len(pairs) <= 3, fmt=".2f", annot_kws={"size": 5},
     )
     ax.set_ylabel("Codon")
-    ax.set_title("Pairwise RSCU differences")
+    ax.set_title(title)
     ax.tick_params(axis="y", labelsize=6)
 
     fig.tight_layout()
@@ -4383,6 +4528,8 @@ def plot_expression_tier_comparison(
 def plot_enrichment_comparison_heatmap(
     sample_data: dict[str, dict],
     output_path: Path,
+    ref_prefix: str | None = None,
+    title_suffix: str = "",
 ):
     """Heatmap of pathway enrichment significance across genomes.
 
@@ -4392,6 +4539,9 @@ def plot_enrichment_comparison_heatmap(
     Args:
         sample_data: Per-sample data from _load_sample_data().
         output_path: Base path for saving.
+        ref_prefix: If set, only include enrichment keys that start with
+            this prefix (e.g. ``"rp_"`` or ``"mahal_"``).
+        title_suffix: Extra text appended to the title.
     """
     _apply_style()
     sids = sorted(sample_data.keys())
@@ -4401,6 +4551,8 @@ def plot_enrichment_comparison_heatmap(
     for sid in sids:
         enrichments = sample_data[sid].get("enrichment", {})
         for key, edf in enrichments.items():
+            if ref_prefix and not key.startswith(ref_prefix):
+                continue
             if edf.empty or "fdr" not in edf.columns:
                 continue
             metric_tier = key.replace("enrichment_", "")
@@ -4444,7 +4596,8 @@ def plot_enrichment_comparison_heatmap(
     )
     ax.set_xlabel("")
     ax.set_ylabel("")
-    ax.set_title(f"Pathway enrichment comparison (red line: FDR = 0.05)")
+    _title = f"Pathway enrichment comparison{title_suffix} (red line: FDR = 0.05)"
+    ax.set_title(_title)
     ax.tick_params(axis="y", labelsize=7)
 
     fig.tight_layout()
@@ -4633,91 +4786,103 @@ def plot_hgt_mge_comparison(
 def plot_rp_he_comparison_across_genomes(
     sample_data: dict[str, dict],
     output_path: Path,
+    ref_source: str = "ribosomal",
+    ref_label: str = "RP",
 ):
-    """Compare RP and high-expression RSCU profiles across genomes.
+    """Compare a reference-set RSCU profile against genome-wide RSCU across genomes.
 
-    For each genome, shows the Euclidean distance between its ribosomal
-    and high-expression RSCU profiles as a horizontal bar, plus the
-    correlation coefficient.  Reveals whether the RP/HE relationship
-    is conserved or divergent across genomes.
+    For each genome, shows the Euclidean distance between its reference-set
+    and genome-wide RSCU profiles as a horizontal bar, plus the correlation
+    coefficient.
 
     Args:
         sample_data: Per-sample data from _load_sample_data().
         output_path: Base path for saving.
+        ref_source: Key prefix in sample_data for the reference RSCU
+            (``"ribosomal"`` → ``rscu_ribosomal``,
+             ``"mahal"`` → ``rscu_mahal_cluster``).
+        ref_label: Short label for titles/axes (e.g. ``"RP"``,
+            ``"Mahal. cluster"``).
     """
     _apply_style()
+    _ref_data_key = {
+        "ribosomal": "rscu_ribosomal",
+        "mahal": "rscu_mahal_cluster",
+    }.get(ref_source, f"rscu_{ref_source}")
+
     sids = sorted(sample_data.keys())
     rows = []
     for sid in sids:
-        rp_df = sample_data[sid].get("rscu_ribosomal")
-        expr = sample_data[sid].get("expression")
-        enc_data = sample_data[sid].get("enc")
-
-        if rp_df is None or expr is None:
+        ref_df = sample_data[sid].get(_ref_data_key)
+        if ref_df is None:
             continue
 
-        rp_cols = [c for c in RSCU_COLUMN_NAMES if c in rp_df.columns]
-        if len(rp_cols) < 10 or len(rp_df) == 0:
+        # Extract reference RSCU values
+        ref_cols = [c for c in RSCU_COLUMN_NAMES if c in ref_df.columns]
+        if ref_cols and len(ref_df) > 0:
+            ref_vals = pd.Series({c: ref_df[c].iloc[0] for c in ref_cols})
+        elif "RSCU" in ref_df.columns:
+            idx_cols = [c for c in ref_df.index if c in RSCU_COLUMN_NAMES]
+            if idx_cols:
+                ref_vals = pd.Series({c: float(ref_df.loc[c, "RSCU"]) for c in idx_cols})
+            else:
+                continue
+        else:
             continue
 
-        rp_vals = pd.Series({c: rp_df[c].iloc[0] for c in rp_cols})
+        if len(ref_vals) < 10:
+            continue
 
-        # Load per-gene RSCU to compute HE median
-        rscu_all_path = sample_data[sid].get("rscu_median")
-        # We need per-gene RSCU to compute HE median — use rscu_median as genome reference
-        genome_vals = None
+        # Genome-wide RSCU
         rscu_median_df = sample_data[sid].get("rscu_median")
-        if rscu_median_df is not None and len(rscu_median_df) > 0:
-            genome_vals = pd.Series({c: rscu_median_df[c].iloc[0] for c in rp_cols
-                                     if c in rscu_median_df.columns})
-
-        if genome_vals is None:
+        if rscu_median_df is None or len(rscu_median_df) == 0:
             continue
+        genome_vals = pd.Series({c: rscu_median_df[c].iloc[0] for c in ref_vals.index
+                                 if c in rscu_median_df.columns})
 
-        # Euclidean distance RP vs genome
-        shared = sorted(set(rp_vals.index) & set(genome_vals.index))
+        shared = sorted(set(ref_vals.index) & set(genome_vals.index))
         if len(shared) < 10:
             continue
 
-        rp_v = np.array([rp_vals[c] for c in shared])
+        ref_v = np.array([ref_vals[c] for c in shared])
         gn_v = np.array([genome_vals[c] for c in shared])
-        mask = np.isfinite(rp_v) & np.isfinite(gn_v)
+        mask = np.isfinite(ref_v) & np.isfinite(gn_v)
 
         if mask.sum() < 10:
             continue
 
-        dist = np.sqrt(np.sum((rp_v[mask] - gn_v[mask]) ** 2))
-        rho, _ = stats.spearmanr(rp_v[mask], gn_v[mask])
+        dist = np.sqrt(np.sum((ref_v[mask] - gn_v[mask]) ** 2))
+        rho, _ = stats.spearmanr(ref_v[mask], gn_v[mask])
 
         rows.append({
             "sample_id": sid,
-            "rp_genome_distance": dist,
-            "rp_genome_rho": rho,
+            "ref_genome_distance": dist,
+            "ref_genome_rho": rho,
         })
 
     if len(rows) < 2:
         return
 
-    df = pd.DataFrame(rows).sort_values("rp_genome_distance")
+    df = pd.DataFrame(rows).sort_values("ref_genome_distance")
     palette = sns.color_palette("Set2", len(df))
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, max(4, len(df) * 0.5 + 1)))
 
     # Distance bars
-    ax1.barh(df["sample_id"], df["rp_genome_distance"],
+    ax1.barh(df["sample_id"], df["ref_genome_distance"],
              color=palette, edgecolor="white", linewidth=0.5)
-    ax1.set_xlabel("Euclidean distance\n(RP vs genome RSCU)")
-    ax1.set_title("RP codon usage\ndivergence from genome")
+    ax1.set_xlabel(f"Euclidean distance\n({ref_label} vs genome RSCU)")
+    ax1.set_title(f"{ref_label} codon usage\ndivergence from genome")
 
     # Correlation dots
-    ax2.scatter(df["rp_genome_rho"], df["sample_id"], s=80,
+    ax2.scatter(df["ref_genome_rho"], df["sample_id"], s=80,
                 color=palette, edgecolors="black", linewidth=0.5, zorder=3)
     ax2.axvline(1.0, color="gray", linestyle=":", alpha=0.4)
-    ax2.set_xlabel("Spearman ρ\n(RP vs genome RSCU)")
-    ax2.set_title("RP–genome\ncorrelation")
-    ax2.set_xlim(min(df["rp_genome_rho"].min() - 0.05, 0.5), 1.05)
+    ax2.set_xlabel(f"Spearman ρ\n({ref_label} vs genome RSCU)")
+    ax2.set_title(f"{ref_label}–genome\ncorrelation")
+    ax2.set_xlim(min(df["ref_genome_rho"].min() - 0.05, 0.5), 1.05)
 
-    fig.suptitle("Ribosomal protein codon usage across genomes", fontsize=12, y=1.02)
+    fig.suptitle(f"{ref_label} codon usage across genomes", fontsize=12, y=1.02)
     fig.tight_layout()
     _save_fig(fig, output_path)
 
@@ -5366,21 +5531,41 @@ def generate_pairwise_comparison_plots(
 
     logger.info("Generating qualitative comparison plots for %d genomes", len(sample_data))
 
-    # RSCU overlay comparison
-    try:
-        p = plot_dir / "rscu_overlay"
-        plot_pairwise_rscu_overlay(sample_data, p)
-        outputs["rscu_overlay"] = p.with_suffix(".png")
-    except Exception as e:
-        logger.warning("RSCU overlay plot failed: %s", e)
+    # RSCU overlay + delta heatmap — three versions per RSCU source
+    _pw_rscu_variants = [
+        ("genome", "All CDS"),
+        ("ribosomal", "Ribosomal Proteins"),
+        ("mahal", "Mahalanobis cluster"),
+    ]
+    for src, label in _pw_rscu_variants:
+        profiles = _extract_rscu_profiles(sample_data, src)
+        if len(profiles) < 2:
+            logger.info("SKIPPED: pairwise %s plots (fewer than 2 profiles)", src)
+            continue
 
-    # RSCU difference heatmap
-    try:
-        p = plot_dir / "rscu_delta_heatmap"
-        plot_pairwise_rscu_delta_heatmap(sample_data, p)
-        outputs["rscu_delta_heatmap"] = p.with_suffix(".png")
-    except Exception as e:
-        logger.warning("RSCU delta heatmap failed: %s", e)
+        # Overlay
+        try:
+            p = plot_dir / f"rscu_overlay_{src}"
+            plot_pairwise_rscu_overlay(
+                sample_data, p,
+                profiles=profiles,
+                title=f"RSCU comparison — {label}",
+            )
+            outputs[f"rscu_overlay_{src}"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("RSCU overlay plot (%s) failed: %s", src, e)
+
+        # Delta heatmap
+        try:
+            p = plot_dir / f"rscu_delta_heatmap_{src}"
+            plot_pairwise_rscu_delta_heatmap(
+                sample_data, p,
+                profiles=profiles,
+                title=f"Pairwise RSCU differences — {label}",
+            )
+            outputs[f"rscu_delta_heatmap_{src}"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("RSCU delta heatmap (%s) failed: %s", src, e)
 
     # Genome metrics comparison
     try:
@@ -5398,13 +5583,20 @@ def generate_pairwise_comparison_plots(
     except Exception as e:
         logger.warning("Expression tier comparison failed: %s", e)
 
-    # Enrichment comparison heatmap
-    try:
-        p = plot_dir / "enrichment_comparison"
-        plot_enrichment_comparison_heatmap(sample_data, p)
-        outputs["enrichment_comparison"] = p.with_suffix(".png")
-    except Exception as e:
-        logger.warning("Enrichment comparison heatmap failed: %s", e)
+    # Enrichment comparison heatmaps — RP-based and Mahalanobis-based
+    for _epfx, _elbl, _esfx in [
+        ("rp_", " (RP-based)", "_rp"),
+        ("mahal_", " (Mahalanobis-based)", "_mahal"),
+    ]:
+        try:
+            p = plot_dir / f"enrichment_comparison{_esfx}"
+            plot_enrichment_comparison_heatmap(
+                sample_data, p,
+                ref_prefix=_epfx, title_suffix=_elbl,
+            )
+            outputs[f"enrichment_comparison{_esfx}"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Enrichment comparison heatmap (%s) failed: %s", _esfx, e)
 
     # Bio/ecology multi-panel comparison
     try:
@@ -5422,13 +5614,17 @@ def generate_pairwise_comparison_plots(
     except Exception as e:
         logger.warning("HGT/MGE comparison failed: %s", e)
 
-    # RP vs HE across genomes
-    try:
-        p = plot_dir / "rp_he_across_genomes"
-        plot_rp_he_comparison_across_genomes(sample_data, p)
-        outputs["rp_he_across_genomes"] = p.with_suffix(".png")
-    except Exception as e:
-        logger.warning("RP/HE comparison across genomes failed: %s", e)
+    # Reference-set vs genome RSCU across genomes (RP and Mahalanobis)
+    for _ref_src, _ref_lbl in [("ribosomal", "RP"), ("mahal", "Mahal. cluster")]:
+        try:
+            p = plot_dir / f"ref_he_across_genomes_{_ref_src}"
+            plot_rp_he_comparison_across_genomes(
+                sample_data, p,
+                ref_source=_ref_src, ref_label=_ref_lbl,
+            )
+            outputs[f"ref_he_across_genomes_{_ref_src}"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("%s vs genome comparison across genomes failed: %s", _ref_lbl, e)
 
     # ── Advanced comparative plots ──────────────────────────────────
 
