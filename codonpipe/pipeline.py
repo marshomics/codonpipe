@@ -310,6 +310,8 @@ def run_single_genome(
             logger.warning("Expression analysis failed: %s. Continuing.", e, exc_info=True)
     elif skip_expression:
         logger.info("[Step 6/12] Skipping expression analysis (--skip-expression)")
+    elif not skip_mahal:
+        logger.info("[Step 6/12] Deferring expression analysis to Step 9b (Mahalanobis reference)")
     else:
         logger.info("[Step 6/12] Skipping expression analysis (no ribosomal proteins found)")
 
@@ -331,6 +333,8 @@ def run_single_genome(
                     enrichment_results[f"rp_{key}"] = pd.read_csv(path, sep="\t")
         except Exception as e:
             logger.warning("Pathway enrichment failed: %s. Continuing.", e, exc_info=True)
+    elif not skip_mahal:
+        logger.info("[Step 7/12] Deferring pathway enrichment to Step 9c (Mahalanobis reference)")
     else:
         logger.info(
             "[Step 7/12] Skipping pathway enrichment (%s)",
