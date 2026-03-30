@@ -22,10 +22,7 @@ import logging
 from collections import Counter
 from pathlib import Path
 
-import warnings
-
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
