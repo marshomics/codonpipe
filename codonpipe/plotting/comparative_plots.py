@@ -2135,8 +2135,8 @@ def plot_grodon2_by_condition(
         try:
             stat, pval = kruskal(*groups)
             ax.set_title(f"Kruskal-Wallis p = {pval:.3g}", fontsize=10)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Kruskal-Wallis test failed: %s", e)
 
     ax.set_ylabel("gRodon2 Doubling Time (h)", fontsize=10)
     ax.set_xlabel("")
