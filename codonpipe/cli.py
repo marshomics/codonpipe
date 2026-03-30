@@ -57,6 +57,17 @@ def main():
 @click.option("--mahal-distance-multiplier", type=float, default=2.0, show_default=True,
               help="Mahalanobis cluster radius as a multiplier of the median RP distance. "
                    "Lower values (e.g. 1.5) produce a tighter cluster; higher values (e.g. 3.0) are more permissive.")
+@click.option("--run-stability", is_flag=True,
+              help="Run bootstrap stability analysis on the Mahalanobis cluster. "
+                   "Sweeps a grid of multipliers and reports per-gene membership frequency.")
+@click.option("--stability-bootstraps", type=int, default=100, show_default=True,
+              help="Number of bootstrap replicates per multiplier for stability analysis.")
+@click.option("--stability-multipliers", type=str, default=None,
+              help="Comma-separated multiplier values to test (e.g. '1.0,1.5,2.0,2.5,3.0'). "
+                   "Defaults to 1.0,1.25,1.5,1.75,2.0,2.5,3.0.")
+@click.option("--auto-select-multiplier", is_flag=True,
+              help="Automatically use the stability-recommended multiplier instead of "
+                   "--mahal-distance-multiplier. Requires --run-stability.")
 @click.option("--kegg-ko-pathway", type=click.Path(exists=True, path_type=Path), default=None,
               help="KO-to-pathway mapping TSV for offline enrichment (auto-downloaded from KEGG if omitted).")
 @click.option("--force", is_flag=True, help="Overwrite existing outputs.")
@@ -84,6 +95,10 @@ def run(
     mahal_min_k: int,
     mahal_max_k: int,
     mahal_distance_multiplier: float,
+    run_stability: bool,
+    stability_bootstraps: int,
+    stability_multipliers: str | None,
+    auto_select_multiplier: bool,
     kegg_ko_pathway: Path | None,
     force: bool,
     verbose: bool,
@@ -116,6 +131,15 @@ def run(
     if kofam_results is not None:
         skip_kofamscan = True
 
+    # Parse stability multipliers from comma-separated string
+    stab_mult_list = None
+    if stability_multipliers is not None:
+        try:
+            stab_mult_list = [float(x.strip()) for x in stability_multipliers.split(",")]
+        except ValueError:
+            logger.error("Invalid --stability-multipliers value: %s", stability_multipliers)
+            sys.exit(1)
+
     try:
         outputs = run_single_genome(
             genome_fasta=genome,
@@ -135,6 +159,10 @@ def run(
             mahal_min_k=mahal_min_k,
             mahal_max_k=mahal_max_k,
             mahal_distance_multiplier=mahal_distance_multiplier,
+            run_stability=run_stability,
+            stability_bootstraps=stability_bootstraps,
+            stability_multipliers=stab_mult_list,
+            auto_select_multiplier=auto_select_multiplier,
             kegg_ko_pathway=kegg_ko_pathway,
             gff_file=gff_file,
             force=force,
@@ -177,6 +205,14 @@ def run(
 @click.option("--mahal-distance-multiplier", type=float, default=2.0, show_default=True,
               help="Mahalanobis cluster radius as a multiplier of the median RP distance. "
                    "Lower values (e.g. 1.5) produce a tighter cluster; higher values (e.g. 3.0) are more permissive.")
+@click.option("--run-stability", is_flag=True,
+              help="Run bootstrap stability analysis on the Mahalanobis cluster.")
+@click.option("--stability-bootstraps", type=int, default=100, show_default=True,
+              help="Number of bootstrap replicates per multiplier for stability analysis.")
+@click.option("--stability-multipliers", type=str, default=None,
+              help="Comma-separated multiplier values to test (e.g. '1.0,1.5,2.0,2.5,3.0').")
+@click.option("--auto-select-multiplier", is_flag=True,
+              help="Automatically use the stability-recommended multiplier. Requires --run-stability.")
 @click.option("--kegg-ko-pathway", type=click.Path(exists=True, path_type=Path), default=None,
               help="KO-to-pathway mapping TSV for offline enrichment.")
 @click.option("--gff", "gff_file", type=click.Path(exists=True, path_type=Path), default=None,
@@ -203,6 +239,10 @@ def batch(
     mahal_min_k: int,
     mahal_max_k: int,
     mahal_distance_multiplier: float,
+    run_stability: bool,
+    stability_bootstraps: int,
+    stability_multipliers: str | None,
+    auto_select_multiplier: bool,
     kegg_ko_pathway: Path | None,
     gff_file: Path | None,
     force: bool,
@@ -239,6 +279,15 @@ def batch(
 
     from codonpipe.pipeline import run_batch
 
+    # Parse stability multipliers from comma-separated string
+    stab_mult_list = None
+    if stability_multipliers is not None:
+        try:
+            stab_mult_list = [float(x.strip()) for x in stability_multipliers.split(",")]
+        except ValueError:
+            logger.error("Invalid --stability-multipliers value: %s", stability_multipliers)
+            sys.exit(1)
+
     try:
         meta_cols = list(metadata_cols) if metadata_cols else None
         outputs = run_batch(
@@ -260,6 +309,10 @@ def batch(
             mahal_min_k=mahal_min_k,
             mahal_max_k=mahal_max_k,
             mahal_distance_multiplier=mahal_distance_multiplier,
+            run_stability=run_stability,
+            stability_bootstraps=stability_bootstraps,
+            stability_multipliers=stab_mult_list,
+            auto_select_multiplier=auto_select_multiplier,
             kegg_ko_pathway=kegg_ko_pathway,
             gff_file=gff_file,
             force=force,
