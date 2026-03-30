@@ -96,6 +96,7 @@ def run_single_genome(
     skip_mahal: bool = False,
     mahal_min_k: int = 2,
     mahal_max_k: int = 8,
+    mahal_distance_multiplier: float = 2.0,
     kegg_ko_pathway: Path | None = None,
     gff_file: Path | None = None,
     force: bool = False,
@@ -146,6 +147,9 @@ def run_single_genome(
         skip_mahal: Skip Mahalanobis codon usage clustering.
         mahal_min_k: Minimum Mahalanobis components to test (default 2).
         mahal_max_k: Maximum Mahalanobis components to test (default 8).
+        mahal_distance_multiplier: Threshold = multiplier × median RP
+            Mahalanobis distance (default 2.0).  Lower values produce a
+            tighter cluster; higher values are more permissive.
         kegg_ko_pathway: User-supplied KO-to-pathway mapping TSV for offline use.
         gff_file: GFF3 annotation file for tRNA extraction (auto-detected from
             Prokka output if omitted).
@@ -269,6 +273,10 @@ def run_single_genome(
         logger.info("[Step 5/12] Skipping CU bias statistics (--skip-expression)")
 
     # ── Step 6: Expression analysis ─────────────────────────────────────
+    # When Mahalanobis clustering is enabled (!skip_mahal), expression
+    # scoring is deferred to Step 9b so that genes are scored against the
+    # broader Mahalanobis cluster reference instead of RP-only IDs.
+    # Expression runs here only when Mahalanobis is skipped (skip_mahal=True).
     expr_df = None
     if not skip_expression and rp_ids_file and rp_ids_file.exists() and skip_mahal:
         logger.info("[Step 6/12] Running expression level prediction (MELP/CAI/Fop)")
@@ -405,6 +413,7 @@ def run_single_genome(
                 expr_df=expr_df,
                 min_k=mahal_min_k,
                 max_k=mahal_max_k,
+                distance_multiplier=mahal_distance_multiplier,
             )
 
             # Separate file paths from in-memory objects, but keep
