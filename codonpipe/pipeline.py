@@ -23,7 +23,7 @@ from codonpipe.modules.expression import run_expression_analysis
 from codonpipe.modules.cu_statistics import run_cu_statistics
 from codonpipe.modules.enrichment import run_enrichment_analysis
 from codonpipe.modules.advanced_analyses import run_advanced_analyses
-from codonpipe.modules.gmm_clustering import run_gmm_clustering
+from codonpipe.modules.mahal_clustering import run_mahal_clustering
 from codonpipe.modules.bio_ecology import run_bio_ecology_analyses
 from codonpipe.modules.codon_table_formats import generate_all_codon_tables
 from codonpipe.modules.statistics import run_batch_statistics
@@ -83,9 +83,9 @@ def run_single_genome(
     skip_kofamscan: bool = False,
     kofam_results_file: Path | None = None,
     skip_expression: bool = False,
-    skip_gmm: bool = False,
-    gmm_min_k: int = 2,
-    gmm_max_k: int = 8,
+    skip_mahal: bool = False,
+    mahal_min_k: int = 2,
+    mahal_max_k: int = 8,
     kegg_ko_pathway: Path | None = None,
     gff_file: Path | None = None,
     force: bool = False,
@@ -103,7 +103,7 @@ def run_single_genome(
         8. Advanced analyses (COA, S-value, neutrality, PR2, delta RSCU,
            tRNA-codon correlation, COG enrichment, gene length vs bias,
            ENC-ENC' difference)
-        9. GMM clustering — COA-based Gaussian Mixture Model clustering
+        9. Mahalanobis clustering — COA-based Mahalanobis distance clustering
            to identify the translationally optimised gene cluster, using
            ribosomal proteins as anchor
        10. Biological/ecological analyses (HGT detection, growth rate
@@ -111,7 +111,7 @@ def run_single_genome(
            asymmetry, operon co-adaptation)
        11. Codon usage tables in all standard formats (RSCU, counts,
            per-thousand, W values, adaptation weights, CBI) plus
-           GMM-cluster-specific tables
+           Mahalanobis-cluster-specific tables
        12. Publication-ready plots
 
     Args:
@@ -133,9 +133,9 @@ def run_single_genome(
             When provided, KofamScan execution is skipped and this file is
             parsed directly. Overrides skip_kofamscan.
         skip_expression: Skip R-based expression analysis.
-        skip_gmm: Skip GMM codon usage clustering.
-        gmm_min_k: Minimum GMM components to test (default 2).
-        gmm_max_k: Maximum GMM components to test (default 8).
+        skip_mahal: Skip Mahalanobis codon usage clustering.
+        mahal_min_k: Minimum Mahalanobis components to test (default 2).
+        mahal_max_k: Maximum Mahalanobis components to test (default 8).
         kegg_ko_pathway: User-supplied KO-to-pathway mapping TSV for offline use.
         gff_file: GFF3 annotation file for tRNA extraction (auto-detected from
             Prokka output if omitted).
@@ -367,12 +367,12 @@ def run_single_genome(
     if not advanced_results:
         logger.info("SKIPPED: advanced analyses produced no results")
 
-    # ── Step 9: GMM clustering on COA space ──────────────────────────────
-    gmm_results = {}
-    gmm_cluster_gene_ids = None
-    gmm_cluster_rscu = None
-    if not skip_gmm:
-        logger.info("[Step 9/12] Running GMM clustering on COA-projected RSCU")
+    # ── Step 9: Mahalanobis clustering on COA space ──────────────────────────────
+    mahal_results = {}
+    mahal_cluster_gene_ids = None
+    mahal_cluster_rscu = None
+    if not skip_mahal:
+        logger.info("[Step 9/12] Running Mahalanobis clustering on COA-projected RSCU")
         try:
             rp_rscu_df = None
             if rp_ffn and rp_ffn.exists():
@@ -381,7 +381,7 @@ def run_single_genome(
                 except Exception:
                     pass
 
-            gmm_out = run_gmm_clustering(
+            mahal_out = run_mahal_clustering(
                 rscu_gene_df=rscu_gene_df,
                 output_dir=output_dir,
                 sample_id=sample_id,
@@ -389,74 +389,74 @@ def run_single_genome(
                 rp_ids_file=rp_ids_file,
                 rp_rscu_df=rp_rscu_df,
                 expr_df=expr_df,
-                min_k=gmm_min_k,
-                max_k=gmm_max_k,
+                min_k=mahal_min_k,
+                max_k=mahal_max_k,
             )
 
             # Separate file paths from in-memory objects, but keep
-            # everything in gmm_results too so downstream steps can
-            # access paths like gmm_cluster_ids_path directly.
-            for key, val in gmm_out.items():
-                gmm_results[key] = val
+            # everything in mahal_results too so downstream steps can
+            # access paths like mahal_cluster_ids_path directly.
+            for key, val in mahal_out.items():
+                mahal_results[key] = val
                 if isinstance(val, Path):
-                    all_outputs[f"gmm_{key}"] = val
+                    all_outputs[f"mahal_{key}"] = val
 
-            gmm_cluster_gene_ids = gmm_results.get("gmm_cluster_gene_ids")
-            gmm_cluster_rscu = gmm_results.get("gmm_cluster_rscu")
+            mahal_cluster_gene_ids = mahal_results.get("mahal_cluster_gene_ids")
+            mahal_cluster_rscu = mahal_results.get("mahal_cluster_rscu")
 
-            # Annotate expression table with GMM cluster membership
-            if gmm_cluster_gene_ids and expr_df is not None and not expr_df.empty:
+            # Annotate expression table with Mahalanobis cluster membership
+            if mahal_cluster_gene_ids and expr_df is not None and not expr_df.empty:
                 try:
-                    expr_df["in_gmm_cluster"] = expr_df["gene"].isin(gmm_cluster_gene_ids)
+                    expr_df["in_mahal_cluster"] = expr_df["gene"].isin(mahal_cluster_gene_ids)
                     logger.info(
-                        "Annotated expression table with GMM cluster membership "
+                        "Annotated expression table with Mahalanobis cluster membership "
                         "(%d genes in RP cluster)",
-                        expr_df["in_gmm_cluster"].sum(),
+                        expr_df["in_mahal_cluster"].sum(),
                     )
                 except Exception as e:
-                    logger.warning("Could not annotate expression table with GMM clusters: %s", e)
+                    logger.warning("Could not annotate expression table with Mahalanobis clusters: %s", e)
         except Exception as e:
-            logger.warning("GMM clustering failed: %s. Continuing.", e, exc_info=True)
+            logger.warning("Mahalanobis clustering failed: %s. Continuing.", e, exc_info=True)
     else:
-        logger.info("[Step 9/12] Skipping GMM clustering (--skip-gmm)")
+        logger.info("[Step 9/12] Skipping Mahalanobis clustering (--skip-mahal)")
 
-    # Save GMM cluster RSCU to rscu/ directory alongside genome and RP RSCU
-    if gmm_cluster_rscu is not None and not gmm_cluster_rscu.empty:
+    # Save Mahalanobis cluster RSCU to rscu/ directory alongside genome and RP RSCU
+    if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty:
         try:
             rscu_dir = output_dir / "rscu"
             rscu_dir.mkdir(parents=True, exist_ok=True)
-            gmm_rscu_path = rscu_dir / f"{sample_id}_rscu_gmm_cluster.tsv"
-            gmm_cluster_rscu.to_frame("RSCU").to_csv(gmm_rscu_path, sep="\t")
-            all_outputs["rscu_gmm_cluster"] = gmm_rscu_path
-            logger.info("GMM cluster RSCU table saved to rscu/ directory")
+            mahal_rscu_path = rscu_dir / f"{sample_id}_rscu_mahal_cluster.tsv"
+            mahal_cluster_rscu.to_frame("RSCU").to_csv(mahal_rscu_path, sep="\t")
+            all_outputs["rscu_mahal_cluster"] = mahal_rscu_path
+            logger.info("Mahalanobis cluster RSCU table saved to rscu/ directory")
         except Exception as e:
-            logger.warning("Could not save GMM cluster RSCU to rscu/: %s", e)
+            logger.warning("Could not save Mahalanobis cluster RSCU to rscu/: %s", e)
 
-    # ── Step 9b: Re-run expression scoring with GMM cluster as reference ─
-    # Step 6 scored genes against RP-only IDs.  The GMM cluster provides a
+    # ── Step 9b: Re-run expression scoring with Mahalanobis cluster as reference ─
+    # Step 6 scored genes against RP-only IDs.  The Mahalanobis cluster provides a
     # broader, biologically grounded reference set (RP + co-clustered genes).
-    # Re-run MELP/CAI/Fop via coRdon using GMM cluster gene IDs, then
-    # promote the GMM-based classification as the primary expression_class.
-    gmm_cluster_ids_path = gmm_results.get("gmm_cluster_ids_path")
+    # Re-run MELP/CAI/Fop via coRdon using Mahalanobis cluster gene IDs, then
+    # promote the Mahalanobis-based classification as the primary expression_class.
+    mahal_cluster_ids_path = mahal_results.get("mahal_cluster_ids_path")
     if (
-        gmm_cluster_gene_ids
-        and gmm_cluster_ids_path
+        mahal_cluster_gene_ids
+        and mahal_cluster_ids_path
         and not skip_expression
     ):
         logger.info(
-            "[Step 9b/12] Re-running expression analysis with GMM cluster "
+            "[Step 9b/12] Re-running expression analysis with Mahalanobis cluster "
             "(%d genes) as reference",
-            len(gmm_cluster_gene_ids),
+            len(mahal_cluster_gene_ids),
         )
         try:
-            gmm_expr_outputs = run_expression_analysis(
-                ffn_path, gmm_cluster_ids_path, output_dir, sample_id,
+            mahal_expr_outputs = run_expression_analysis(
+                ffn_path, mahal_cluster_ids_path, output_dir, sample_id,
                 force=True,  # overwrite the RP-based expression files
             )
-            all_outputs.update(gmm_expr_outputs)
+            all_outputs.update(mahal_expr_outputs)
 
-            if "expression_combined" in gmm_expr_outputs:
-                gmm_expr_df = pd.read_csv(gmm_expr_outputs["expression_combined"], sep="\t")
+            if "expression_combined" in mahal_expr_outputs:
+                mahal_expr_df = pd.read_csv(mahal_expr_outputs["expression_combined"], sep="\t")
 
                 # Preserve RP-based scores as secondary columns
                 if expr_df is not None and not expr_df.empty:
@@ -469,10 +469,10 @@ def run_single_genome(
                     rp_backup = expr_df[["gene"] + list(rp_cols_to_keep.keys())].rename(
                         columns=rp_cols_to_keep
                     )
-                    gmm_expr_df = gmm_expr_df.merge(rp_backup, on="gene", how="left")
+                    mahal_expr_df = mahal_expr_df.merge(rp_backup, on="gene", how="left")
 
-                # Add GMM cluster membership flag
-                gmm_expr_df["in_gmm_cluster"] = gmm_expr_df["gene"].isin(gmm_cluster_gene_ids)
+                # Add Mahalanobis cluster membership flag
+                mahal_expr_df["in_mahal_cluster"] = mahal_expr_df["gene"].isin(mahal_cluster_gene_ids)
 
                 # Merge ENC' residual if available
                 if enc_df is not None and encprime_df is not None:
@@ -480,7 +480,7 @@ def run_single_genome(
                         from codonpipe.modules.advanced_analyses import compute_enc_diff
                         enc_diff_df = compute_enc_diff(enc_df, encprime_df)
                         if not enc_diff_df.empty and "gene" in enc_diff_df.columns:
-                            gmm_expr_df = gmm_expr_df.merge(
+                            mahal_expr_df = mahal_expr_df.merge(
                                 enc_diff_df[["gene", "ENC_diff"]].rename(
                                     columns={"ENC_diff": "ENCprime_residual"}
                                 ),
@@ -491,73 +491,73 @@ def run_single_genome(
 
                 # Annotate with KofamScan
                 if kofam_df is not None and not kofam_df.empty:
-                    expr_ann = annotate_with_kofam(gmm_expr_df, kofam_df)
+                    expr_ann = annotate_with_kofam(mahal_expr_df, kofam_df)
                     expr_ann_path = output_dir / "expression" / f"{sample_id}_expression_annotated.tsv"
                     expr_ann.to_csv(expr_ann_path, sep="\t", index=False)
                     all_outputs["expression_annotated"] = expr_ann_path
 
                 # Save and promote
-                gmm_expr_df.to_csv(gmm_expr_outputs["expression_combined"], sep="\t", index=False)
-                expr_df = gmm_expr_df
+                mahal_expr_df.to_csv(mahal_expr_outputs["expression_combined"], sep="\t", index=False)
+                expr_df = mahal_expr_df
                 logger.info(
-                    "Expression analysis re-scored with GMM cluster reference "
-                    "(%d genes); expression_class now GMM-based",
+                    "Expression analysis re-scored with Mahalanobis cluster reference "
+                    "(%d genes); expression_class now Mahalanobis-based",
                     len(expr_df),
                 )
         except (FileNotFoundError, RuntimeError) as e:
             logger.warning(
-                "GMM-based expression re-scoring failed: %s. "
+                "Mahalanobis-based expression re-scoring failed: %s. "
                 "Keeping RP-based expression scores.", e, exc_info=True,
             )
 
-    # ── Step 9c: Re-run pathway enrichment on GMM-based expression tiers ─
+    # ── Step 9c: Re-run pathway enrichment on Mahalanobis-based expression tiers ─
     # Step 7 enrichment used RP-only expression tiers.  Now that genes are
-    # re-scored against the GMM cluster, re-run enrichment so downstream
-    # plots and tables reflect the GMM-derived view.
+    # re-scored against the Mahalanobis cluster, re-run enrichment so downstream
+    # plots and tables reflect the Mahalanobis-derived view.
     if (
-        gmm_cluster_gene_ids
+        mahal_cluster_gene_ids
         and expr_df is not None
         and kofam_df is not None
         and not kofam_df.empty
     ):
-        logger.info("[Step 9c/12] Re-running pathway enrichment on GMM-based expression tiers")
+        logger.info("[Step 9c/12] Re-running pathway enrichment on Mahalanobis-based expression tiers")
         try:
-            gmm_enrich_outputs = run_enrichment_analysis(
+            mahal_enrich_outputs = run_enrichment_analysis(
                 expr_df, kofam_df, output_dir, sample_id,
                 kegg_ko_pathway_file=kegg_ko_pathway,
-                output_subdir="enrichment_gmm",
+                output_subdir="enrichment_mahal",
             )
             all_outputs.update({
-                f"gmm_{k}": v for k, v in gmm_enrich_outputs.items()
+                f"mahal_{k}": v for k, v in mahal_enrich_outputs.items()
             })
-            # Load GMM enrichment results for plotting, prefixed with "gmm_"
-            for key, path in gmm_enrich_outputs.items():
+            # Load Mahalanobis enrichment results for plotting, prefixed with "mahal_"
+            for key, path in mahal_enrich_outputs.items():
                 if key.startswith("enrichment_") and path.exists():
-                    enrichment_results[f"gmm_{key}"] = pd.read_csv(path, sep="\t")
+                    enrichment_results[f"mahal_{key}"] = pd.read_csv(path, sep="\t")
         except Exception as e:
-            logger.warning("GMM-tier pathway enrichment failed: %s. Continuing.", e, exc_info=True)
+            logger.warning("Mahalanobis-tier pathway enrichment failed: %s. Continuing.", e, exc_info=True)
 
-    # ── Step 9d: Recompute S-value and COG enrichment with GMM reference ──
+    # ── Step 9d: Recompute S-value and COG enrichment with Mahalanobis reference ──
     # Step 8 computed S-value against ribosomal proteins and COG enrichment
     # against RP-based expression tiers.  Now that expression is re-scored
-    # against the GMM cluster, recompute both.
-    if gmm_cluster_rscu is not None and not gmm_cluster_rscu.empty:
+    # against the Mahalanobis cluster, recompute both.
+    if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty:
         try:
             from codonpipe.modules.advanced_analyses import compute_s_value, compute_delta_rscu
-            rscu_gmm_dict = gmm_cluster_rscu.to_dict()
+            rscu_mahal_dict = mahal_cluster_rscu.to_dict()
             adv_dir = output_dir / "advanced"
 
-            logger.info("[Step 9d/12] Recomputing S-value with GMM-cluster RSCU reference")
-            s_val_gmm_df = compute_s_value(rscu_gene_df, rscu_rp,
-                                            rscu_gmm_cluster=rscu_gmm_dict)
-            if not s_val_gmm_df.empty:
+            logger.info("[Step 9d/12] Recomputing S-value with Mahalanobis-cluster RSCU reference")
+            s_val_mahal_df = compute_s_value(rscu_gene_df, rscu_rp,
+                                            rscu_mahal_cluster=rscu_mahal_dict)
+            if not s_val_mahal_df.empty:
                 s_val_path = adv_dir / f"{sample_id}_s_value.tsv"
-                s_val_gmm_df.to_csv(s_val_path, sep="\t", index=False)
+                s_val_mahal_df.to_csv(s_val_path, sep="\t", index=False)
                 all_outputs["advanced_s_value_path"] = s_val_path
-                advanced_results["s_value"] = s_val_gmm_df
-                logger.info("S-value recomputed against GMM-cluster reference (%d genes)", len(s_val_gmm_df))
+                advanced_results["s_value"] = s_val_mahal_df
+                logger.info("S-value recomputed against Mahalanobis-cluster reference (%d genes)", len(s_val_mahal_df))
 
-            # Delta RSCU with GMM-based expression tiers
+            # Delta RSCU with Mahalanobis-based expression tiers
             if expr_df is not None:
                 for class_col in ["expression_class"]:
                     if class_col in expr_df.columns:
@@ -568,21 +568,21 @@ def run_single_genome(
                             delta_df.to_csv(out_path, sep="\t", index=False)
                             all_outputs[f"advanced_delta_rscu_{metric}_path"] = out_path
                             advanced_results[f"delta_rscu_{metric}"] = delta_df
-            # Re-run COG enrichment with GMM-based expression tiers
+            # Re-run COG enrichment with Mahalanobis-based expression tiers
             cog_tsv = all_outputs.get("cog_result")
             if cog_tsv and Path(cog_tsv).exists() and expr_df is not None:
                 from codonpipe.modules.advanced_analyses import compute_cog_enrichment
                 adv_dir = output_dir / "advanced"
-                cog_enrich_gmm = compute_cog_enrichment(Path(cog_tsv), expr_df)
-                if not cog_enrich_gmm.empty:
+                cog_enrich_mahal = compute_cog_enrichment(Path(cog_tsv), expr_df)
+                if not cog_enrich_mahal.empty:
                     cog_path = adv_dir / f"{sample_id}_cog_enrichment.tsv"
-                    cog_enrich_gmm.to_csv(cog_path, sep="\t", index=False)
+                    cog_enrich_mahal.to_csv(cog_path, sep="\t", index=False)
                     all_outputs["advanced_cog_enrichment_path"] = cog_path
-                    advanced_results["cog_enrichment"] = cog_enrich_gmm
-                    logger.info("COG enrichment recomputed with GMM-based expression tiers")
+                    advanced_results["cog_enrichment"] = cog_enrich_mahal
+                    logger.info("COG enrichment recomputed with Mahalanobis-based expression tiers")
 
         except Exception as e:
-            logger.warning("GMM-aware metric recomputation failed: %s. Keeping RP-based values.", e)
+            logger.warning("Mahalanobis-aware metric recomputation failed: %s. Keeping RP-based values.", e)
 
     # ── Step 10: Biological/ecological analyses ─────────────────────────
     logger.info("[Step 10/12] Running biological and ecological analyses")
@@ -599,9 +599,9 @@ def run_single_genome(
             cog_result_tsv=all_outputs.get("cog_result"),
             kofam_df=kofam_df,
             gff_path=resolved_gff,
-            gmm_cluster_rscu=gmm_cluster_rscu,
-            gmm_cluster_gene_ids=gmm_cluster_gene_ids,
-            gmm_cluster_ids_path=gmm_cluster_ids_path,
+            mahal_cluster_rscu=mahal_cluster_rscu,
+            mahal_cluster_gene_ids=mahal_cluster_gene_ids,
+            mahal_cluster_ids_path=mahal_cluster_ids_path,
         )
         # Normalize keys and flatten nested dicts for plotting compatibility
         _bio_key_map = {
@@ -642,7 +642,7 @@ def run_single_genome(
             sample_id=sample_id,
             expr_df=expr_df,
             rp_ids_file=rp_ids_file,
-            gmm_cluster_gene_ids=gmm_cluster_gene_ids,
+            mahal_cluster_gene_ids=mahal_cluster_gene_ids,
         )
         all_outputs.update(table_outputs)
     except Exception as e:
@@ -664,9 +664,9 @@ def run_single_genome(
         advanced_results=advanced_results if advanced_results else None,
         bio_ecology_results=bio_ecology_results if bio_ecology_results else None,
         gff_path=resolved_gff,
-        gmm_cluster_rscu=gmm_cluster_rscu,
-        gmm_rp_cluster=gmm_results.get("gmm_rp_cluster"),
-        gmm_cluster_size=len(gmm_cluster_gene_ids) if gmm_cluster_gene_ids else None,
+        mahal_cluster_rscu=mahal_cluster_rscu,
+        mahal_rp_cluster=mahal_results.get("mahal_rp_cluster"),
+        mahal_cluster_size=len(mahal_cluster_gene_ids) if mahal_cluster_gene_ids else None,
     )
     all_outputs.update(plot_outputs)
 
@@ -870,7 +870,10 @@ def _run_batch_analyses(
             batch_df[meta_cols_to_merge], on="sample_id", how="left"
         )
 
-    combined_path = output_dir / "combined_rscu.tsv"
+    batch_rscu_dir = output_dir / "batch_rscu"
+    batch_rscu_dir.mkdir(parents=True, exist_ok=True)
+
+    combined_path = batch_rscu_dir / "combined_rscu.tsv"
     combined_rscu.to_csv(combined_path, sep="\t", index=False)
     outputs["combined_rscu"] = combined_path
 
@@ -887,7 +890,7 @@ def _run_batch_analyses(
             combined_rp = combined_rp.merge(
                 batch_df[meta_cols_to_merge], on="sample_id", how="left"
             )
-        rp_combined_path = output_dir / "combined_rscu_ribosomal.tsv"
+        rp_combined_path = batch_rscu_dir / "combined_rscu_ribosomal.tsv"
         combined_rp.to_csv(rp_combined_path, sep="\t", index=False)
         outputs["combined_rscu_ribosomal"] = rp_combined_path
 
