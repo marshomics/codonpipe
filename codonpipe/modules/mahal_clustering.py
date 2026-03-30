@@ -825,6 +825,7 @@ def run_mahal_clustering(
     })
     coa_with_assignments = coa_with_assignments.merge(assign_merge, on="gene", how="left")
     results["mahal_coa_coords"] = coa_with_assignments
+    results["mahal_coa_inertia"] = coa_inertia
 
     # ── Step 10: Diagnostic plots ─────────────────────────────────────
     try:
