@@ -102,6 +102,7 @@ def run_single_genome(
     stability_bootstraps: int = 100,
     stability_multipliers: list[float] | None = None,
     auto_select_multiplier: bool = False,
+    stability_core_threshold: float = 0.5,
     kegg_ko_pathway: Path | None = None,
     gff_file: Path | None = None,
     force: bool = False,
@@ -168,6 +169,9 @@ def run_single_genome(
             the stability-recommended multiplier instead of the user-supplied
             mahal_distance_multiplier.  The Mahalanobis clustering step is
             re-run with the recommended value.
+        stability_core_threshold: Membership frequency threshold for a gene
+            to be considered "core" in the stability analysis (default 0.5).
+            Set to 0.9 for a high-confidence subset.
         kegg_ko_pathway: User-supplied KO-to-pathway mapping TSV for offline use.
         gff_file: GFF3 annotation file for tRNA extraction (auto-detected from
             Prokka output if omitted).
@@ -483,6 +487,7 @@ def run_single_genome(
                 expr_df=expr_df,
                 n_bootstraps=stability_bootstraps,
                 multiplier_grid=stability_multipliers,
+                core_threshold=stability_core_threshold,
             )
 
             for key, val in stability_results.items():
