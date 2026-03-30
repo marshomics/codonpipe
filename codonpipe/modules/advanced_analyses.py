@@ -25,6 +25,8 @@ from codonpipe.utils.codon_tables import (
     SENSE_CODONS,
     dna_to_rna,
 )
+from codonpipe.utils.io import find_gene_id_column
+from codonpipe.utils.statistics import benjamini_hochberg
 
 logger = logging.getLogger("codonpipe")
 
@@ -144,13 +146,13 @@ def compute_s_value(
     rscu_rp: dict[str, float] | None,
     metric: str = "euclidean",
     rscu_ace: dict[str, float] | None = None,
-    rscu_gmm_cluster: dict[str, float] | None = None,
+    rscu_mahal_cluster: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     """Compute per-gene RSCU distance to a reference codon usage profile.
 
-    Reference priority: GMM cluster > ACE consensus > ribosomal proteins.
+    Reference priority: Mahalanobis cluster > ACE consensus > ribosomal proteins.
 
-    The GMM optimal cluster captures the codon usage of translationally
+    The Mahalanobis optimal cluster captures the codon usage of translationally
     optimised genes identified by data-driven clustering, making it the
     most biologically grounded reference.  ACE consensus is genome-specific
     and composition-independent.  Ribosomal proteins are the traditional
@@ -164,15 +166,15 @@ def compute_s_value(
         rscu_rp: Concatenated RSCU for ribosomal proteins (fallback reference).
         metric: 'euclidean' or 'chi_squared'.
         rscu_ace: ACE consensus RSCU dict.
-        rscu_gmm_cluster: GMM optimal cluster RSCU dict (preferred reference).
+        rscu_mahal_cluster: Mahalanobis optimal cluster RSCU dict (preferred reference).
 
     Returns:
         DataFrame with gene, S_value, S_reference columns.
     """
-    # Priority: GMM cluster > ACE consensus > RP
-    if rscu_gmm_cluster is not None:
-        ref = rscu_gmm_cluster
-        ref_label = "gmm_cluster"
+    # Priority: Mahalanobis cluster > ACE consensus > RP
+    if rscu_mahal_cluster is not None:
+        ref = rscu_mahal_cluster
+        ref_label = "mahal_cluster"
     elif rscu_ace is not None:
         ref = rscu_ace
         ref_label = "ace"
@@ -619,13 +621,7 @@ def compute_cog_enrichment(
         return pd.DataFrame()
 
     # Find query/gene ID column
-    query_col = None
-    for candidate in ["QUERY_ID", "query_id", "Query", "query", "gene_id", "protein_id"]:
-        if candidate in cog_df.columns:
-            query_col = candidate
-            break
-    if query_col is None:
-        query_col = cog_df.columns[0]
+    query_col = find_gene_id_column(cog_df, fallback_to_first=True)
 
     # COG category descriptions
     cog_descriptions = {
@@ -720,14 +716,7 @@ def compute_cog_enrichment(
     # BH FDR correction
     n_tests = len(result)
     if n_tests > 0:
-        pvals = result["p_value"].values
-        fdr = np.zeros(n_tests)
-        for i in range(n_tests):
-            fdr[i] = pvals[i] * n_tests / (i + 1)
-        for i in range(n_tests - 2, -1, -1):
-            fdr[i] = min(fdr[i], fdr[i + 1])
-        fdr = np.minimum(fdr, 1.0)
-        result["fdr"] = fdr
+        result["fdr"] = benjamini_hochberg(result["p_value"].values)
         result["significant"] = result["fdr"] <= 0.05
 
     return result
@@ -791,7 +780,7 @@ def run_advanced_analyses(
     gff_path: Path | None = None,
     cog_result_tsv: Path | None = None,
     rscu_ace: dict[str, float] | None = None,
-    rscu_gmm_cluster: dict[str, float] | None = None,
+    rscu_mahal_cluster: dict[str, float] | None = None,
 ) -> dict[str, pd.DataFrame | Path]:
     """Run all advanced codon usage analyses.
 
@@ -807,7 +796,7 @@ def run_advanced_analyses(
         gff_path: GFF3 annotation file (for tRNA extraction).
         cog_result_tsv: COGclassifier result.tsv (for COG enrichment).
         rscu_ace: ACE consensus RSCU dict.
-        rscu_gmm_cluster: GMM optimal cluster RSCU dict. When provided,
+        rscu_mahal_cluster: Mahalanobis optimal cluster RSCU dict. When provided,
             S-value uses this as the reference (highest priority).
 
     Returns:
@@ -827,16 +816,16 @@ def run_advanced_analyses(
             outputs[key] = df
             outputs[f"{key}_path"] = out_path
 
-    # 2. S-value (reference priority: GMM cluster > ACE consensus > RP)
-    if rscu_gmm_cluster is not None:
-        ref_label = "GMM cluster"
+    # 2. S-value (reference priority: Mahalanobis cluster > ACE consensus > RP)
+    if rscu_mahal_cluster is not None:
+        ref_label = "Mahalanobis cluster"
     elif rscu_ace is not None:
         ref_label = "ACE consensus"
     else:
         ref_label = "ribosomal proteins"
     logger.info("Computing S-value (RSCU distance to %s) for %s", ref_label, sample_id)
     s_val_df = compute_s_value(rscu_gene_df, rscu_rp, rscu_ace=rscu_ace,
-                                rscu_gmm_cluster=rscu_gmm_cluster)
+                                rscu_mahal_cluster=rscu_mahal_cluster)
     if not s_val_df.empty:
         out_path = adv_dir / f"{sample_id}_s_value.tsv"
         s_val_df.to_csv(out_path, sep="\t", index=False)
