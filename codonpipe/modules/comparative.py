@@ -17,7 +17,11 @@ import pandas as pd
 from scipy import stats as sp_stats
 from scipy.spatial.distance import pdist, squareform
 
-from codonpipe.utils.codon_tables import RSCU_COLUMN_NAMES
+from codonpipe.utils.codon_tables import (
+    RSCU_COLUMN_NAMES,
+    COL_MELP, COL_CAI, COL_FOP, EXPRESSION_METRICS,
+    COL_EXPRESSION_CLASS,
+)
 from codonpipe.utils.statistics import benjamini_hochberg
 
 logger = logging.getLogger("codonpipe")
@@ -134,8 +138,8 @@ def _read_rscu_median(paths: dict, row: dict) -> None:
             rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
             for c in rscu_cols:
                 row[c] = df[c].iloc[0] if len(df) > 0 else np.nan
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to read RSCU median: %s", e)
 
 
 def _read_expression_summary(paths: dict, row: dict) -> None:
@@ -143,12 +147,12 @@ def _read_expression_summary(paths: dict, row: dict) -> None:
     if p and Path(p).exists():
         try:
             df = pd.read_csv(p, sep="\t")
-            for metric in ("MELP", "CAI", "Fop"):
+            for metric in EXPRESSION_METRICS:
                 if metric in df.columns:
                     row[f"median_{metric}"] = df[metric].median()
                     row[f"mean_{metric}"] = df[metric].mean()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to read expression summary: %s", e)
 
 
 def _read_enc_summary(paths: dict, row: dict) -> None:
@@ -162,8 +166,8 @@ def _read_enc_summary(paths: dict, row: dict) -> None:
             gc3_col = next((c for c in ("GC3", "GC3s", "gc3") if c in df.columns), None)
             if gc3_col:
                 row["mean_GC3"] = df[gc3_col].mean()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to read ENC summary: %s", e)
 
 
 def _read_growth_rate(paths: dict, row: dict) -> None:
@@ -181,8 +185,8 @@ def _read_growth_rate(paths: dict, row: dict) -> None:
                 if "growth_class" in df.columns:
                     row["growth_class"] = df["growth_class"].iloc[0]
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read growth rate (key=%s): %s", key, e)
 
 
 def _read_grodon2(paths: dict, row: dict) -> None:
@@ -207,8 +211,8 @@ def _read_grodon2(paths: dict, row: dict) -> None:
                 if "growth_class" in df.columns:
                     row["grodon2_growth_class"] = df["growth_class"].iloc[0]
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read gRodon2 prediction (key=%s): %s", key, e)
 
 
 def _read_hgt_summary(paths: dict, row: dict) -> None:
@@ -233,8 +237,8 @@ def _read_hgt_summary(paths: dict, row: dict) -> None:
                     row["n_hgt_positive"] = int(n_sig)
                     row["hgt_fraction"] = n_sig / len(df) if len(df) > 0 else 0
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read HGT summary (key=%s): %s", key, e)
 
 
 def _read_strand_asymmetry(paths: dict, row: dict) -> None:
@@ -250,8 +254,8 @@ def _read_strand_asymmetry(paths: dict, row: dict) -> None:
                     row["n_strand_asym_sig"] = int((df[p_col] < 0.05).sum())
                     row["strand_asym_fraction"] = row["n_strand_asym_sig"] / max(len(df), 1)
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read strand asymmetry (key=%s): %s", key, e)
 
 
 def _read_operon_summary(paths: dict, row: dict) -> None:
@@ -267,8 +271,8 @@ def _read_operon_summary(paths: dict, row: dict) -> None:
                 if "same_operon_prediction" in df.columns:
                     row["operon_predicted_fraction"] = df["same_operon_prediction"].mean()
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read operon summary (key=%s): %s", key, e)
 
 
 def _read_gc_content(paths: dict, row: dict) -> None:
@@ -291,8 +295,8 @@ def _read_gc_content(paths: dict, row: dict) -> None:
                     slope, _, r, p_val, _ = sp_stats.linregress(x[common], y[common])
                     row["neutrality_slope"] = slope
                     row["neutrality_r2"] = r ** 2
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to read GC content: %s", e)
 
 
 def _read_s_value(paths: dict, row: dict) -> None:
@@ -304,8 +308,8 @@ def _read_s_value(paths: dict, row: dict) -> None:
             if s_col:
                 row["mean_S_value"] = df[s_col].mean()
                 row["median_S_value"] = df[s_col].median()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to read S-value: %s", e)
 
 
 def _read_translational_selection(paths: dict, row: dict) -> None:
@@ -323,8 +327,8 @@ def _read_translational_selection(paths: dict, row: dict) -> None:
                         valid["quintile"].values, valid["mean_fop"].values
                     )
                     row["fop_gradient_slope"] = slope
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to read translational selection fop_gradient: %s", e)
 
     # Read position_effects (5prime, middle, 3prime)
     p_pos = paths.get("bio_trans_sel_position_effects_path") or paths.get("bio_trans_sel_position_effects")
@@ -334,8 +338,8 @@ def _read_translational_selection(paths: dict, row: dict) -> None:
             for pos in ("fop_5prime", "fop_middle", "fop_3prime"):
                 if pos in df.columns:
                     row[f"mean_{pos}"] = df[pos].mean()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to read translational selection position_effects: %s", e)
 
 
 def _read_enc_prime(paths: dict, row: dict) -> None:
@@ -350,8 +354,8 @@ def _read_enc_prime(paths: dict, row: dict) -> None:
                 # Compute ENC-ENCprime difference if ENC is available
                 if "median_ENC" in row and not np.isnan(row["median_ENC"]):
                     row["median_ENC_diff"] = row["median_ENC"] - row["median_ENCprime"]
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to read ENCprime: %s", e)
 
 
 def _read_milc(paths: dict, row: dict) -> None:
@@ -363,8 +367,8 @@ def _read_milc(paths: dict, row: dict) -> None:
             milc_col = next((c for c in ("MILC", "milc") if c in df.columns), None)
             if milc_col:
                 row["median_MILC"] = df[milc_col].median()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to read MILC: %s", e)
 
 
 def _read_cbi(paths: dict, row: dict) -> None:
@@ -379,8 +383,8 @@ def _read_cbi(paths: dict, row: dict) -> None:
                 if cbi_col:
                     row["mean_CBI"] = df[cbi_col].mean()
                     return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read CBI (key=%s): %s", key, e)
 
 
 def _read_ribosomal_rscu(paths: dict, row: dict) -> None:
@@ -392,8 +396,8 @@ def _read_ribosomal_rscu(paths: dict, row: dict) -> None:
             rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
             for c in rscu_cols:
                 row[f"rp_{c}"] = df[c].iloc[0] if len(df) > 0 else np.nan
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to read ribosomal RSCU: %s", e)
 
 
 def _read_high_expression_rscu(paths: dict, row: dict) -> None:
@@ -410,8 +414,8 @@ def _read_high_expression_rscu(paths: dict, row: dict) -> None:
                     col_name = f"{aa}-{codon}" if aa else codon
                     if col_name in RSCU_COLUMN_NAMES:
                         row[f"he_{col_name}"] = r["rscu"]
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to read high-expression RSCU: %s", e)
 
 
 def _read_mahal_cluster_rscu(paths: dict, row: dict) -> None:
@@ -425,8 +429,8 @@ def _read_mahal_cluster_rscu(paths: dict, row: dict) -> None:
                     if col_name in df.index:
                         row[f"mahal_{col_name}"] = df.loc[col_name, "RSCU"]
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read Mahalanobis cluster RSCU (key=%s): %s", key, e)
 
     # Fallback: try codon table format output
     p = paths.get("mahal_cluster_rscu")
@@ -436,8 +440,8 @@ def _read_mahal_cluster_rscu(paths: dict, row: dict) -> None:
             rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in df.columns]
             for c in rscu_cols:
                 row[f"mahal_{c}"] = df[c].iloc[0] if len(df) > 0 else np.nan
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to read Mahalanobis cluster RSCU fallback: %s", e)
 
 
 def _read_mahal_summary(paths: dict, row: dict) -> None:
@@ -454,14 +458,14 @@ def _read_mahal_summary(paths: dict, row: dict) -> None:
                         if col in df.columns:
                             row[f"mahal_{col}"] = r[col]
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read Mahalanobis summary (key=%s): %s", key, e)
 
 
 def _read_enrichment_summary(paths: dict, row: dict) -> None:
     """Read pathway enrichment results and extract counts of significant pathways."""
     # Standard RP-based enrichment
-    for metric in ("CAI", "MELP", "Fop"):
+    for metric in EXPRESSION_METRICS:
         key = f"enrichment_{metric}_high"
         p = paths.get(key)
         if p and Path(p).exists():
@@ -475,8 +479,8 @@ def _read_enrichment_summary(paths: dict, row: dict) -> None:
                 elif fdr_col:
                     row[f"n_enriched_{metric}_high"] = int((df[fdr_col] < 0.05).sum())
                     row[f"n_pathways_{metric}_high"] = len(df)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read enrichment summary (metric=%s): %s", metric, e)
 
 
 
@@ -496,8 +500,8 @@ def _read_phage_mobile_summary(paths: dict, row: dict) -> None:
                 if phage_col:
                     row["n_phage"] = int(df[phage_col].sum())
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read phage/mobile summary (key=%s): %s", key, e)
 
 
 def _read_hgt_mahalanobis(paths: dict, row: dict) -> None:
@@ -514,8 +518,8 @@ def _read_hgt_mahalanobis(paths: dict, row: dict) -> None:
                 if "gc3_deviation" in df.columns:
                     row["mean_abs_gc3_deviation"] = df["gc3_deviation"].abs().mean()
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read HGT Mahalanobis distance (key=%s): %s", key, e)
 
 
 # ---------------------------------------------------------------------------
@@ -1100,8 +1104,8 @@ def between_condition_enrichment_comparison(
                             cond_pathways[cond][pw] = cond_pathways[cond].get(pw, 0) + 1
                             if name_col and pw not in all_pathways:
                                 all_pathways[pw] = row[name_col]
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to read enrichment summary for between-condition comparison (metric=%s): %s", metric, e)
                 break  # Use first available metric only
 
     if not all_pathways:
@@ -1225,8 +1229,8 @@ def between_condition_strand_asymmetry_patterns(
                     if "mean_rscu_plus" in df.columns and "mean_rscu_minus" in df.columns:
                         df["asymmetry"] = df["mean_rscu_plus"] - df["mean_rscu_minus"]
                         per_sample[sid] = df
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to read strand asymmetry for between-condition comparison (key=%s): %s", key, e)
                 break
 
     if len(per_sample) < 4:
@@ -1356,8 +1360,8 @@ def between_condition_optimal_codons(
                     df = pd.read_csv(p, sep="\t")
                     if "delta_rscu" in df.columns and "codon" in df.columns:
                         cond_deltas[sid_cond[sid]].append(df[["amino_acid", "codon", "delta_rscu"]])
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to read translational selection position_effects for between-condition comparison (key=%s): %s", key, e)
                 break
 
     cond_list = sorted(conditions)
@@ -1435,8 +1439,8 @@ def between_condition_hgt_burden(
                         cond_medians[sid_cond[sid]].append(df["mahalanobis_dist"].median())
                     if "hgt_flag" in df.columns:
                         cond_hgt_fracs[sid_cond[sid]].append(df["hgt_flag"].mean())
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to read HGT Mahalanobis distance for between-condition comparison (key=%s): %s", key, e)
                 break
 
     result: dict = {}
@@ -1559,8 +1563,8 @@ def between_condition_gc3_gc12(
                     if not sub.empty:
                         sub["sample_id"] = sid
                         cond_data[sid_cond[sid]].append(sub)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read GC content for between-condition comparison: %s", e)
 
     result = {}
     for cond, dfs in cond_data.items():
