@@ -422,21 +422,24 @@ def run_grodon(
     """Run gRodon2 growth rate prediction on a CDS FASTA file.
 
     The full genome CDS set is always used as the background for CUBHE/CPB
-    computation.  The HE gene set can be supplied explicitly (high-MELP
-    tier from Mahalanobis-based scoring) or via RP IDs; if neither is
-    given, gRodon2 falls back to its built-in ribosomal protein regex.
+    computation.  The HE gene set defaults to ribosomal protein IDs; if
+    neither *rp_ids_file* nor *he_ids_file* is given, gRodon2 falls back
+    to its built-in ribosomal protein header regex.
 
     Args:
         ffn_path: Path to CDS nucleotide FASTA (in-frame coding sequences).
         output_dir: Directory to save the result TSV.
         sample_id: Sample identifier.
         rp_ids_file: Optional path to a file listing ribosomal protein gene
-            IDs (one per line), as identified by COGclassifier.  Used as
-            the highly-expressed set when *he_ids_file* is not provided.
-        he_ids_file: Optional path to a file listing highly-expressed gene
-            IDs (one per line).  When provided, takes precedence over
-            *rp_ids_file* for marking the HE set.  Typically contains
-            high-MELP-tier genes scored against the Mahalanobis reference.
+            IDs (one per line), as identified by COGclassifier.  This is
+            the recommended HE set — gRodon2's model was trained with
+            ribosomal proteins (~55 genes) as the HE anchor.
+        he_ids_file: Optional path to a custom HE gene list (one per line).
+            When provided, takes precedence over *rp_ids_file*.  **Use with
+            caution**: gRodon2's regression coefficients assume a small,
+            strongly biased HE set (ribosomal proteins).  Supplying a
+            larger set (e.g. hundreds of high-MELP genes) dilutes CUBHE
+            and causes the model to underestimate growth rate.
 
     Returns:
         Dict with gRodon2 results (doubling time, CI, codon stats),
