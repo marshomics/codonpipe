@@ -54,6 +54,9 @@ def main():
               help="Minimum number of Mahalanobis clustering components to test.")
 @click.option("--mahal-max-k", type=int, default=8, show_default=True,
               help="Maximum number of Mahalanobis clustering components to test.")
+@click.option("--mahal-distance-multiplier", type=float, default=2.0, show_default=True,
+              help="Mahalanobis cluster radius as a multiplier of the median RP distance. "
+                   "Lower values (e.g. 1.5) produce a tighter cluster; higher values (e.g. 3.0) are more permissive.")
 @click.option("--kegg-ko-pathway", type=click.Path(exists=True, path_type=Path), default=None,
               help="KO-to-pathway mapping TSV for offline enrichment (auto-downloaded from KEGG if omitted).")
 @click.option("--force", is_flag=True, help="Overwrite existing outputs.")
@@ -80,6 +83,7 @@ def run(
     skip_mahal: bool,
     mahal_min_k: int,
     mahal_max_k: int,
+    mahal_distance_multiplier: float,
     kegg_ko_pathway: Path | None,
     force: bool,
     verbose: bool,
@@ -130,6 +134,7 @@ def run(
             skip_mahal=skip_mahal,
             mahal_min_k=mahal_min_k,
             mahal_max_k=mahal_max_k,
+            mahal_distance_multiplier=mahal_distance_multiplier,
             kegg_ko_pathway=kegg_ko_pathway,
             gff_file=gff_file,
             force=force,
@@ -169,6 +174,9 @@ def run(
               help="Minimum number of Mahalanobis clustering components to test.")
 @click.option("--mahal-max-k", type=int, default=8, show_default=True,
               help="Maximum number of Mahalanobis clustering components to test.")
+@click.option("--mahal-distance-multiplier", type=float, default=2.0, show_default=True,
+              help="Mahalanobis cluster radius as a multiplier of the median RP distance. "
+                   "Lower values (e.g. 1.5) produce a tighter cluster; higher values (e.g. 3.0) are more permissive.")
 @click.option("--kegg-ko-pathway", type=click.Path(exists=True, path_type=Path), default=None,
               help="KO-to-pathway mapping TSV for offline enrichment.")
 @click.option("--gff", "gff_file", type=click.Path(exists=True, path_type=Path), default=None,
@@ -194,6 +202,7 @@ def batch(
     skip_mahal: bool,
     mahal_min_k: int,
     mahal_max_k: int,
+    mahal_distance_multiplier: float,
     kegg_ko_pathway: Path | None,
     gff_file: Path | None,
     force: bool,
@@ -202,7 +211,8 @@ def batch(
 ):
     """Run codon analysis on multiple genomes from a batch table.
 
-    BATCH_TABLE is a TSV/CSV file with at minimum a 'genome_path' column.
+    BATCH_TABLE is a TSV/CSV/TXT file (tab- or comma-delimited) with at minimum
+    a 'genome_path' column.
     Optional columns: 'sample_id', plus any metadata columns for comparative analysis.
 
     To skip Prokka for samples that already have gene predictions, include
@@ -249,6 +259,7 @@ def batch(
             skip_mahal=skip_mahal,
             mahal_min_k=mahal_min_k,
             mahal_max_k=mahal_max_k,
+            mahal_distance_multiplier=mahal_distance_multiplier,
             kegg_ko_pathway=kegg_ko_pathway,
             gff_file=gff_file,
             force=force,
