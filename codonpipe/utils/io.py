@@ -78,7 +78,7 @@ def read_fasta_ids(fasta_path: Path) -> list[str]:
 
 
 def load_batch_table(table_path: Path) -> pd.DataFrame:
-    """Load a batch input table (TSV or CSV) with at minimum a 'genome_path' column.
+    """Load a batch input table (TSV, CSV, or TXT) with at minimum a 'genome_path' column.
 
     Accepted columns:
         - genome_path (required): path to genome FASTA
@@ -171,3 +171,40 @@ def write_tsv(df: pd.DataFrame, path: Path, **kwargs) -> None:
     """Write a DataFrame as TSV."""
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, sep="\t", index=False, **kwargs)
+
+
+def find_gene_id_column(
+    df: pd.DataFrame,
+    candidates: tuple[str, ...] = (
+        "QUERY_ID", "query_id", "Query", "query",
+        "gene_name", "gene", "gene_id", "protein_id",
+    ),
+    fallback_to_first: bool = False,
+) -> str | None:
+    """Find the gene/protein ID column in a DataFrame by trying known names.
+
+    Args:
+        df: DataFrame whose columns to search.
+        candidates: Column names to try, in priority order.
+        fallback_to_first: If True, return the first column when no candidate
+            matches (with a logged warning). If False, return None.
+
+    Returns:
+        Matched column name, or None if no match found (and fallback disabled).
+    """
+    import logging
+
+    for col in candidates:
+        if col in df.columns:
+            return col
+
+    if fallback_to_first and len(df.columns) > 0:
+        logger = logging.getLogger("codonpipe")
+        logger.warning(
+            "Could not identify gene ID column by name; falling back to "
+            "first column '%s'. Check input format if results look wrong.",
+            df.columns[0],
+        )
+        return df.columns[0]
+
+    return None
