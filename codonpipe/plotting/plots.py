@@ -3088,12 +3088,16 @@ def plot_genomic_cu_landscape(
     output_path: Path,
     sample_id: str = "",
     gff_path: Path | None = None,
+    mahal_cluster_gene_ids: set | None = None,
 ):
     """Multi-track genomic landscape of codon usage variation.
 
     Upper track: Mahalanobis distance (if HGT data available) or ENC per gene.
     Lower track: GC3 content per gene.
     MGE/phage genes are highlighted with colored vertical bands.
+    Genes in the Mahalanobis translationally optimized cluster are marked
+    with green diamonds on the upper track when *mahal_cluster_gene_ids*
+    is provided.
     Gene positions come from GFF if available; otherwise gene order in the
     RSCU table is used as a positional proxy (Prokka produces genes in
     genome order).
@@ -3106,6 +3110,8 @@ def plot_genomic_cu_landscape(
         output_path: Base path for saving.
         sample_id: Sample identifier.
         gff_path: GFF3 annotation file for genomic coordinates (optional).
+        mahal_cluster_gene_ids: Gene IDs in the Mahalanobis-defined
+            translationally optimized cluster (optional).
     """
     _apply_style()
     if enc_df is None or enc_df.empty:
@@ -3135,6 +3141,16 @@ def plot_genomic_cu_landscape(
 
     ax_top.fill_between(x, 0, y_top, color="#4a90d9", alpha=0.4, linewidth=0)
     ax_top.plot(x, y_top, color="#2c5f8a", linewidth=0.5, alpha=0.7)
+
+    # --- Mahalanobis cluster genes: overlay on upper track ---
+    if mahal_cluster_gene_ids:
+        cluster_mask = np.array([g in mahal_cluster_gene_ids for g in genes])
+        if cluster_mask.any():
+            ax_top.scatter(
+                x[cluster_mask], y_top[cluster_mask],
+                marker="D", s=12, color="#2ca02c", alpha=0.7,
+                zorder=3, label="Transl. optimized (Mahal.)",
+            )
 
     # --- Bottom track: GC3 ---
     merged_gc3 = gene_positions.merge(enc_df[["gene", "GC3"]], on="gene", how="left")
@@ -3179,6 +3195,10 @@ def plot_genomic_cu_landscape(
     # Legend proxies
     from matplotlib.patches import Patch
     legend_elements = []
+    if mahal_cluster_gene_ids:
+        cluster_mask_any = any(g in mahal_cluster_gene_ids for g in genes)
+        if cluster_mask_any:
+            legend_elements.append(Patch(facecolor="#2ca02c", alpha=0.7, label="Transl. optimized (Mahal.)"))
     if mge_genes:
         legend_elements.append(Patch(facecolor="#e84040", alpha=0.4, label="MGE/phage"))
     if hgt_genes - mge_genes:
@@ -3203,6 +3223,7 @@ def plot_mge_vs_core_rscu(
     output_path: Path,
     sample_id: str = "",
     mahal_cluster_rscu: dict[str, float] | None = None,
+    mahal_cluster_gene_ids: set | None = None,
 ):
     """Violin plots comparing codon usage metrics between MGE-associated and core genome genes.
 
@@ -3210,6 +3231,11 @@ def plot_mge_vs_core_rscu(
     and Euclidean distance from Mahalanobis cluster RSCU (if provided).
     Genes are split into MGE (mobilome + phage), other HGT candidates, and
     core genome.  Mann-Whitney p-values annotated.
+
+    When *mahal_cluster_gene_ids* is provided, a second plot is generated
+    (``_mahal_core`` suffix) where "core" is redefined as the Mahalanobis
+    translationally optimized gene subset rather than all non-HGT/non-MGE
+    genes.
 
     Args:
         rscu_gene_df: Per-gene RSCU table.
@@ -3222,12 +3248,15 @@ def plot_mge_vs_core_rscu(
         mahal_cluster_rscu: Optional Mahalanobis cluster RSCU dict. When
             provided, a per-gene Euclidean distance to the cluster RSCU
             is added as an extra panel.
+        mahal_cluster_gene_ids: Gene IDs in the Mahalanobis-defined
+            translationally optimized cluster (optional). When provided,
+            a second plot variant is saved with core = this subset.
     """
     _apply_style()
     if hgt_df is None or hgt_df.empty:
         return
 
-    # Classify genes
+    # Classify genes — MGE and HGT sets are shared by both plot variants
     mge_genes = set()
     if phage_mobile_df is not None and not phage_mobile_df.empty:
         for col in ("is_mobilome", "is_phage_related", "is_phage", "phage_related", "mobilome"):
@@ -3239,16 +3268,14 @@ def plot_mge_vs_core_rscu(
         hgt_only_genes = set(hgt_df.loc[hgt_df["hgt_flag"], "gene"]) - mge_genes
 
     all_genes = set(enc_df["gene"]) if "gene" in enc_df.columns else set()
-    core_genes = all_genes - mge_genes - hgt_only_genes
 
     if not mge_genes and not hgt_only_genes:
         return
 
-    # Build combined table
+    # Build combined metric table (shared by both variants)
     merged = enc_df.copy()
     if "mahalanobis_dist" in hgt_df.columns:
         merged = merged.merge(hgt_df[["gene", "mahalanobis_dist"]], on="gene", how="left")
-    # Prefer MELP > CAI > Fop for the expression panel
     _expr_col = None
     if expr_df is not None:
         for _m in ("MELP", "CAI", "Fop"):
@@ -3272,15 +3299,62 @@ def plot_mge_vs_core_rscu(
             })
             merged = merged.merge(_dist_df, on="gene", how="left")
 
+    # --- Original variant: core = all non-HGT/non-MGE genes ---
+    core_genes = all_genes - mge_genes - hgt_only_genes
+    _plot_mge_vs_core_violin(
+        merged, mge_genes, hgt_only_genes, core_genes,
+        _expr_col, output_path, sample_id,
+        core_label="Core genome",
+        title_suffix="",
+    )
+
+    # --- Mahalanobis variant: core = translationally optimized cluster ---
+    if mahal_cluster_gene_ids:
+        mahal_core = mahal_cluster_gene_ids - mge_genes - hgt_only_genes
+        if mahal_core:
+            mahal_path = output_path.parent / (
+                output_path.stem.replace("_mge_vs_core_rscu", "_mge_vs_mahal_core_rscu")
+                + output_path.suffix
+            )
+            _plot_mge_vs_core_violin(
+                merged, mge_genes, hgt_only_genes, mahal_core,
+                _expr_col, mahal_path, sample_id,
+                core_label="Transl. optimized (Mahal.)",
+                title_suffix=" [Mahal. core]",
+            )
+
+
+def _plot_mge_vs_core_violin(
+    merged: pd.DataFrame,
+    mge_genes: set,
+    hgt_only_genes: set,
+    core_genes: set,
+    expr_col: str | None,
+    output_path: Path,
+    sample_id: str,
+    core_label: str = "Core genome",
+    title_suffix: str = "",
+):
+    """Shared implementation for the MGE-vs-core violin panels.
+
+    Separated from ``plot_mge_vs_core_rscu`` so the same drawing logic
+    serves both the original (core = non-HGT/non-MGE) and Mahalanobis
+    (core = translationally optimized cluster) variants.
+    """
+
     def _assign_class(gene):
         if gene in mge_genes:
             return "MGE/phage"
         elif gene in hgt_only_genes:
             return "HGT candidate"
+        elif gene in core_genes:
+            return core_label
         else:
-            return "Core genome"
+            return None  # exclude genes outside all three sets
 
+    merged = merged.copy()
     merged["gene_class"] = merged["gene"].apply(_assign_class)
+    merged = merged.dropna(subset=["gene_class"])
 
     # Determine panels
     panels = []
@@ -3290,8 +3364,8 @@ def plot_mge_vs_core_rscu(
         panels.append(("GC3", "GC3"))
     if "mahalanobis_dist" in merged.columns:
         panels.append(("mahalanobis_dist", "Mahalanobis distance"))
-    if _expr_col is not None and _expr_col in merged.columns:
-        panels.append((_expr_col, _expr_col))
+    if expr_col is not None and expr_col in merged.columns:
+        panels.append((expr_col, expr_col))
     if "mahal_cluster_rscu_dist" in merged.columns:
         panels.append(("mahal_cluster_rscu_dist", "Dist. from Mahal. cluster RSCU"))
 
@@ -3303,9 +3377,11 @@ def plot_mge_vs_core_rscu(
     if n_panels == 1:
         axes = [axes]
 
-    order = ["Core genome", "HGT candidate", "MGE/phage"]
+    order = [core_label, "HGT candidate", "MGE/phage"]
     order = [o for o in order if o in merged["gene_class"].unique()]
-    palette = {"Core genome": "#b0b0b0", "HGT candidate": "#d9a032", "MGE/phage": "#e84040"}
+    palette = {core_label: "#b0b0b0", "HGT candidate": "#d9a032", "MGE/phage": "#e84040"}
+    if core_label != "Core genome":
+        palette[core_label] = "#2ca02c"
 
     for ax, (col, label) in zip(axes, panels):
         plot_data = merged.dropna(subset=[col])
@@ -3323,17 +3399,672 @@ def plot_mge_vs_core_rscu(
         ax.tick_params(axis="x", rotation=25)
 
         # Mann-Whitney U: MGE/phage vs core
-        if "Core genome" in order and len(order) >= 2:
+        if core_label in order and len(order) >= 2:
             test_class = "MGE/phage" if "MGE/phage" in order else order[-1]
-            core_vals = plot_data.loc[plot_data["gene_class"] == "Core genome", col].dropna()
+            core_vals = plot_data.loc[plot_data["gene_class"] == core_label, col].dropna()
             test_vals = plot_data.loc[plot_data["gene_class"] == test_class, col].dropna()
             if len(core_vals) >= 3 and len(test_vals) >= 3:
                 _, pval = stats.mannwhitneyu(core_vals, test_vals, alternative="two-sided")
                 sig_str = f"p = {pval:.2e}"
                 ax.set_title(sig_str, fontsize=8, fontstyle="italic")
 
-    fig.suptitle(f"Codon usage: MGE vs core genome — {sample_id}", fontsize=12, y=1.02)
+    fig.suptitle(f"Codon usage: MGE vs core genome{title_suffix} — {sample_id}", fontsize=12, y=1.02)
     fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+# ─── Plot: Per-codon ΔRSCU deviation heatmap ─────────────────────────────────
+
+
+def plot_codon_deviation_heatmap(
+    rscu_gene_df: pd.DataFrame,
+    enc_df: pd.DataFrame,
+    mahal_cluster_rscu: dict[str, float] | None,
+    mahal_cluster_gene_ids: set | None,
+    hgt_df: pd.DataFrame | None,
+    phage_mobile_df: pd.DataFrame | None,
+    output_path: Path,
+    sample_id: str = "",
+    gff_path: Path | None = None,
+    window_size: int = 30,
+):
+    """Per-codon ΔRSCU heatmap with genes ordered by genomic position.
+
+    Each cell shows the deviation of a gene's (or gene-window's) RSCU from the
+    Mahalanobis cluster mean for a given codon.  Rows = codons (hierarchically
+    clustered), columns = genes/windows in genome order.  Top annotation tracks
+    mark Mahalanobis cluster membership, HGT candidates, and MGE/phage genes.
+
+    For genomes with >200 genes, a sliding window of *window_size* genes is
+    applied, showing the mean ΔRSCU per window.
+
+    Args:
+        rscu_gene_df: Per-gene RSCU table with a ``gene`` column.
+        enc_df: ENC + GC3 per gene.
+        mahal_cluster_rscu: Mahalanobis cluster mean RSCU dict (keys = RSCU
+            column names like 'Phe-UUU').
+        mahal_cluster_gene_ids: Gene IDs in the translationally optimized cluster.
+        hgt_df: HGT detection DataFrame (optional).
+        phage_mobile_df: Phage/mobile element DataFrame (optional).
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+        gff_path: GFF3 file for genomic coordinates (optional).
+        window_size: Sliding window width when gene count exceeds 200.
+    """
+    _apply_style()
+    if mahal_cluster_rscu is None or rscu_gene_df is None or rscu_gene_df.empty:
+        return
+
+    rscu_cols = [c for c in RSCU_COLUMN_NAMES
+                 if c in rscu_gene_df.columns and c in mahal_cluster_rscu]
+    if len(rscu_cols) < 10:
+        return
+
+    # Gene positions for genome-order sorting
+    gene_positions = _get_gene_positions(rscu_gene_df, enc_df, gff_path)
+    if gene_positions.empty:
+        return
+    ordered_genes = gene_positions["gene"].tolist()
+
+    # Filter to genes present in RSCU data
+    gene_set = set(rscu_gene_df["gene"])
+    ordered_genes = [g for g in ordered_genes if g in gene_set]
+    if len(ordered_genes) < 10:
+        return
+
+    # Build ΔRSCU matrix (genes × codons)
+    ref_vec = np.array([mahal_cluster_rscu[c] for c in rscu_cols])
+    gene_rscu = rscu_gene_df.set_index("gene").loc[
+        [g for g in ordered_genes if g in rscu_gene_df["gene"].values], rscu_cols
+    ]
+    ordered_genes = gene_rscu.index.tolist()
+    delta = gene_rscu.values - ref_vec  # (n_genes, n_codons)
+
+    # Annotation vectors for ordered genes
+    mahal_set = mahal_cluster_gene_ids or set()
+    mge_genes = set()
+    if phage_mobile_df is not None and not phage_mobile_df.empty:
+        for col in ("is_mobilome", "is_phage_related", "is_phage", "phage_related", "mobilome"):
+            if col in phage_mobile_df.columns:
+                mge_genes |= set(phage_mobile_df.loc[phage_mobile_df[col].astype(bool), "gene"])
+    hgt_genes = set()
+    if hgt_df is not None and "hgt_flag" in hgt_df.columns:
+        hgt_genes = set(hgt_df.loc[hgt_df["hgt_flag"], "gene"]) - mge_genes
+
+    # Apply sliding window if genome is large
+    use_window = len(ordered_genes) > 200
+    if use_window:
+        n_windows = len(ordered_genes) - window_size + 1
+        if n_windows < 5:
+            use_window = False
+
+    if use_window:
+        window_delta = np.array([
+            delta[i:i + window_size].mean(axis=0) for i in range(n_windows)
+        ])
+        # Window annotation: fraction of window in each class
+        window_mahal = np.array([
+            sum(1 for g in ordered_genes[i:i + window_size] if g in mahal_set) / window_size
+            for i in range(n_windows)
+        ])
+        window_mge = np.array([
+            sum(1 for g in ordered_genes[i:i + window_size] if g in mge_genes) / window_size
+            for i in range(n_windows)
+        ])
+        window_hgt = np.array([
+            sum(1 for g in ordered_genes[i:i + window_size] if g in hgt_genes) / window_size
+            for i in range(n_windows)
+        ])
+        plot_matrix = window_delta.T  # (n_codons, n_windows)
+        x_label = f"Genome position (sliding window, w={window_size} genes)"
+        n_cols = n_windows
+    else:
+        plot_matrix = delta.T  # (n_codons, n_genes)
+        window_mahal = np.array([1.0 if g in mahal_set else 0.0 for g in ordered_genes])
+        window_mge = np.array([1.0 if g in mge_genes else 0.0 for g in ordered_genes])
+        window_hgt = np.array([1.0 if g in hgt_genes else 0.0 for g in ordered_genes])
+        x_label = "Gene (genome order)"
+        n_cols = len(ordered_genes)
+
+    # Hierarchically cluster codons (rows)
+    try:
+        row_link = linkage(plot_matrix, method="ward", metric="euclidean")
+        row_order = dendrogram(row_link, no_plot=True)["leaves"]
+    except Exception:
+        row_order = list(range(len(rscu_cols)))
+
+    plot_matrix = plot_matrix[row_order, :]
+    codon_labels = [rscu_cols[i] for i in row_order]
+
+    # Amino acid color strip for row annotation
+    aa_map = {}
+    for aa, cols in AMINO_ACID_FAMILIES.items():
+        for c in cols:
+            aa_map[c] = aa
+    aa_labels = [aa_map.get(c, "?") for c in codon_labels]
+    unique_aas = sorted(set(aa_labels))
+    aa_palette = dict(zip(unique_aas, sns.color_palette("husl", len(unique_aas))))
+    aa_colors = [aa_palette[a] for a in aa_labels]
+
+    # Determine symmetric colormap range
+    vmax = np.nanpercentile(np.abs(plot_matrix), 98)
+    vmax = max(vmax, 0.1)
+
+    # Figure layout: annotation tracks on top, heatmap below, AA sidebar left
+    fig_width = max(10, min(22, n_cols * 0.03 + 3))
+    fig = plt.figure(figsize=(fig_width, 10))
+    gs = gridspec.GridSpec(
+        4, 2, figure=fig,
+        height_ratios=[0.3, 0.3, 0.3, 10],
+        width_ratios=[0.5, 20],
+        hspace=0.05, wspace=0.02,
+    )
+
+    # Annotation tracks (top 3 rows, right column)
+    ax_mahal_track = fig.add_subplot(gs[0, 1])
+    ax_hgt_track = fig.add_subplot(gs[1, 1], sharex=ax_mahal_track)
+    ax_mge_track = fig.add_subplot(gs[2, 1], sharex=ax_mahal_track)
+    ax_heat = fig.add_subplot(gs[3, 1], sharex=ax_mahal_track)
+    ax_aa = fig.add_subplot(gs[3, 0], sharey=ax_heat)
+
+    # Mahalanobis cluster track
+    ax_mahal_track.imshow(
+        window_mahal[np.newaxis, :], aspect="auto",
+        cmap="Greens", vmin=0, vmax=1, interpolation="nearest",
+    )
+    ax_mahal_track.set_ylabel("Mahal.", fontsize=7, rotation=0, ha="right", va="center")
+    ax_mahal_track.set_yticks([])
+    ax_mahal_track.tick_params(labelbottom=False)
+
+    # HGT track
+    ax_hgt_track.imshow(
+        window_hgt[np.newaxis, :], aspect="auto",
+        cmap="Oranges", vmin=0, vmax=1, interpolation="nearest",
+    )
+    ax_hgt_track.set_ylabel("HGT", fontsize=7, rotation=0, ha="right", va="center")
+    ax_hgt_track.set_yticks([])
+    ax_hgt_track.tick_params(labelbottom=False)
+
+    # MGE track
+    ax_mge_track.imshow(
+        window_mge[np.newaxis, :], aspect="auto",
+        cmap="Reds", vmin=0, vmax=1, interpolation="nearest",
+    )
+    ax_mge_track.set_ylabel("MGE", fontsize=7, rotation=0, ha="right", va="center")
+    ax_mge_track.set_yticks([])
+    ax_mge_track.tick_params(labelbottom=False)
+
+    # Main heatmap
+    im = ax_heat.imshow(
+        plot_matrix, aspect="auto",
+        cmap="RdBu_r", vmin=-vmax, vmax=vmax, interpolation="nearest",
+    )
+    ax_heat.set_xlabel(x_label, fontsize=9)
+    ax_heat.set_ylabel("")
+    # Only show codon labels if few enough to be legible
+    if len(codon_labels) <= 65:
+        ax_heat.set_yticks(range(len(codon_labels)))
+        ax_heat.set_yticklabels(codon_labels, fontsize=5)
+    else:
+        ax_heat.set_yticks([])
+
+    ax_heat.set_xticks([])
+
+    # Amino acid sidebar
+    aa_img = np.zeros((len(aa_colors), 1, 3))
+    for i, c in enumerate(aa_colors):
+        aa_img[i, 0, :] = c[:3]
+    ax_aa.imshow(aa_img, aspect="auto", interpolation="nearest")
+    ax_aa.set_xticks([])
+    ax_aa.set_yticks([])
+    ax_aa.set_xlabel("AA", fontsize=7)
+
+    # Colorbar
+    cbar = fig.colorbar(im, ax=ax_heat, orientation="vertical", fraction=0.02, pad=0.01)
+    cbar.set_label("ΔRSCU from Mahal. cluster mean", fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
+
+    fig.suptitle(
+        f"Per-codon RSCU deviation from translationally optimized cluster — {sample_id}",
+        fontsize=11, y=0.98,
+    )
+    _save_fig(fig, output_path)
+
+
+# ─── Plot: Binned Mahalanobis distance genome landscape ──────────────────────
+
+
+def plot_binned_mahal_landscape(
+    enc_df: pd.DataFrame,
+    hgt_df: pd.DataFrame | None,
+    rscu_gene_df: pd.DataFrame,
+    mahal_cluster_gene_ids: set | None,
+    phage_mobile_df: pd.DataFrame | None,
+    output_path: Path,
+    sample_id: str = "",
+    gff_path: Path | None = None,
+    n_bins: int = 5,
+):
+    """Genome landscape with Mahalanobis distance colored by quantile bins.
+
+    Upper track: each gene colored by its Mahalanobis distance quantile bin.
+    Lower track: GC3 deviation from genome mean (shared x-axis).
+    Genes in the translationally optimized cluster are in the lowest bin and
+    colored distinctly.
+
+    Args:
+        enc_df: ENC + GC3 per gene.
+        hgt_df: HGT detection DataFrame with ``mahalanobis_dist`` column.
+        rscu_gene_df: Per-gene RSCU table (for gene ordering).
+        mahal_cluster_gene_ids: Genes in the Mahalanobis cluster.
+        phage_mobile_df: Phage/mobile element DataFrame (optional).
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+        gff_path: GFF3 file for genomic coordinates (optional).
+        n_bins: Number of quantile bins for Mahalanobis distance.
+    """
+    _apply_style()
+    if (hgt_df is None or "mahalanobis_dist" not in hgt_df.columns
+            or enc_df is None or enc_df.empty or rscu_gene_df is None):
+        return
+
+    gene_positions = _get_gene_positions(rscu_gene_df, enc_df, gff_path)
+    if gene_positions.empty:
+        return
+
+    merged = gene_positions.merge(
+        hgt_df[["gene", "mahalanobis_dist"]], on="gene", how="left"
+    )
+    merged = merged.merge(enc_df[["gene", "GC3"]], on="gene", how="left")
+    merged = merged.dropna(subset=["mahalanobis_dist"])
+    if len(merged) < 10:
+        return
+
+    x = merged["position"].values
+    dists = merged["mahalanobis_dist"].values
+    genes = merged["gene"].values
+
+    # Assign quantile bins
+    bin_edges = np.nanpercentile(dists, np.linspace(0, 100, n_bins + 1))
+    bin_edges[-1] += 1e-6  # ensure max value is included
+    bin_labels = np.digitize(dists, bin_edges) - 1
+    bin_labels = np.clip(bin_labels, 0, n_bins - 1)
+
+    # Override: cluster members always get bin 0
+    mahal_set = mahal_cluster_gene_ids or set()
+    for i, g in enumerate(genes):
+        if g in mahal_set:
+            bin_labels[i] = 0
+
+    # Colormap: green (optimized) → yellow → orange → red (divergent)
+    bin_cmap = plt.cm.get_cmap("RdYlGn_r", n_bins)
+    bin_colors = [bin_cmap(b / (n_bins - 1)) for b in bin_labels]
+
+    # MGE/HGT gene sets for highlighting
+    mge_genes = set()
+    if phage_mobile_df is not None and not phage_mobile_df.empty:
+        for col in ("is_mobilome", "is_phage_related", "is_phage", "phage_related", "mobilome"):
+            if col in phage_mobile_df.columns:
+                mge_genes |= set(phage_mobile_df.loc[phage_mobile_df[col].astype(bool), "gene"])
+    hgt_genes = set()
+    if "hgt_flag" in hgt_df.columns:
+        hgt_genes = set(hgt_df.loc[hgt_df["hgt_flag"], "gene"]) - mge_genes
+
+    fig, (ax_top, ax_bot) = plt.subplots(
+        2, 1, figsize=(14, 7), sharex=True,
+        gridspec_kw={"height_ratios": [1.3, 1], "hspace": 0.08},
+    )
+
+    # Upper track: scatter colored by bin
+    ax_top.scatter(x, dists, c=bin_colors, s=6, alpha=0.7,
+                   edgecolors="none", rasterized=True, zorder=2)
+
+    # Overlay MGE/HGT markers
+    gene_to_idx = {g: i for i, g in enumerate(genes)}
+    for g in mge_genes:
+        if g in gene_to_idx:
+            i = gene_to_idx[g]
+            ax_top.axvline(x[i], color="#e84040", alpha=0.2, linewidth=1.2, zorder=1)
+    for g in hgt_genes:
+        if g in gene_to_idx:
+            i = gene_to_idx[g]
+            ax_top.axvline(x[i], color="#d9a032", alpha=0.15, linewidth=0.8, zorder=1)
+
+    ax_top.set_ylabel("Mahalanobis distance", fontsize=10)
+
+    # Bin legend
+    from matplotlib.patches import Patch
+    bin_patches = []
+    for b in range(n_bins):
+        lo = bin_edges[b]
+        hi = bin_edges[b + 1] if b + 1 < len(bin_edges) else bin_edges[-1]
+        lbl = f"Q{b + 1} ({lo:.1f}–{hi:.1f})"
+        if b == 0:
+            lbl = f"Q1 / optimized (≤{hi:.1f})"
+        bin_patches.append(Patch(facecolor=bin_cmap(b / (n_bins - 1)), label=lbl))
+    if mge_genes:
+        bin_patches.append(Patch(facecolor="#e84040", alpha=0.4, label="MGE/phage"))
+    if hgt_genes:
+        bin_patches.append(Patch(facecolor="#d9a032", alpha=0.4, label="HGT candidate"))
+    ax_top.legend(handles=bin_patches, loc="upper right", fontsize=6, ncol=2)
+
+    # Lower track: GC3
+    gc3 = merged["GC3"].values
+    gc3_mean = np.nanmean(gc3)
+    ax_bot.fill_between(x, gc3_mean, gc3, where=gc3 >= gc3_mean,
+                        color="#e8853d", alpha=0.4, linewidth=0, interpolate=True)
+    ax_bot.fill_between(x, gc3_mean, gc3, where=gc3 < gc3_mean,
+                        color="#5fa85f", alpha=0.4, linewidth=0, interpolate=True)
+    ax_bot.plot(x, gc3, color="#444444", linewidth=0.5, alpha=0.7)
+    ax_bot.axhline(gc3_mean, color="black", linestyle=":", linewidth=0.8, alpha=0.5)
+    ax_bot.set_ylabel("GC3", fontsize=10)
+    ax_bot.set_xlabel(
+        "Gene position (index)" if gff_path is None else "Genome position (kb)"
+    )
+
+    ax_top.set_title(
+        f"Mahalanobis distance landscape (quantile-binned) — {sample_id}",
+        fontsize=12,
+    )
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+# ─── Plot: COA biplot with Mahalanobis distance coloring ─────────────────────
+
+
+def plot_coa_mahal_biplot(
+    mahal_coa_coords: pd.DataFrame,
+    mahal_cluster_gene_ids: set | None,
+    hgt_df: pd.DataFrame | None,
+    phage_mobile_df: pd.DataFrame | None,
+    output_path: Path,
+    sample_id: str = "",
+    coa_inertia: pd.DataFrame | None = None,
+):
+    """COA biplot of all genes colored by Mahalanobis distance from the RP centroid.
+
+    Genes in the translationally optimized cluster are circled.  HGT candidates
+    and MGE/phage genes are marked with distinct symbols.  A Mahalanobis
+    threshold ellipse is drawn when distance data is available.
+
+    Args:
+        mahal_coa_coords: DataFrame with gene, Axis1, Axis2, and optionally
+            ``mahalanobis_dist`` and ``mahal_cluster`` columns (from
+            ``run_mahal_clustering``).
+        mahal_cluster_gene_ids: Gene IDs in the optimized cluster.
+        hgt_df: HGT detection DataFrame (optional).
+        phage_mobile_df: Phage/mobile element DataFrame (optional).
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+        coa_inertia: COA inertia table with ``pct_inertia`` column (optional,
+            for axis labels).
+    """
+    _apply_style()
+    if mahal_coa_coords is None or mahal_coa_coords.empty:
+        return
+    if "Axis1" not in mahal_coa_coords.columns or "Axis2" not in mahal_coa_coords.columns:
+        return
+
+    df = mahal_coa_coords.copy()
+    x = df["Axis1"].values
+    y = df["Axis2"].values
+    genes = df["gene"].values
+
+    has_dist = "mahalanobis_dist" in df.columns
+    dists = df["mahalanobis_dist"].values if has_dist else np.zeros(len(df))
+
+    # Gene class sets
+    mahal_set = mahal_cluster_gene_ids or set()
+    mge_genes = set()
+    if phage_mobile_df is not None and not phage_mobile_df.empty:
+        for col in ("is_mobilome", "is_phage_related", "is_phage", "phage_related", "mobilome"):
+            if col in phage_mobile_df.columns:
+                mge_genes |= set(phage_mobile_df.loc[phage_mobile_df[col].astype(bool), "gene"])
+    hgt_genes = set()
+    if hgt_df is not None and "hgt_flag" in hgt_df.columns:
+        hgt_genes = set(hgt_df.loc[hgt_df["hgt_flag"], "gene"]) - mge_genes
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+
+    # Background: all genes colored by Mahalanobis distance
+    if has_dist:
+        valid = ~np.isnan(dists)
+        vmax = np.nanpercentile(dists[valid], 95) if valid.any() else 1.0
+        norm = plt.Normalize(vmin=0, vmax=max(vmax, 0.1))
+        sc = ax.scatter(
+            x[valid], y[valid], c=dists[valid], cmap="viridis_r", norm=norm,
+            s=8, alpha=0.5, edgecolors="none", rasterized=True, zorder=2,
+        )
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.03, pad=0.02)
+        cbar.set_label("Mahalanobis distance", fontsize=9)
+        cbar.ax.tick_params(labelsize=7)
+    else:
+        ax.scatter(x, y, c="#cccccc", s=8, alpha=0.4,
+                   edgecolors="none", rasterized=True, zorder=2)
+
+    # Overlay: cluster members (green edge ring)
+    cluster_mask = np.array([g in mahal_set for g in genes])
+    if cluster_mask.any():
+        ax.scatter(
+            x[cluster_mask], y[cluster_mask],
+            facecolors="none", edgecolors="#2ca02c", linewidths=0.6,
+            s=20, alpha=0.8, zorder=3, label=f"Optimized cluster (n={cluster_mask.sum()})",
+        )
+
+    # Overlay: MGE genes
+    mge_mask = np.array([g in mge_genes for g in genes])
+    if mge_mask.any():
+        ax.scatter(
+            x[mge_mask], y[mge_mask],
+            marker="s", facecolors="#e84040", edgecolors="white",
+            linewidths=0.3, s=18, alpha=0.8, zorder=4,
+            label=f"MGE/phage (n={mge_mask.sum()})",
+        )
+
+    # Overlay: HGT candidates
+    hgt_mask = np.array([g in hgt_genes for g in genes])
+    if hgt_mask.any():
+        ax.scatter(
+            x[hgt_mask], y[hgt_mask],
+            marker="^", facecolors="#d9a032", edgecolors="white",
+            linewidths=0.3, s=18, alpha=0.8, zorder=4,
+            label=f"HGT candidate (n={hgt_mask.sum()})",
+        )
+
+    # Axis labels with inertia percentages if available
+    pct1, pct2 = 0.0, 0.0
+    if coa_inertia is not None and "pct_inertia" in coa_inertia.columns:
+        if len(coa_inertia) >= 1:
+            pct1 = float(coa_inertia["pct_inertia"].iloc[0])
+        if len(coa_inertia) >= 2:
+            pct2 = float(coa_inertia["pct_inertia"].iloc[1])
+
+    ax.set_xlabel(f"COA Axis 1 ({pct1:.1f}% inertia)" if pct1 > 0 else "COA Axis 1", fontsize=10)
+    ax.set_ylabel(f"COA Axis 2 ({pct2:.1f}% inertia)" if pct2 > 0 else "COA Axis 2", fontsize=10)
+    ax.set_title(f"Codon usage space (COA) — {sample_id}", fontsize=12)
+    ax.legend(fontsize=7, framealpha=0.7, loc="best")
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+
+
+# ─── Plot: Circular genome codon usage map ───────────────────────────────────
+
+
+def plot_circular_cu_map(
+    rscu_gene_df: pd.DataFrame,
+    enc_df: pd.DataFrame,
+    hgt_df: pd.DataFrame | None,
+    phage_mobile_df: pd.DataFrame | None,
+    mahal_cluster_gene_ids: set | None,
+    mahal_cluster_rscu: dict[str, float] | None,
+    output_path: Path,
+    sample_id: str = "",
+    gff_path: Path | None = None,
+):
+    """Circular genome map with concentric codon-usage rings.
+
+    Outer ring: Mahalanobis distance heatmap (gene-level).
+    Middle ring: GC3 deviation from genome mean.
+    Inner ring: Mahalanobis cluster membership (binary green/grey).
+    HGT and MGE genes are highlighted with tick marks on the perimeter.
+
+    Uses matplotlib polar projection — no external Circos library needed.
+
+    Args:
+        rscu_gene_df: Per-gene RSCU table.
+        enc_df: ENC + GC3 per gene.
+        hgt_df: HGT detection DataFrame (optional).
+        phage_mobile_df: Phage/mobile element DataFrame (optional).
+        mahal_cluster_gene_ids: Gene IDs in the optimized cluster.
+        mahal_cluster_rscu: Mahalanobis cluster mean RSCU (for Euclidean
+            distance fallback if Mahalanobis distance unavailable).
+        output_path: Base path for saving.
+        sample_id: Sample identifier.
+        gff_path: GFF3 file for genomic coordinates (optional).
+    """
+    _apply_style()
+    if enc_df is None or enc_df.empty or rscu_gene_df is None:
+        return
+
+    gene_positions = _get_gene_positions(rscu_gene_df, enc_df, gff_path)
+    if gene_positions.empty or len(gene_positions) < 10:
+        return
+
+    genes = gene_positions["gene"].values
+    n_genes = len(genes)
+
+    # Compute angular positions (evenly spaced around circle)
+    theta = np.linspace(0, 2 * np.pi, n_genes, endpoint=False)
+    bar_width = 2 * np.pi / n_genes * 0.95
+
+    # Merge metrics
+    merged = gene_positions.copy()
+    merged = merged.merge(enc_df[["gene", "GC3"]], on="gene", how="left")
+
+    # Mahalanobis distance
+    has_mahal_dist = False
+    if hgt_df is not None and "mahalanobis_dist" in hgt_df.columns:
+        merged = merged.merge(hgt_df[["gene", "mahalanobis_dist"]], on="gene", how="left")
+        has_mahal_dist = True
+
+    # Euclidean distance fallback
+    if not has_mahal_dist and mahal_cluster_rscu is not None:
+        rscu_cols = [c for c in RSCU_COLUMN_NAMES
+                     if c in rscu_gene_df.columns and c in mahal_cluster_rscu]
+        if len(rscu_cols) >= 10:
+            ref = np.array([mahal_cluster_rscu[c] for c in rscu_cols])
+            gene_vals = rscu_gene_df.set_index("gene").reindex(genes)[rscu_cols].values
+            euclid = np.sqrt(np.nansum((gene_vals - ref) ** 2, axis=1))
+            merged["mahalanobis_dist"] = euclid
+            has_mahal_dist = True
+
+    dist_col = "mahalanobis_dist" if has_mahal_dist else None
+
+    mahal_set = mahal_cluster_gene_ids or set()
+    mge_genes = set()
+    if phage_mobile_df is not None and not phage_mobile_df.empty:
+        for col in ("is_mobilome", "is_phage_related", "is_phage", "phage_related", "mobilome"):
+            if col in phage_mobile_df.columns:
+                mge_genes |= set(phage_mobile_df.loc[phage_mobile_df[col].astype(bool), "gene"])
+    hgt_genes = set()
+    if hgt_df is not None and "hgt_flag" in hgt_df.columns:
+        hgt_genes = set(hgt_df.loc[hgt_df["hgt_flag"], "gene"]) - mge_genes
+
+    fig = plt.figure(figsize=(10, 10))
+
+    # Three concentric rings using polar axes
+    # Outer ring: r = [0.7, 1.0] — Mahalanobis distance
+    # Middle ring: r = [0.45, 0.65] — GC3
+    # Inner ring: r = [0.25, 0.40] — cluster membership
+
+    ax = fig.add_subplot(111, polar=True)
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+
+    # Outer ring: Mahalanobis distance heatmap
+    if dist_col and dist_col in merged.columns:
+        dvals = merged[dist_col].values
+        dvals_clean = np.nan_to_num(dvals, nan=0.0)
+        d_max = np.nanpercentile(dvals_clean[dvals_clean > 0], 95) if (dvals_clean > 0).any() else 1.0
+        d_max = max(d_max, 0.1)
+        d_norm = np.clip(dvals_clean / d_max, 0, 1)
+        cmap_outer = plt.cm.get_cmap("viridis_r")
+        outer_colors = [cmap_outer(v) for v in d_norm]
+        bars_outer = ax.bar(
+            theta, 0.30, width=bar_width, bottom=0.70,
+            color=outer_colors, edgecolor="none", alpha=0.85,
+        )
+
+    # Middle ring: GC3 deviation
+    gc3 = merged["GC3"].values
+    gc3_mean = np.nanmean(gc3)
+    gc3_dev = gc3 - gc3_mean
+    gc3_abs_max = np.nanpercentile(np.abs(gc3_dev), 95)
+    gc3_abs_max = max(gc3_abs_max, 0.01)
+    gc3_norm = np.clip(gc3_dev / gc3_abs_max, -1, 1)
+    cmap_gc3 = plt.cm.get_cmap("RdYlGn_r")
+    gc3_colors = [cmap_gc3((v + 1) / 2) for v in gc3_norm]
+    ax.bar(
+        theta, 0.20, width=bar_width, bottom=0.45,
+        color=gc3_colors, edgecolor="none", alpha=0.85,
+    )
+
+    # Inner ring: cluster membership (green = in cluster, light grey = not)
+    cluster_colors = ["#2ca02c" if g in mahal_set else "#e0e0e0" for g in genes]
+    ax.bar(
+        theta, 0.15, width=bar_width, bottom=0.25,
+        color=cluster_colors, edgecolor="none", alpha=0.85,
+    )
+
+    # Perimeter markers: MGE (red) and HGT (orange)
+    gene_to_theta = dict(zip(genes, theta))
+    for g in mge_genes:
+        if g in gene_to_theta:
+            ax.plot(gene_to_theta[g], 1.03, "|", color="#e84040",
+                    markersize=6, alpha=0.7, zorder=5)
+    for g in hgt_genes:
+        if g in gene_to_theta:
+            ax.plot(gene_to_theta[g], 1.03, "|", color="#d9a032",
+                    markersize=4, alpha=0.6, zorder=5)
+
+    # Clean up axes
+    ax.set_ylim(0, 1.1)
+    ax.set_yticks([])
+    ax.set_xticks([])
+    ax.spines["polar"].set_visible(False)
+    ax.grid(False)
+
+    # Ring labels
+    label_angle = np.pi / 2 + 0.15  # slightly offset from 12 o'clock
+    ax.text(label_angle, 0.85, "Mahal.\ndist.", fontsize=7,
+            ha="center", va="center", color="white",
+            path_effects=[pe.withStroke(linewidth=2, foreground="black")])
+    ax.text(label_angle, 0.55, "GC3\ndev.", fontsize=7,
+            ha="center", va="center", color="white",
+            path_effects=[pe.withStroke(linewidth=2, foreground="black")])
+    ax.text(label_angle, 0.33, "Cluster", fontsize=7,
+            ha="center", va="center", color="white",
+            path_effects=[pe.withStroke(linewidth=2, foreground="black")])
+
+    # Legend
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+    legend_handles = [
+        Patch(facecolor="#2ca02c", label="Transl. optimized"),
+        Patch(facecolor="#e0e0e0", label="Non-optimized"),
+        Line2D([0], [0], marker="|", color="#e84040", label="MGE/phage",
+               linestyle="None", markersize=8),
+        Line2D([0], [0], marker="|", color="#d9a032", label="HGT candidate",
+               linestyle="None", markersize=8),
+    ]
+    ax.legend(
+        handles=legend_handles, loc="lower right",
+        bbox_to_anchor=(1.15, -0.05), fontsize=7, framealpha=0.8,
+    )
+
+    ax.set_title(f"Circular codon usage map — {sample_id}", fontsize=12, pad=20)
     _save_fig(fig, output_path)
 
 
@@ -3415,6 +4146,9 @@ def generate_single_genome_plots(
     gff_path: Path | None = None,
     mahal_cluster_rscu: "pd.Series | None" = None,
     mahal_cluster_size: int | None = None,
+    mahal_cluster_gene_ids: set | None = None,
+    mahal_coa_coords: pd.DataFrame | None = None,
+    coa_inertia: pd.DataFrame | None = None,
 ) -> dict[str, Path]:
     """Generate all single-genome plots.
 
@@ -3931,6 +4665,7 @@ def _generate_bio_ecology_plots(
             plot_genomic_cu_landscape(
                 rscu_gene_df, enc_df, hgt_data, phage_data,
                 p, sample_id, gff_path=gff_path,
+                mahal_cluster_gene_ids=mahal_cluster_gene_ids,
             )
             outputs["genomic_cu_landscape"] = p.with_suffix(".png")
         except Exception as e:
@@ -3946,12 +4681,82 @@ def _generate_bio_ecology_plots(
                 rscu_gene_df, enc_df, hgt_data, phage_data, expr_df,
                 p, sample_id,
                 mahal_cluster_rscu=mahal_cluster_rscu,
+                mahal_cluster_gene_ids=mahal_cluster_gene_ids,
             )
             outputs["mge_vs_core_rscu"] = p.with_suffix(".png")
         except Exception as e:
             logger.warning("MGE vs core RSCU plot failed: %s", e)
     else:
         logger.info("SKIPPED: MGE vs core RSCU plot (no HGT data)")
+
+    # Per-codon ΔRSCU deviation heatmap
+    if (rscu_gene_df is not None and enc_df is not None
+            and mahal_cluster_rscu is not None):
+        try:
+            p = plot_dir / f"{sample_id}_codon_deviation_heatmap"
+            plot_codon_deviation_heatmap(
+                rscu_gene_df, enc_df,
+                mahal_cluster_rscu=dict(mahal_cluster_rscu) if mahal_cluster_rscu is not None else None,
+                mahal_cluster_gene_ids=mahal_cluster_gene_ids,
+                hgt_df=hgt_data, phage_mobile_df=phage_data,
+                output_path=p, sample_id=sample_id, gff_path=gff_path,
+            )
+            outputs["codon_deviation_heatmap"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Codon deviation heatmap failed: %s", e)
+    else:
+        logger.info("SKIPPED: codon deviation heatmap (no Mahalanobis cluster RSCU)")
+
+    # Binned Mahalanobis distance genome landscape
+    if (hgt_data is not None and rscu_gene_df is not None
+            and enc_df is not None and mahal_cluster_gene_ids):
+        try:
+            p = plot_dir / f"{sample_id}_binned_mahal_landscape"
+            plot_binned_mahal_landscape(
+                enc_df, hgt_data, rscu_gene_df,
+                mahal_cluster_gene_ids=mahal_cluster_gene_ids,
+                phage_mobile_df=phage_data,
+                output_path=p, sample_id=sample_id, gff_path=gff_path,
+            )
+            outputs["binned_mahal_landscape"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Binned Mahalanobis landscape plot failed: %s", e)
+    else:
+        logger.info("SKIPPED: binned Mahalanobis landscape (no HGT/cluster data)")
+
+    # COA biplot with Mahalanobis distance coloring
+    if mahal_coa_coords is not None and not mahal_coa_coords.empty:
+        try:
+            p = plot_dir / f"{sample_id}_coa_mahal_biplot"
+            plot_coa_mahal_biplot(
+                mahal_coa_coords,
+                mahal_cluster_gene_ids=mahal_cluster_gene_ids,
+                hgt_df=hgt_data, phage_mobile_df=phage_data,
+                output_path=p, sample_id=sample_id,
+                coa_inertia=coa_inertia,
+            )
+            outputs["coa_mahal_biplot"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("COA Mahalanobis biplot failed: %s", e)
+    else:
+        logger.info("SKIPPED: COA Mahalanobis biplot (no COA coordinates)")
+
+    # Circular genome codon usage map
+    if rscu_gene_df is not None and enc_df is not None:
+        try:
+            p = plot_dir / f"{sample_id}_circular_cu_map"
+            plot_circular_cu_map(
+                rscu_gene_df, enc_df,
+                hgt_df=hgt_data, phage_mobile_df=phage_data,
+                mahal_cluster_gene_ids=mahal_cluster_gene_ids,
+                mahal_cluster_rscu=dict(mahal_cluster_rscu) if mahal_cluster_rscu is not None else None,
+                output_path=p, sample_id=sample_id, gff_path=gff_path,
+            )
+            outputs["circular_cu_map"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Circular CU map failed: %s", e)
+    else:
+        logger.info("SKIPPED: circular CU map (no RSCU/ENC data)")
 
 
 def generate_batch_plots(
