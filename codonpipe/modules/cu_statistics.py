@@ -63,6 +63,9 @@ def _cu_statistic_r_script(metric_func: str) -> str:
     Args:
         metric_func: coRdon function name — "ENCprime" or "MILC".
     """
+    _VALID_METRICS = {"ENCprime", "MILC"}
+    if metric_func not in _VALID_METRICS:
+        raise ValueError(f"Unknown CU metric {metric_func!r}; expected one of {_VALID_METRICS}")
     return _CU_STATISTIC_R_TEMPLATE.replace("__METRIC__", metric_func)
 
 
