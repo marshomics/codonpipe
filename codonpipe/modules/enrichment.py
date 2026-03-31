@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from codonpipe import __version__
 from codonpipe.utils.statistics import benjamini_hochberg
 
 logger = logging.getLogger("codonpipe")
@@ -146,7 +147,7 @@ def _download_kegg_ko_map(max_retries: int = 3) -> dict[str, set[str]]:
         try:
             logger.info("Downloading KO-pathway mapping from KEGG REST API (attempt %d/%d)...",
                         attempt, max_retries)
-            req = urllib.request.Request(_KEGG_LINK_URL, headers={"User-Agent": "CodonPipe/0.1"})
+            req = urllib.request.Request(_KEGG_LINK_URL, headers={"User-Agent": f"CodonPipe/{__version__}"})
             with urllib.request.urlopen(req, timeout=60) as resp:
                 text = resp.read().decode("utf-8")
             break  # success
@@ -191,7 +192,7 @@ def _download_kegg_pathway_names(max_retries: int = 3) -> dict[str, str]:
     last_exc: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
-            req = urllib.request.Request(_KEGG_PATHWAY_LIST_URL, headers={"User-Agent": "CodonPipe/0.1"})
+            req = urllib.request.Request(_KEGG_PATHWAY_LIST_URL, headers={"User-Agent": f"CodonPipe/{__version__}"})
             with urllib.request.urlopen(req, timeout=60) as resp:
                 text = resp.read().decode("utf-8")
             break  # success
