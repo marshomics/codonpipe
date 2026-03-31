@@ -340,8 +340,10 @@ def run_stability_analysis(
         else:
             size_score = 0.0
 
-        # Composite stability score
-        cos_term = cosine_sim if not np.isnan(cosine_sim) else 0.8  # default if unavailable
+        # Composite stability score.
+        # When cosine similarity could not be computed, use a neutral 0.5
+        # (midpoint of the [0, 1] range) to avoid inflating the score.
+        cos_term = cosine_sim if not np.isnan(cosine_sim) else 0.5
         composite = (
             _W_JACCARD * mean_jaccard
             + _W_MEAN_FREQ * mean_core_freq
