@@ -1174,7 +1174,7 @@ def between_condition_enrichment_comparison(
                 f"n_enriched_{g2}": n2_enriched,
                 f"n_samples_{g2}": n2_total,
                 f"frac_enriched_{g2}": round(n2_enriched / n2_total, 3),
-                "odds_ratio": round(odds_ratio, 3) if np.isfinite(odds_ratio) else np.inf,
+                "odds_ratio": round(odds_ratio, 3) if np.isfinite(odds_ratio) else None,
                 "p_value": p_val,
             })
 
