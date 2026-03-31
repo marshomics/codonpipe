@@ -37,7 +37,9 @@ from Bio import SeqIO
 from codonpipe.modules.advanced_analyses import compute_coa_on_rscu
 from codonpipe.modules.rscu import compute_rscu_from_counts, count_codons
 from codonpipe.plotting.utils import DPI, FORMATS, STYLE_PARAMS, apply_style, save_fig
-from codonpipe.utils.codon_tables import MIN_GENE_LENGTH, RSCU_COLUMN_NAMES
+from codonpipe.utils.codon_tables import (
+    MIN_GENE_LENGTH, RSCU_COLUMN_NAMES, RSCU_COL_TO_CODON, AA_CODON_GROUPS_RSCU,
+)
 
 logger = logging.getLogger("codonpipe")
 
@@ -292,6 +294,90 @@ def _compute_cluster_rscu(
     return pd.Series({c: rscu_dict[c] for c in rscu_cols})
 
 
+def _rscu_to_adaptation_weights(cluster_rscu: pd.Series) -> dict[str, float]:
+    """Convert core-cluster RSCU values to per-codon adaptation weights.
+
+    For each synonymous family, w_codon = RSCU_codon / max(RSCU) within
+    the family. This follows Sharp & Li (1987): the weight for the most
+    preferred codon is 1.0, and all others are scaled relative to it.
+
+    Codons belonging to amino acids not represented in the cluster RSCU
+    (or with max RSCU = 0) are omitted, so they won't contribute to CAI.
+
+    Returns:
+        Dict mapping RNA codon (e.g. 'GCU') to its adaptation weight in (0, 1].
+    """
+    # Build a mapping from RSCU column name → codon
+    weights: dict[str, float] = {}
+    for family_label, codons in AA_CODON_GROUPS_RSCU.items():
+        # Find the RSCU column names for this family
+        family_cols = []
+        for col in RSCU_COLUMN_NAMES:
+            codon = RSCU_COL_TO_CODON[col]
+            if codon in codons:
+                family_cols.append((col, codon))
+
+        # Get RSCU values present in the cluster reference
+        vals = {}
+        for col, codon in family_cols:
+            if col in cluster_rscu.index:
+                vals[codon] = cluster_rscu[col]
+
+        if not vals:
+            continue
+        max_rscu = max(vals.values())
+        if max_rscu <= 0:
+            continue
+        for codon, rscu_val in vals.items():
+            w = rscu_val / max_rscu
+            # Floor at a small epsilon to avoid log(0) in geometric mean
+            weights[codon] = max(w, 1e-6)
+
+    return weights
+
+
+def _compute_core_cai(
+    ffn_path: Path,
+    adaptation_weights: dict[str, float],
+    min_length: int = MIN_GENE_LENGTH,
+) -> dict[str, float]:
+    """Compute CAI of each gene relative to the core-cluster codon preferences.
+
+    CAI (Sharp & Li 1987) is the geometric mean of the per-codon adaptation
+    weights across all sense codons in a gene.  Codons not present in the
+    weight table (stops, Met, Trp, or missing families) are skipped.
+
+    Args:
+        ffn_path: Nucleotide CDS FASTA.
+        adaptation_weights: Codon → weight from _rscu_to_adaptation_weights().
+        min_length: Minimum sequence length (nt).
+
+    Returns:
+        Dict mapping gene ID → core-relative CAI (0–1 scale).
+    """
+    from codonpipe.modules.rscu import dna_to_rna
+
+    gene_cai: dict[str, float] = {}
+
+    for rec in SeqIO.parse(str(ffn_path), "fasta"):
+        seq = str(rec.seq)
+        if len(seq) < min_length:
+            continue
+
+        rna = dna_to_rna(seq)
+        log_sum = 0.0
+        n = 0
+        for i in range(0, len(rna) - 2, 3):
+            codon = rna[i : i + 3]
+            if codon in adaptation_weights:
+                log_sum += np.log(adaptation_weights[codon])
+                n += 1
+
+        if n > 0:
+            gene_cai[rec.id] = float(np.exp(log_sum / n))
+        # else: gene has no scoreable codons, omit from dict
+
+    return gene_cai
 
 
 # ---------------------------------------------------------------------------
@@ -750,6 +836,24 @@ def run_mahal_clustering(
             cluster_rscu = pd.Series(dtype=float)
     results["mahal_cluster_rscu"] = cluster_rscu
 
+    # ── Step 7b: Core-relative CAI ───────────────────────────────────
+    # Derive per-codon adaptation weights from the core cluster RSCU,
+    # then score every gene's CAI against those weights.
+    gene_core_cai: dict[str, float] = {}
+    if not cluster_rscu.empty and ffn_path and ffn_path.exists():
+        adapt_weights = _rscu_to_adaptation_weights(cluster_rscu)
+        if adapt_weights:
+            gene_core_cai = _compute_core_cai(ffn_path, adapt_weights)
+            logger.info(
+                "Core-relative CAI computed for %d genes (mean=%.4f, median=%.4f)",
+                len(gene_core_cai),
+                float(np.mean(list(gene_core_cai.values()))) if gene_core_cai else 0.0,
+                float(np.median(list(gene_core_cai.values()))) if gene_core_cai else 0.0,
+            )
+        else:
+            logger.warning("Could not derive adaptation weights from cluster RSCU; skipping core CAI")
+    results["gene_core_cai"] = gene_core_cai
+
     # ── Step 8: Quality check — cosine similarity ─────────────────────
     rp_cosine_sim = np.nan
     if rp_rscu_df is not None and not rp_rscu_df.empty:
@@ -774,6 +878,7 @@ def run_mahal_clustering(
     cluster_df = pd.DataFrame({
         "gene": gene_ids,
         "mahalanobis_distance": distances,
+        "core_CAI": [gene_core_cai.get(gid, np.nan) for gid in gene_ids],
         "membership_score": probabilities[:, 1],
         "in_optimized_set": [gid in cluster_gene_ids for gid in gene_ids],
         "is_ribosomal_protein": [gid in rp_gene_ids for gid in gene_ids],
