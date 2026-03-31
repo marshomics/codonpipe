@@ -481,3 +481,176 @@ def _find_gene_column(df: pd.DataFrame) -> str | None:
     """Find the gene ID column in a KofamScan DataFrame."""
     from codonpipe.utils.io import find_gene_id_column
     return find_gene_id_column(df)
+
+
+# ── Gene-level codon usage inefficiency report ────────────────────────────────
+
+def generate_codon_inefficiency_report(
+    mahal_clusters_path: Path,
+    kofam_df: pd.DataFrame | None,
+    enrichment_results: dict[str, pd.DataFrame],
+    output_path: Path,
+    mahal_summary_path: Path | None = None,
+) -> Path | None:
+    """Produce a ranked table of all genes ordered by codon usage inefficiency.
+
+    Each gene is ranked by its Mahalanobis distance from the core cluster
+    centroid (descending — most divergent first).  The table includes
+    KO accession, and, for genes whose KO contributed to a significant
+    enrichment result, the names of significantly enriched and significantly
+    depleted KEGG pathways.
+
+    Args:
+        mahal_clusters_path: Path to ``{sample}_mahal_clusters.tsv``
+            (gene, mahalanobis_distance, membership_score, in_optimized_set,
+            is_ribosomal_protein).
+        kofam_df: KofamScan annotation DataFrame (gene_name, KO, KO_definition).
+        enrichment_results: Dict of enrichment DataFrames keyed like
+            ``"mahal_enrichment_MELP_high"``, ``"mahal_enrichment_CAI_low"``,
+            etc.  Each DataFrame must contain ``pathway``, ``pathway_name``,
+            ``test_kos_in_pathway``, and ``significant`` columns.
+        output_path: Where to write the TSV.
+        mahal_summary_path: Optional path to ``{sample}_mahal_summary.tsv``
+            used to normalize distances to the cluster threshold.
+
+    Returns:
+        output_path on success, None if no data was available.
+    """
+    if not mahal_clusters_path.exists():
+        logger.warning("Mahalanobis clusters file not found: %s", mahal_clusters_path)
+        return None
+
+    clusters = pd.read_csv(mahal_clusters_path, sep="\t")
+    if "gene" not in clusters.columns or "mahalanobis_distance" not in clusters.columns:
+        logger.warning("mahal_clusters.tsv missing expected columns")
+        return None
+
+    # Normalize distance to cluster threshold if available
+    threshold = None
+    if mahal_summary_path is not None and mahal_summary_path.exists():
+        try:
+            summary = pd.read_csv(mahal_summary_path, sep="\t")
+            if "mahalanobis_threshold" in summary.columns:
+                threshold = float(summary["mahalanobis_threshold"].iloc[0])
+        except Exception:
+            pass
+
+    if threshold and threshold > 0:
+        clusters["distance_ratio"] = (
+            clusters["mahalanobis_distance"] / threshold
+        ).round(4)
+    else:
+        clusters["distance_ratio"] = np.nan
+
+    # Merge KO accession and definition
+    if kofam_df is not None and not kofam_df.empty:
+        ko_col = _find_ko_column(kofam_df)
+        gene_col = _find_gene_column(kofam_df)
+        if ko_col and gene_col:
+            ko_info = kofam_df[[gene_col, ko_col]].copy()
+            if "KO_definition" in kofam_df.columns:
+                ko_info = kofam_df[[gene_col, ko_col, "KO_definition"]].copy()
+            ko_info = ko_info.rename(columns={gene_col: "gene", ko_col: "KO"})
+            clusters = clusters.merge(ko_info, on="gene", how="left")
+    if "KO" not in clusters.columns:
+        clusters["KO"] = np.nan
+    if "KO_definition" not in clusters.columns:
+        clusters["KO_definition"] = np.nan
+
+    # Build KO → significant pathway mappings from enrichment results.
+    # "low" tiers represent pathways depleted in efficiently-biased genes
+    # (i.e. over-represented among poorly-optimized genes).
+    # "high" tiers represent pathways enriched among efficiently-biased genes.
+    ko_to_depleted: dict[str, set[str]] = defaultdict(set)
+    ko_to_enriched: dict[str, set[str]] = defaultdict(set)
+
+    for key, enrich_df in enrichment_results.items():
+        if not isinstance(enrich_df, pd.DataFrame) or enrich_df.empty:
+            continue
+        if "significant" not in enrich_df.columns:
+            continue
+
+        sig_rows = enrich_df[enrich_df["significant"] == True]  # noqa: E712
+        if sig_rows.empty:
+            continue
+
+        # Determine whether this is a "low" or "high" tier enrichment
+        key_lower = key.lower()
+        is_low = "_low" in key_lower
+        is_high = "_high" in key_lower
+        if not is_low and not is_high:
+            continue
+
+        for _, row in sig_rows.iterrows():
+            kos_str = row.get("test_kos_in_pathway", "")
+            pw_name = row.get("pathway_name", row.get("pathway", ""))
+            pw_id = row.get("pathway", "")
+            label = f"{pw_name} ({pw_id})" if pw_name else pw_id
+
+            if not kos_str or pd.isna(kos_str):
+                continue
+            for ko in str(kos_str).split(","):
+                ko = ko.strip()
+                if not ko:
+                    continue
+                if is_low:
+                    ko_to_depleted[ko].add(label)
+                if is_high:
+                    ko_to_enriched[ko].add(label)
+
+    # Map pathway annotations onto genes via their KO
+    def _lookup_pathways(ko_val, mapping: dict[str, set[str]]) -> str:
+        if pd.isna(ko_val):
+            return ""
+        hits = set()
+        for ko in str(ko_val).split(";"):
+            ko = ko.strip()
+            if ko in mapping:
+                hits.update(mapping[ko])
+        return "; ".join(sorted(hits))
+
+    clusters["pathways_significantly_depleted"] = clusters["KO"].apply(
+        lambda ko: _lookup_pathways(ko, ko_to_depleted)
+    )
+    clusters["pathways_significantly_enriched"] = clusters["KO"].apply(
+        lambda ko: _lookup_pathways(ko, ko_to_enriched)
+    )
+
+    # Rank by core-relative CAI (ascending — lowest CAI = most divergent
+    # from core cluster preferences).  Fall back to Mahalanobis distance
+    # descending if core_CAI is absent.
+    if "core_CAI" in clusters.columns and clusters["core_CAI"].notna().any():
+        clusters = clusters.sort_values("core_CAI", ascending=True).reset_index(drop=True)
+    else:
+        clusters = clusters.sort_values("mahalanobis_distance", ascending=False).reset_index(drop=True)
+    clusters.index = clusters.index + 1
+    clusters.index.name = "rank"
+
+    # Select and order output columns
+    out_cols = [
+        "gene",
+        "core_CAI",
+        "mahalanobis_distance",
+        "distance_ratio",
+        "in_optimized_set",
+        "is_ribosomal_protein",
+        "KO",
+        "KO_definition",
+        "pathways_significantly_depleted",
+        "pathways_significantly_enriched",
+        "membership_score",
+    ]
+    out_cols = [c for c in out_cols if c in clusters.columns]
+    clusters = clusters[out_cols]
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    clusters.to_csv(output_path, sep="\t")
+    logger.info(
+        "Codon inefficiency report: %d genes ranked, %d with KO, "
+        "%d linked to depleted pathways, %d linked to enriched pathways",
+        len(clusters),
+        clusters["KO"].notna().sum(),
+        (clusters["pathways_significantly_depleted"] != "").sum(),
+        (clusters["pathways_significantly_enriched"] != "").sum(),
+    )
+    return output_path
