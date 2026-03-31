@@ -1,38 +1,71 @@
 [build-system]
-requires = ["setuptools>=64", "setuptools-scm"]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "profinder"
+name = "codonpipe"
 version = "0.1.0"
-description = "ProFinder — identify and extract bacterial or archaeal promoter sequences from a single genome, scan for motifs, and generate an HTML report"
+description = "End-to-end codon usage analysis pipeline for microbial genomes"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [
     {name = "James Marsh"},
 ]
+keywords = ["codon usage", "RSCU", "microbial genomics", "codon adaptation index"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "pandas>=1.3",
-    "biopython>=1.79",
-    "tensorflow-cpu>=2.6",
+    "biopython>=1.81",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "scipy>=1.10",
+    "scikit-learn>=1.2",
+    "umap-learn>=0.5",
+    "click>=8.1",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
+    "pre-commit>=3.0",
 ]
 
 [project.scripts]
-profinder = "profinder.pipeline:main"
+codonpipe = "codonpipe.cli:main"
 
 [project.urls]
-Repository = "https://github.com/marshomics/profinder"
+Homepage = "https://github.com/jmarsh/codonpipe"
+Repository = "https://github.com/jmarsh/codonpipe"
+Issues = "https://github.com/jmarsh/codonpipe/issues"
 
 [tool.setuptools.packages.find]
-include = ["profinder*"]
+include = ["codonpipe*"]
 
 [tool.setuptools.package-data]
-profinder = ["motifs/*.meme", "hmms/*.hmm", "weights/**/*"]
+codonpipe = ["data/*.txt"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
