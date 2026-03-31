@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import shutil
 from pathlib import Path
 
 from codonpipe.utils.io import check_tool, run_cmd
@@ -13,6 +14,9 @@ logger = logging.getLogger("codonpipe")
 # Prokka with --compliant requires locus tags ≤ 37 characters total.
 # The locus tag gets a "_NNNNN" suffix (6 chars), so the prefix must be ≤ 31.
 _MAX_LOCUSTAG_LEN = 31
+
+# GenBank format limits contig/sequence IDs to 37 characters.
+_MAX_CONTIG_ID_LEN = 37
 
 
 def _safe_locustag(sample_id: str) -> str:
@@ -32,6 +36,68 @@ def _safe_locustag(sample_id: str) -> str:
     digest = hashlib.md5(sample_id.encode()).hexdigest()[:6]
     max_prefix = _MAX_LOCUSTAG_LEN - len(digest) - 1  # -1 for underscore
     return f"{tag[:max_prefix]}_{digest}"
+
+
+def _sanitize_contig_ids(input_fasta: Path, output_fasta: Path) -> dict[str, str]:
+    """Rewrite FASTA headers to fit within the GenBank 37-character limit.
+
+    Contigs that already fit are left unchanged.  Long IDs are replaced with
+    ``contig_NNNN`` (sequential numbering), which is always ≤ 37 chars.
+
+    A mapping file (``{output_fasta}.contig_map.tsv``) is written alongside
+    the sanitized FASTA so the original names can be recovered.
+
+    Args:
+        input_fasta: Original genome FASTA.
+        output_fasta: Where to write the sanitized FASTA.
+
+    Returns:
+        Dict mapping new contig ID → original contig ID.
+    """
+    needs_rename = False
+    # Quick scan: check if any contig ID exceeds the limit
+    with open(input_fasta) as fh:
+        for line in fh:
+            if line.startswith(">"):
+                cid = line[1:].split()[0]
+                if len(cid) > _MAX_CONTIG_ID_LEN:
+                    needs_rename = True
+                    break
+
+    if not needs_rename:
+        # No renaming needed — just copy the file
+        shutil.copy2(input_fasta, output_fasta)
+        return {}
+
+    contig_map: dict[str, str] = {}
+    idx = 0
+    with open(input_fasta) as fin, open(output_fasta, "w") as fout:
+        for line in fin:
+            if line.startswith(">"):
+                original_id = line[1:].split()[0]
+                rest = line[1 + len(original_id):]  # preserve description
+                if len(original_id) > _MAX_CONTIG_ID_LEN:
+                    idx += 1
+                    new_id = f"contig_{idx:04d}"
+                    contig_map[new_id] = original_id
+                    fout.write(f">{new_id}{rest}")
+                else:
+                    fout.write(line)
+            else:
+                fout.write(line)
+
+    # Save mapping for traceability
+    map_path = Path(str(output_fasta) + ".contig_map.tsv")
+    with open(map_path, "w") as mf:
+        mf.write("new_contig_id\toriginal_contig_id\n")
+        for new_id, orig_id in contig_map.items():
+            mf.write(f"{new_id}\t{orig_id}\n")
+
+    logger.info(
+        "Renamed %d/%d contigs with IDs > %d chars for GenBank compliance",
+        len(contig_map), idx, _MAX_CONTIG_ID_LEN,
+    )
+    return contig_map
 
 
 def run_prokka(
@@ -79,6 +145,12 @@ def run_prokka(
             sample_id, _MAX_LOCUSTAG_LEN, locustag,
         )
 
+    # Sanitize input FASTA contig IDs if any exceed 37 chars
+    prokka_dir.mkdir(parents=True, exist_ok=True)
+    sanitized_fasta = prokka_dir / f"{sample_id}_sanitized_input.fasta"
+    contig_map = _sanitize_contig_ids(genome_fasta, sanitized_fasta)
+    input_fasta = sanitized_fasta
+
     cmd = [
         "prokka",
         "--outdir", str(prokka_dir),
@@ -95,7 +167,7 @@ def run_prokka(
         cmd.append("--force")
     if extra_args:
         cmd.extend(extra_args)
-    cmd.append(str(genome_fasta))
+    cmd.append(str(input_fasta))
 
     run_cmd(cmd, description=f"Running Prokka on {sample_id}")
 
