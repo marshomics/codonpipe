@@ -630,6 +630,8 @@ def generate_codon_inefficiency_report(
     out_cols = [
         "gene",
         "core_CAI",
+        "n_core_rare_codons",
+        "n_genome_rare_codons",
         "mahalanobis_distance",
         "distance_ratio",
         "in_optimized_set",
