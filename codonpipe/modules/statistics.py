@@ -60,8 +60,10 @@ def pairwise_wilcoxon(
                 logger.debug("Small sample sizes for %s: n1=%d, n2=%d; interpret with caution",
                             col, len(vals1), len(vals2))
 
-            # Extract amino acid from column name
-            aa = col.split("-")[0].rstrip("0123456789")
+            # Extract amino acid from column name (format: {AA}{digits}-{codon}).
+            # Validate the expected format before extracting.
+            parts = col.split("-")
+            aa = parts[0].rstrip("0123456789") if len(parts) == 2 else col
             results.append({
                 "codon": col,
                 "amino_acid": aa,
@@ -147,11 +149,11 @@ def compute_zscore_normalization(
         # Replace zeros/NaN with a small pseudocount before the log transform
         # to avoid -inf values while minimally perturbing the ratios.
         pseudocount = 1e-6
-        for idx in result.index:
-            vals = result.loc[idx, rscu_cols].values.astype(float)
-            vals = np.where(np.isnan(vals) | (vals == 0), pseudocount, vals)
-            geo_mean = np.exp(np.mean(np.log(vals)))
-            result.loc[idx, rscu_cols] = np.log(vals / geo_mean)
+        mat = result[rscu_cols].values.astype(float)
+        mat = np.where(np.isnan(mat) | (mat == 0), pseudocount, mat)
+        log_mat = np.log(mat)
+        geo_means = np.exp(log_mat.mean(axis=1, keepdims=True))
+        result[rscu_cols] = np.log(mat / geo_means)
     elif method == "zscore":
         for col in rscu_cols:
             vals = result[col]
