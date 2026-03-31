@@ -327,7 +327,7 @@ _R_SCRIPT = r"""
 # Ensure user library is on the search path even when .Renviron is absent
 local({
   user_lib <- Sys.getenv("R_LIBS_USER", unset = "")
-  if (nchar(user_lib) == 0 || grepl("%%", user_lib)) {
+  if (nchar(user_lib) == 0 || grepl("%", user_lib, fixed = TRUE)) {
     user_lib <- file.path(Sys.getenv("HOME"), "R", "library")
   }
   if (dir.exists(user_lib)) .libPaths(c(user_lib, .libPaths()))
@@ -497,10 +497,9 @@ def run_grodon(
         if raw.get("status") == "no_highly_expressed_genes":
             if effective_he:
                 logger.warning(
-                    "gRodon2: none of the HE IDs from %s matched CDS in %s "
-                    "(background: %s)",
-                    effective_he, ffn_path,
-                    effective_bg or "full genome",
+                    "gRodon2: none of the HE IDs from %s (%s) matched CDS in %s "
+                    "(background: full genome)",
+                    effective_he, he_source, ffn_path,
                 )
             else:
                 logger.warning(
@@ -519,7 +518,7 @@ def run_grodon(
         upper_ci = raw["upper_ci"]
 
         # Growth class (same thresholds as gRodon2's own warnings)
-        if d is None or (d is not None and np.isnan(d)):
+        if d is None or np.isnan(d):
             growth_class = "very_slow"
             caveat = "gRodon2 returned NaN; doubling time too long to estimate reliably."
         elif d > 5.0:
