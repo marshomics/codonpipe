@@ -58,6 +58,9 @@ _PIPELINE_COLS = frozenset({
     "prokka_gff", "gff_path", "kofam_results",
 })
 
+# Tolerance for comparing floating-point multiplier values.
+_MULTIPLIER_TOL = 0.01
+
 
 def _load_rp_ids(rp_ids_file: Path | None) -> set[str] | None:
     """Load RP gene IDs from a text file (one per line)."""
@@ -511,7 +514,7 @@ def run_single_genome(
             if (
                 auto_select_multiplier
                 and rec_mult is not None
-                and abs(rec_mult - mahal_distance_multiplier) > 0.01
+                and abs(rec_mult - mahal_distance_multiplier) > _MULTIPLIER_TOL
             ):
                 logger.info(
                     "Auto-selecting recommended multiplier %.2f (was %.2f); "
@@ -539,9 +542,8 @@ def run_single_genome(
                     max_k=mahal_max_k,
                     distance_multiplier=rec_mult,
                 )
-                mahal_results = {}
+                mahal_results.update(mahal_out)
                 for key, val in mahal_out.items():
-                    mahal_results[key] = val
                     if isinstance(val, Path):
                         all_outputs[f"mahal_{key}"] = val
                 mahal_cluster_gene_ids = mahal_results.get("mahal_cluster_gene_ids")
@@ -619,7 +621,6 @@ def run_single_genome(
     # broader, biologically grounded reference set (RP + co-clustered genes).
     # Re-run MELP/CAI/Fop via coRdon using Mahalanobis cluster gene IDs, then
     # promote the Mahalanobis-based classification as the primary expression_class.
-    mahal_cluster_ids_path = mahal_results.get("mahal_cluster_ids_path")
     if (
         mahal_cluster_gene_ids
         and mahal_cluster_ids_path
@@ -693,7 +694,7 @@ def run_single_genome(
 
     # Fallback: if Mahalanobis-based expression wasn't produced, run RP-based
     if not skip_mahal and expr_df is None and not skip_expression and rp_ids_file and rp_ids_file.exists():
-        logger.info("[Step 9b fallback] Mahalanobis unavailable; running RP-based expression analysis")
+        logger.warning("[Step 9b fallback] Mahalanobis-based expression unavailable; falling back to RP-based expression analysis")
         try:
             expr_outputs = run_expression_analysis(
                 ffn_path, rp_ids_file, output_dir, sample_id, force=force,
@@ -866,7 +867,6 @@ def run_single_genome(
     # ── Step 11: Codon usage tables ──────────────────────────────────────
     logger.info("[Step 11/12] Generating codon usage tables in all standard formats")
     try:
-        rp_ffn = rp_outputs.get("rp_ffn")
         table_outputs = generate_all_codon_tables(
             ffn_path=ffn_path,
             rp_ffn_path=rp_ffn,
