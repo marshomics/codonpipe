@@ -239,15 +239,26 @@ def detect_hgt_candidates(
         ref_vals = np.array([ref_series.get(c, np.nan) for c in rscu_cols])
         if np.any(np.isnan(ref_vals)):
             # Fill missing codons with genome mean for those positions
-            genome_mean = X.mean(axis=0)
+            genome_mean = X.mean(axis=0) if not pca_applied else rscu_df[rscu_cols].values.mean(axis=0)
             nan_mask = np.isnan(ref_vals)
             ref_vals[nan_mask] = genome_mean[nan_mask]
         # If PCA was applied, project reference into PCA space
         if pca_applied:
-            ref_vals = pca.transform(ref_vals.reshape(1, -1)).flatten()
-        mean_rscu = ref_vals
-        logger.info("HGT detection: using provided reference RSCU (e.g. Mahalanobis cluster) as centroid")
-    else:
+            n_expected = pca.n_features_in_
+            if ref_vals.shape[0] != n_expected:
+                logger.warning(
+                    "HGT detection: reference RSCU has %d features but PCA expects %d; "
+                    "falling back to genome mean centroid",
+                    ref_vals.shape[0], n_expected,
+                )
+                reference_rscu = None  # fall through to genome-mean below
+            else:
+                ref_vals = pca.transform(ref_vals.reshape(1, -1)).flatten()
+        if reference_rscu is not None:
+            mean_rscu = ref_vals
+            logger.info("HGT detection: using provided reference RSCU (e.g. Mahalanobis cluster) as centroid")
+
+    if reference_rscu is None:
         mean_rscu = X.mean(axis=0)
         logger.info("HGT detection: using genome mean RSCU as centroid")
 
@@ -348,30 +359,21 @@ def detect_hgt_candidates(
 def predict_growth_rate(
     expr_df: pd.DataFrame,
     rp_ids_file: Path | str | None = None,
-    mahal_cluster_gene_ids: list[str] | set[str] | None = None,
 ) -> dict | None:
-    """Predict minimum doubling time from codon adaptation of a reference gene set.
+    """Predict minimum doubling time from CAI of ribosomal proteins.
 
-    When *mahal_cluster_gene_ids* is provided (from Mahalanobis clustering), those genes
-    are used as the reference set.  Otherwise, falls back to ribosomal proteins
-    from *rp_ids_file* or a heuristic name match.
+    Uses the Vieira-Silva & Rocha (2010) empirical model:
+    ``doubling_time = exp(a + b * mean_CAI)``.
 
-    Uses the best available expression metric (MELP preferred, then CAI, then
-    Fop) and the Vieira-Silva & Rocha (2010) empirical model:
-    ``doubling_time = exp(a + b * mean_metric)``.
-
-    The coefficients (a=7.15, b=-7.38) were calibrated on CAI of ribosomal
-    proteins, but apply equally to MELP and to broader Mahalanobis-derived reference
-    sets because both metrics are normalised to [0, 1] with the same biological
-    interpretation (higher = more adapted).
+    The coefficients (a=7.15, b=-7.38) were calibrated on mean CAI of
+    ribosomal proteins across ~200 prokaryotic genomes.  This function
+    uses **only** RP genes and **only** CAI to match the original
+    calibration conditions.
 
     Args:
-        expr_df: Expression table with gene and at least one of MELP, CAI,
-            or Fop columns.
+        expr_df: Expression table with gene and CAI column.
         rp_ids_file: File with ribosomal protein gene IDs (one per line).
-                     Fallback when mahal_cluster_gene_ids is not provided.
-        mahal_cluster_gene_ids: Gene IDs from the Mahalanobis optimal cluster (preferred
-                              reference set when available).
+                     Falls back to heuristic name matching if not provided.
 
     Returns:
         Dict with mean_metric, predicted_doubling_time_hours, n_reference_genes,
@@ -382,35 +384,29 @@ def predict_growth_rate(
         logger.warning("Empty expression data; cannot predict growth rate")
         return None
 
-    metric = _resolve_expression_metric(expr_df)
-    if metric is None:
-        logger.warning("No expression metric column (MELP/CAI/Fop) in expression data; "
-                       "cannot predict growth rate")
+    # Force CAI: the Vieira-Silva & Rocha coefficients were calibrated on CAI
+    metric = "CAI"
+    if metric not in expr_df.columns or expr_df[metric].notna().sum() == 0:
+        logger.warning("CAI column not available in expression data; "
+                       "cannot run Vieira-Silva & Rocha growth rate prediction")
         return None
 
-    # Determine reference gene set: Mahalanobis cluster preferred, RP fallback
-    ref_genes = set()
-    ref_label = "unknown"
-    if mahal_cluster_gene_ids is not None and len(mahal_cluster_gene_ids) >= 3:
-        ref_genes = set(mahal_cluster_gene_ids)
-        ref_label = "mahal_cluster"
-        logger.info("Growth rate prediction using %s on Mahalanobis cluster (%d genes)",
-                     metric, len(ref_genes))
-    else:
-        if rp_ids_file is not None:
-            rp_path = Path(rp_ids_file)
-            if rp_path.exists():
-                with open(rp_path) as f:
-                    ref_genes = set(line.strip() for line in f if line.strip())
-        if not ref_genes:
-            # Heuristic: match genes with "ribosomal" or "rp" in name
-            gene_names = expr_df["gene"].str.lower()
-            ref_genes = set(expr_df.loc[
-                gene_names.str.contains("ribosomal|rp", na=False), "gene"
-            ])
-        ref_label = "ribosomal_proteins"
-        logger.info("Growth rate prediction using %s on ribosomal proteins (%d genes)",
-                     metric, len(ref_genes))
+    # Reference set: ribosomal proteins only
+    ref_genes: set[str] = set()
+    if rp_ids_file is not None:
+        rp_path = Path(rp_ids_file)
+        if rp_path.exists():
+            with open(rp_path) as f:
+                ref_genes = set(line.strip() for line in f if line.strip())
+    if not ref_genes:
+        # Heuristic fallback: match genes with "ribosomal" or "rp" in name
+        gene_names = expr_df["gene"].str.lower()
+        ref_genes = set(expr_df.loc[
+            gene_names.str.contains("ribosomal|rp", na=False), "gene"
+        ])
+    ref_label = "ribosomal_proteins"
+    logger.info("Growth rate prediction using CAI on ribosomal proteins (%d genes)",
+                len(ref_genes))
 
     if not ref_genes:
         logger.warning("No reference genes identified for growth rate prediction")
@@ -463,9 +459,9 @@ def predict_growth_rate(
         "n_rp_genes": int(len(ref_vals_series)),  # backward compat
         "growth_class": growth_class,
         "caveat": (
-            f"Vieira-Silva & Rocha (2010) model using {metric} on "
-            f"{ref_label.replace('_', ' ')} ({len(ref_vals_series)} genes); "
-            "coefficients validated primarily on proteobacteria."
+            f"Vieira-Silva & Rocha (2010) model using CAI on "
+            f"ribosomal proteins ({len(ref_vals_series)} genes); "
+            "coefficients (a=7.15, b=-7.38) calibrated on proteobacteria."
         ),
     }
 
@@ -577,15 +573,18 @@ def quantify_translational_selection(
     else:
         optimal_codons_set = set()
 
-    # Pre-parse FASTA once: store codon counts and Fop for all merged genes.
-    # This avoids re-reading the file per quintile (was 5+1 passes).
+    # Pre-parse FASTA once: store codon counts, Fop, and raw sequences for all
+    # merged genes.  This avoids re-reading the file per quintile and again
+    # for position effects (was 5+2 passes, now 1).
     all_gene_ids = set(merged["gene"].values)
     _gene_codon_counts: dict[str, dict[str, int]] = {}
     _gene_fop: dict[str, float] = {}
+    _gene_seqs: dict[str, str] = {}
     for rec in SeqIO.parse(str(ffn_path), "fasta"):
         if rec.id not in all_gene_ids:
             continue
         seq = str(rec.seq)
+        _gene_seqs[rec.id] = seq
         if len(seq) < 240:
             continue
         gene_counts = count_codons(seq)
@@ -633,14 +632,13 @@ def quantify_translational_selection(
                         metric, spearman_rho, spearman_p)
 
     # --- C. Within-gene codon position effects ---
+    # Reuse cached sequences from initial parse instead of re-reading the FASTA.
     pos_rows = []
-    for rec in SeqIO.parse(str(ffn_path), "fasta"):
-        seq = str(rec.seq)
+    merged_gene_set = set(merged["gene"].values)
+    for gene_id, seq in _gene_seqs.items():
         if len(seq) < 300:
             continue
-
-        gene_id = rec.id
-        if gene_id not in merged["gene"].values:
+        if gene_id not in merged_gene_set:
             continue
 
         # Use 20% of gene length for terminal regions, minimum 90 nt, rounded to codon boundary
@@ -1173,8 +1171,8 @@ def run_bio_ecology_analyses(
             provided, HGT detection uses this as the reference centroid
             instead of the genome mean.
         mahal_cluster_gene_ids: Optional gene IDs from the Mahalanobis optimal cluster.
-            When provided, growth rate prediction uses these as the reference
-            gene set instead of ribosomal proteins.
+            Used for HGT detection and translational selection analyses.
+            Growth rate prediction always uses ribosomal proteins only.
         mahal_cluster_ids_path: Optional path to the Mahalanobis-defined
             optimised gene IDs file (one ID per line).  When provided
             alongside *expr_df* containing MELP-based expression_class,
@@ -1219,7 +1217,6 @@ def run_bio_ecology_analyses(
         if expr_df is not None:
             growth_result = predict_growth_rate(
                 expr_df, rp_ids_file,
-                mahal_cluster_gene_ids=mahal_cluster_gene_ids,
             )
             if growth_result is not None:
                 outputs["growth_rate_prediction"] = growth_result
@@ -1240,79 +1237,22 @@ def run_bio_ecology_analyses(
 
     # 2b. gRodon2 growth rate prediction (requires R + gRodon2 package)
     #
-    # HE set: RP genes filtered to those in the Mahalanobis optimal cluster.
-    # This excludes atypical RPs (HGT, pseudogenes, truncated ORFs) that
-    # weaken ConsistencyHE.  Falls back to all RPs if Mahalanobis is
-    # unavailable or the intersection is too small (<10 genes).
+    # HE set: all ribosomal protein genes.  gRodon2's CUBHE/ConsistencyHE/CPB
+    # regression was trained with ribosomal proteins (~55 genes) as the HE
+    # anchor (Weissman et al. 2021).  We use the full RP set to match the
+    # original training conditions.
     #
     # Background: always the FULL genome CDS set.  gRodon2's CUBHE
     # measures HE bias relative to the genomic average; restricting the
-    # background to the Mahalanobis cluster collapses the contrast.
+    # background to any cluster collapses the contrast.
     logger.info("Running gRodon2 growth rate prediction for %s", sample_id)
     try:
         from codonpipe.modules.grodon import run_grodon
 
-        # gRodon2's HE set: ribosomal proteins filtered to those present
-        # in the Mahalanobis optimal cluster.
-        #
-        # gRodon2's CUBHE/ConsistencyHE/CPB regression was trained with
-        # ribosomal proteins (~55 genes) as the HE anchor (Weissman et al.
-        # 2021).  We refine this by intersecting the RP gene list with the
-        # Mahalanobis cluster, which excludes atypical RPs (horizontally
-        # transferred, pseudogenes, truncated at contig boundaries) that
-        # would drag down ConsistencyHE and dilute CUBHE.
-        #
-        # Fallback order:
-        #   1. RP genes ∩ Mahalanobis cluster (best: concordant RPs only)
-        #   2. All RP genes (when Mahalanobis clustering unavailable)
-        #   3. gRodon2's built-in header regex (no RP IDs at all)
-        #
-        # The full genome CDS set is always used as background.
-        import tempfile as _tmpmod
-
-        filtered_he_path = None
-        if (
-            rp_ids_file is not None
-            and Path(rp_ids_file).exists()
-            and mahal_cluster_gene_ids is not None
-            and len(mahal_cluster_gene_ids) > 0
-        ):
-            # Read RP gene IDs and intersect with Mahalanobis cluster
-            with open(rp_ids_file) as f:
-                rp_ids = {line.strip() for line in f if line.strip()}
-            mahal_set = set(mahal_cluster_gene_ids)
-            concordant_rps = sorted(rp_ids & mahal_set)
-
-            if len(concordant_rps) >= 10:
-                he_tmp = _tmpmod.NamedTemporaryFile(
-                    mode="w", suffix="_rp_mahal_ids.txt", delete=False,
-                    dir=eco_dir,
-                )
-                he_tmp.write("\n".join(concordant_rps) + "\n")
-                he_tmp.close()
-                filtered_he_path = Path(he_tmp.name)
-                logger.info(
-                    "gRodon2: using %d/%d RP genes that overlap with "
-                    "Mahalanobis cluster (excluded %d discordant RPs)",
-                    len(concordant_rps), len(rp_ids),
-                    len(rp_ids) - len(concordant_rps),
-                )
-            else:
-                logger.info(
-                    "gRodon2: only %d RP genes overlap with Mahalanobis cluster "
-                    "(need ≥10); falling back to all %d RP genes",
-                    len(concordant_rps), len(rp_ids),
-                )
-
         grodon_result = run_grodon(
             ffn_path, output_dir, sample_id,
             rp_ids_file=rp_ids_file,
-            he_ids_file=filtered_he_path,
         )
-
-        # Clean up temp filtered IDs file
-        if filtered_he_path is not None:
-            filtered_he_path.unlink(missing_ok=True)
 
         if grodon_result is not None:
             grodon_path = grodon_result.pop("path", None)
