@@ -145,12 +145,6 @@ def run_prokka(
             sample_id, _MAX_LOCUSTAG_LEN, locustag,
         )
 
-    # Sanitize input FASTA contig IDs if any exceed 37 chars
-    prokka_dir.mkdir(parents=True, exist_ok=True)
-    sanitized_fasta = prokka_dir / f"{sample_id}_sanitized_input.fasta"
-    contig_map = _sanitize_contig_ids(genome_fasta, sanitized_fasta)
-    input_fasta = sanitized_fasta
-
     cmd = [
         "prokka",
         "--outdir", str(prokka_dir),
@@ -158,8 +152,6 @@ def run_prokka(
         "--kingdom", kingdom,
         "--cpus", str(cpus),
         "--locustag", locustag,
-        "--centre", "X",
-        "--compliant",
     ]
     if metagenome:
         cmd.append("--metagenome")
@@ -167,7 +159,7 @@ def run_prokka(
         cmd.append("--force")
     if extra_args:
         cmd.extend(extra_args)
-    cmd.append(str(input_fasta))
+    cmd.append(str(genome_fasta))
 
     run_cmd(cmd, description=f"Running Prokka on {sample_id}")
 
