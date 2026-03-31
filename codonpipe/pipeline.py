@@ -1143,6 +1143,19 @@ def run_batch(
         logger.error("No samples completed successfully")
         return {}
 
+    # ── Save annotated batch table with locus tags ─────────────────────
+    locustag_map = {}
+    for sid, outs in sample_outputs.items():
+        lt = outs.get("prokka_locustag")
+        if lt is not None:
+            locustag_map[sid] = lt
+    if locustag_map:
+        df = df.copy()
+        df["prokka_locustag"] = df["sample_id"].map(locustag_map)
+        annotated_path = output_dir / "batch_table_annotated.tsv"
+        df.to_csv(annotated_path, sep="\t", index=False)
+        logger.info("Annotated batch table saved: %s", annotated_path)
+
     # ── Batch-level analyses ────────────────────────────────────────────
     logger.info("Running batch-level comparative analyses")
     batch_outputs = _run_batch_analyses(
