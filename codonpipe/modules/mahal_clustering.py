@@ -380,6 +380,92 @@ def _compute_core_cai(
     return gene_cai
 
 
+def _identify_rare_codons(
+    rscu_series: pd.Series,
+    threshold: float = 0.1,
+) -> set[str]:
+    """Return the set of RNA codons whose RSCU falls below *threshold*.
+
+    These are codons that the reference gene pool (core cluster or whole
+    genome) essentially never uses.  A codon with RSCU < 0.1 in a family
+    of 4 synonymous codons means it accounts for <2.5% of usage for that
+    amino acid.
+
+    Args:
+        rscu_series: RSCU values indexed by column names like 'Ala-GCU'.
+        threshold: RSCU below this value flags the codon as rare.
+
+    Returns:
+        Set of RNA codon triplets (e.g. {'CUA', 'AGA', ...}).
+    """
+    rare: set[str] = set()
+    for col, val in rscu_series.items():
+        if pd.isna(val):
+            continue
+        if val < threshold:
+            codon = RSCU_COL_TO_CODON.get(col)
+            if codon:
+                rare.add(codon)
+    return rare
+
+
+def _count_rare_codons_per_gene(
+    ffn_path: Path,
+    rare_codons: set[str],
+    min_length: int = MIN_GENE_LENGTH,
+) -> dict[str, int]:
+    """Count how many sense-codon positions in each gene use a rare codon.
+
+    Args:
+        ffn_path: Nucleotide CDS FASTA.
+        rare_codons: Set of RNA triplets considered rare.
+        min_length: Minimum sequence length (nt).
+
+    Returns:
+        Dict mapping gene ID → count of rare-codon positions.
+    """
+    from codonpipe.modules.rscu import dna_to_rna
+
+    gene_counts: dict[str, int] = {}
+    for rec in SeqIO.parse(str(ffn_path), "fasta"):
+        seq = str(rec.seq)
+        if len(seq) < min_length:
+            continue
+        rna = dna_to_rna(seq)
+        n_rare = 0
+        for i in range(0, len(rna) - 2, 3):
+            codon = rna[i : i + 3]
+            if codon in rare_codons:
+                n_rare += 1
+        gene_counts[rec.id] = n_rare
+    return gene_counts
+
+
+def _compute_genome_wide_rscu(ffn_path: Path, min_length: int = MIN_GENE_LENGTH) -> pd.Series:
+    """Pool codon counts across all genes and compute genome-wide RSCU.
+
+    Args:
+        ffn_path: Nucleotide CDS FASTA.
+        min_length: Minimum sequence length (nt).
+
+    Returns:
+        Series indexed by RSCU column names with genome-wide RSCU values.
+    """
+    total_counts: Counter = Counter()
+    for rec in SeqIO.parse(str(ffn_path), "fasta"):
+        seq = str(rec.seq)
+        if len(seq) < min_length:
+            continue
+        total_counts += count_codons(seq)
+
+    if not total_counts:
+        return pd.Series(dtype=float)
+
+    rscu_dict = compute_rscu_from_counts(total_counts)
+    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_dict]
+    return pd.Series({c: rscu_dict[c] for c in rscu_cols})
+
+
 # ---------------------------------------------------------------------------
 # Diagnostic plots
 # ---------------------------------------------------------------------------
@@ -854,6 +940,36 @@ def run_mahal_clustering(
             logger.warning("Could not derive adaptation weights from cluster RSCU; skipping core CAI")
     results["gene_core_cai"] = gene_core_cai
 
+    # ── Step 7c: Rare codon counts ───────────────────────────────────
+    # Identify codons with RSCU ≈ 0 in (a) the core cluster and (b) the
+    # whole genome, then count per gene how many codon positions use them.
+    _rare_codon_threshold = 0.1
+    core_rare_per_gene: dict[str, int] = {}
+    genome_rare_per_gene: dict[str, int] = {}
+
+    if not cluster_rscu.empty and ffn_path and ffn_path.exists():
+        core_rare_codons = _identify_rare_codons(cluster_rscu, threshold=_rare_codon_threshold)
+        if core_rare_codons:
+            core_rare_per_gene = _count_rare_codons_per_gene(ffn_path, core_rare_codons)
+            logger.info(
+                "Core-rare codons: %d codons with RSCU < %.2f in core cluster "
+                "(e.g. %s)",
+                len(core_rare_codons), _rare_codon_threshold,
+                ", ".join(sorted(core_rare_codons)[:5]),
+            )
+
+        genome_rscu = _compute_genome_wide_rscu(ffn_path)
+        if not genome_rscu.empty:
+            genome_rare_codons = _identify_rare_codons(genome_rscu, threshold=_rare_codon_threshold)
+            if genome_rare_codons:
+                genome_rare_per_gene = _count_rare_codons_per_gene(ffn_path, genome_rare_codons)
+                logger.info(
+                    "Genome-rare codons: %d codons with RSCU < %.2f genome-wide "
+                    "(e.g. %s)",
+                    len(genome_rare_codons), _rare_codon_threshold,
+                    ", ".join(sorted(genome_rare_codons)[:5]),
+                )
+
     # ── Step 8: Quality check — cosine similarity ─────────────────────
     rp_cosine_sim = np.nan
     if rp_rscu_df is not None and not rp_rscu_df.empty:
@@ -879,6 +995,8 @@ def run_mahal_clustering(
         "gene": gene_ids,
         "mahalanobis_distance": distances,
         "core_CAI": [gene_core_cai.get(gid, np.nan) for gid in gene_ids],
+        "n_core_rare_codons": [core_rare_per_gene.get(gid, 0) for gid in gene_ids],
+        "n_genome_rare_codons": [genome_rare_per_gene.get(gid, 0) for gid in gene_ids],
         "membership_score": probabilities[:, 1],
         "in_optimized_set": [gid in cluster_gene_ids for gid in gene_ids],
         "is_ribosomal_protein": [gid in rp_gene_ids for gid in gene_ids],
