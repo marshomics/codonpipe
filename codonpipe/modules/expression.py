@@ -264,9 +264,17 @@ def _combine_expression(
         else:
             logger.warning("Fop output has no usable score column; skipping Fop merge")
 
-    # Fill width from whichever metric provided it (outer merge can leave NaN)
+    # Fill width from whichever metric provided it (outer merge can leave NaN).
+    # Drop genes with missing width rather than substituting 0 (which is
+    # biologically nonsensical and causes downstream division errors).
     if COL_WIDTH in combined.columns:
-        combined[COL_WIDTH] = combined[COL_WIDTH].fillna(0).astype(int)
+        n_missing = combined[COL_WIDTH].isna().sum()
+        if n_missing > 0:
+            logger.warning(
+                "%d genes have missing width after merge; dropping them", n_missing
+            )
+            combined = combined.dropna(subset=[COL_WIDTH])
+        combined[COL_WIDTH] = combined[COL_WIDTH].astype(int)
 
     # Per-metric classification
     for metric in EXPRESSION_METRICS:
