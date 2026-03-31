@@ -50,6 +50,10 @@ def main():
               help="Skip all R-based analyses (MELP/CAI/Fop/ENCprime/MILC).")
 @click.option("--skip-mahal", is_flag=True,
               help="Skip Mahalanobis clustering of codon usage.")
+@click.option("--skip-gsea", is_flag=True,
+              help="Skip pre-ranked Gene Set Enrichment Analysis.")
+@click.option("--gsea-permutations", type=int, default=1000, show_default=True,
+              help="Number of permutations for GSEA p-value estimation.")
 @click.option("--mahal-min-k", type=int, default=2, show_default=True,
               help="Minimum number of Mahalanobis clustering components to test.")
 @click.option("--mahal-max-k", type=int, default=8, show_default=True,
@@ -95,6 +99,8 @@ def run(
     kofam_results: Path | None,
     skip_expression: bool,
     skip_mahal: bool,
+    skip_gsea: bool,
+    gsea_permutations: int,
     mahal_min_k: int,
     mahal_max_k: int,
     mahal_distance_multiplier: float,
@@ -160,6 +166,8 @@ def run(
             kofam_results_file=kofam_results,
             skip_expression=skip_expression,
             skip_mahal=skip_mahal,
+            skip_gsea=skip_gsea,
+            gsea_permutations=gsea_permutations,
             mahal_min_k=mahal_min_k,
             mahal_max_k=mahal_max_k,
             mahal_distance_multiplier=mahal_distance_multiplier,
@@ -203,6 +211,9 @@ def run(
               help="Pre-computed KofamScan detail-tsv results file (applies to all samples). Per-sample files can also be specified via a 'kofam_results' column in the batch table.")
 @click.option("--skip-expression", is_flag=True, help="Skip R-based expression analysis.")
 @click.option("--skip-mahal", is_flag=True, help="Skip Mahalanobis clustering of codon usage.")
+@click.option("--skip-gsea", is_flag=True, help="Skip pre-ranked Gene Set Enrichment Analysis.")
+@click.option("--gsea-permutations", type=int, default=1000, show_default=True,
+              help="Number of permutations for GSEA p-value estimation.")
 @click.option("--mahal-min-k", type=int, default=2, show_default=True,
               help="Minimum number of Mahalanobis clustering components to test.")
 @click.option("--mahal-max-k", type=int, default=8, show_default=True,
@@ -254,6 +265,8 @@ def batch(
     stability_core_threshold: float,
     kegg_ko_pathway: Path | None,
     gff_file: Path | None,
+    skip_gsea: bool,
+    gsea_permutations: int,
     force: bool,
     verbose: bool,
     log_file: Path | None,
@@ -326,6 +339,8 @@ def batch(
             kegg_ko_pathway=kegg_ko_pathway,
             gff_file=gff_file,
             force=force,
+            skip_gsea=skip_gsea,
+            gsea_permutations=gsea_permutations,
         )
         logger.info("Batch analysis complete. %d output files.", len(outputs))
     except Exception as e:
