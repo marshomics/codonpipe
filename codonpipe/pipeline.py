@@ -120,6 +120,8 @@ def run_single_genome(
     kegg_ko_pathway: Path | None = None,
     gff_file: Path | None = None,
     force: bool = False,
+    skip_gsea: bool = False,
+    gsea_permutations: int = 1000,
 ) -> dict[str, Path]:
     """Run the full codon analysis pipeline on a single genome.
 
@@ -817,6 +819,81 @@ def run_single_genome(
         except Exception as e:
             logger.warning("Mahalanobis-aware metric recomputation failed: %s. Keeping RP-based values.", e)
 
+    # ── Step 9e: Codon usage inefficiency report ─────────────────────────
+    # Produce a single ranked table of all genes ordered by Mahalanobis
+    # distance (most divergent codon usage first), annotated with KO
+    # accession and KEGG pathways from the enrichment results.
+    if mahal_results.get("mahal_clusters_path"):
+        try:
+            from codonpipe.modules.enrichment import generate_codon_inefficiency_report
+
+            report_path = output_dir / "enrichment_mahal" / f"{sample_id}_codon_inefficiency_report.tsv"
+            result_path = generate_codon_inefficiency_report(
+                mahal_clusters_path=Path(mahal_results["mahal_clusters_path"]),
+                kofam_df=kofam_df,
+                enrichment_results=enrichment_results,
+                output_path=report_path,
+                mahal_summary_path=(
+                    Path(mahal_results["mahal_summary_path"])
+                    if mahal_results.get("mahal_summary_path") else None
+                ),
+            )
+            if result_path:
+                all_outputs["codon_inefficiency_report"] = result_path
+                logger.info("[Step 9e/12] Codon inefficiency report saved")
+        except Exception as e:
+            logger.warning("Codon inefficiency report failed: %s. Continuing.", e, exc_info=True)
+
+    # ── Step 9f: Pre-ranked Gene Set Enrichment Analysis ─────────────────
+    gsea_results: dict = {}
+    if (
+        mahal_results.get("mahal_clusters_path")
+        and not skip_mahal
+        and not skip_gsea
+    ):
+        try:
+            from codonpipe.modules.gsea import run_gsea_analysis
+            from codonpipe.modules.enrichment import load_ko_pathway_map, load_pathway_names
+            from codonpipe.plotting.gsea_plots import generate_gsea_plots
+
+            cache_dir = output_dir / ".cache"
+            ko_pw_map = load_ko_pathway_map(
+                user_file=kegg_ko_pathway, cache_dir=cache_dir,
+            )
+            pw_names = load_pathway_names(cache_dir=cache_dir)
+
+            gsea_results = run_gsea_analysis(
+                mahal_clusters_path=Path(mahal_results["mahal_clusters_path"]),
+                kofam_df=kofam_df,
+                output_dir=output_dir,
+                sample_id=sample_id,
+                ko_pathway_map=ko_pw_map if ko_pw_map else None,
+                pathway_names=pw_names if pw_names else None,
+                cog_result_path=(
+                    Path(all_outputs["cog_result"])
+                    if all_outputs.get("cog_result") else None
+                ),
+                n_perm=gsea_permutations,
+                cache_dir=cache_dir,
+            )
+            for key, val in gsea_results.items():
+                if isinstance(val, Path):
+                    all_outputs[key] = val
+
+            # Generate GSEA plots
+            gsea_plot_outputs = generate_gsea_plots(
+                gsea_results, output_dir, sample_id,
+            )
+            all_outputs.update(gsea_plot_outputs)
+
+            n_sources = sum(
+                1 for k in gsea_results
+                if isinstance(gsea_results[k], pd.DataFrame) and not gsea_results[k].empty
+            )
+            logger.info("[Step 9f/12] GSEA complete: %d gene-set sources analyzed", n_sources)
+        except Exception as e:
+            logger.warning("GSEA failed: %s. Continuing.", e, exc_info=True)
+
     # ── Step 10: Biological/ecological analyses ─────────────────────────
     logger.info("[Step 10/12] Running biological and ecological analyses")
     bio_ecology_results = {}
@@ -1327,6 +1404,83 @@ def _run_batch_analyses(
             logger.warning("Condition-aware comparative analyses failed: %s. Continuing.", e, exc_info=True)
     else:
         logger.info("No condition column specified; skipping condition-aware analyses")
+
+    # ── Batch GSEA comparative analysis ───────────────────────────────
+    # Collect per-sample GSEA results and produce cross-sample comparisons.
+    try:
+        from codonpipe.modules.gsea import (
+            compare_gsea_between_samples,
+            compare_gsea_between_conditions,
+        )
+        from codonpipe.plotting.gsea_plots import generate_batch_gsea_plots
+
+        sample_gsea: dict[str, dict[str, pd.DataFrame]] = {}
+        for sid, paths in sample_outputs.items():
+            sid_gsea: dict[str, pd.DataFrame] = {}
+            for source in ["modules", "pathways", "cog"]:
+                key = f"gsea_{source}_path"
+                if key in paths and Path(paths[key]).exists():
+                    sid_gsea[source] = pd.read_csv(paths[key], sep="\t")
+            if sid_gsea:
+                sample_gsea[sid] = sid_gsea
+
+        if len(sample_gsea) >= 2:
+            logger.info("Running batch GSEA comparative analysis (%d samples)", len(sample_gsea))
+            batch_gsea_dir = output_dir / "batch_gsea"
+            batch_gsea_dir.mkdir(parents=True, exist_ok=True)
+
+            # Build condition map if condition_col is available
+            cond_map = None
+            if condition_col and condition_col in batch_df.columns:
+                cond_map = dict(zip(
+                    batch_df["sample_id"],
+                    batch_df[condition_col].astype(str),
+                ))
+
+            # NES matrices and between-condition tests per source
+            between_results: dict[str, pd.DataFrame] = {}
+            for source in ["modules", "pathways", "cog"]:
+                source_data = {
+                    sid: d[source] for sid, d in sample_gsea.items() if source in d
+                }
+                if len(source_data) < 2:
+                    continue
+
+                # Save NES matrix
+                nes_matrix = compare_gsea_between_samples(source_data, source)
+                if not nes_matrix.empty:
+                    nes_path = batch_gsea_dir / f"gsea_{source}_nes_matrix.tsv"
+                    nes_matrix.to_csv(nes_path, sep="\t")
+                    outputs[f"gsea_{source}_nes_matrix"] = nes_path
+
+                # Between-condition tests
+                if cond_map and len(set(cond_map.values())) >= 2:
+                    bw_df = compare_gsea_between_conditions(
+                        source_data, cond_map, source,
+                    )
+                    if not bw_df.empty:
+                        bw_path = batch_gsea_dir / f"gsea_{source}_between_conditions.tsv"
+                        bw_df.to_csv(bw_path, sep="\t", index=False)
+                        outputs[f"gsea_{source}_between_conditions"] = bw_path
+                        between_results[source] = bw_df
+                        n_sig = bw_df["significant"].sum() if "significant" in bw_df.columns else 0
+                        logger.info(
+                            "GSEA %s between-condition: %d gene sets tested, %d significant",
+                            source, len(bw_df), n_sig,
+                        )
+
+            # Generate batch GSEA plots
+            gsea_plot_outputs = generate_batch_gsea_plots(
+                sample_gsea=sample_gsea,
+                output_dir=output_dir,
+                condition_map=cond_map,
+                between_results=between_results if between_results else None,
+            )
+            outputs.update(gsea_plot_outputs)
+        elif sample_gsea:
+            logger.info("Only %d sample(s) with GSEA results; skipping batch GSEA comparison", len(sample_gsea))
+    except Exception as e:
+        logger.warning("Batch GSEA comparative analysis failed: %s. Continuing.", e, exc_info=True)
 
     return outputs
 
