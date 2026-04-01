@@ -2129,6 +2129,10 @@ def run_mahal_clustering(
         results["dual_anchor_df"] = dual_df
         results["dual_anchor_categories"] = cat_counts
 
+        # Median Mahalanobis distance among density seed genes
+        _seed_mask = np.array([gid in density_seed_ids for gid in gene_ids])
+        density_median = float(np.median(density_distances[_seed_mask])) if _seed_mask.any() else 0.0
+
         # Summary stats for the density anchor
         density_summary = {
             "density_peak_axis1": density_diag["density_peak_xy"][0] if density_diag["density_peak_xy"] else None,
