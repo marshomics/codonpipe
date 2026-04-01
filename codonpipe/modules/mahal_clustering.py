@@ -1659,6 +1659,7 @@ def run_mahal_clustering(
     # Update RP indices and gene_ids to match the (possibly reduced) set
     rp_gene_ids_active = set(rp_ids_list)
     rp_indices = np.array([i for i, g in enumerate(gene_ids) if g in rp_gene_ids_active])
+    rp_gene_ids = rp_gene_ids_active  # keep downstream plots/masks consistent
 
     if len(rp_indices) < 3:
         logger.warning(
