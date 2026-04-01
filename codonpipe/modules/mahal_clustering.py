@@ -1418,10 +1418,10 @@ def _plot_dual_anchor_coa(
         "neither": "Neither",
     }
     cat_alphas = {
-        "both": 0.7, "rp_only": 0.7, "dens_only": 0.7, "neither": 0.15,
+        "both": 0.7, "rp_only": 0.7, "dens_only": 0.7, "neither": 0.35,
     }
     cat_sizes = {
-        "both": 14, "rp_only": 14, "dens_only": 14, "neither": 6,
+        "both": 14, "rp_only": 14, "dens_only": 14, "neither": 8,
     }
 
     # Plot by category, "neither" first so it's behind
