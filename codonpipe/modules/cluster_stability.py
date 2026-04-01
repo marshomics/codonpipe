@@ -169,6 +169,8 @@ def run_stability_analysis(
     n_bootstraps: int = _DEFAULT_N_BOOTSTRAPS,
     multiplier_grid: list[float] | None = None,
     core_threshold: float = _DEFAULT_CORE_THRESHOLD,
+    rp_gene_ids_override: set[str] | None = None,
+    output_subdir: str | None = None,
 ) -> dict:
     """Bootstrap stability analysis across a grid of distance multipliers.
 
@@ -200,12 +202,17 @@ def run_stability_analysis(
         core_threshold: Membership frequency threshold for a gene to be
             considered "core" (default 0.5).  Set to 0.9 for a
             high-confidence subset.
+        rp_gene_ids_override: When provided, use these RP gene IDs
+            instead of loading from ``rp_ids_file``.  Used by multi-anchor
+            mode to bootstrap individual RP sub-clusters.
+        output_subdir: Override for the output subdirectory name
+            (default "cluster_stability").
 
     Returns:
         Dict with stability results, recommended multiplier, per-gene
         membership frequencies, and diagnostic file paths.
     """
-    stab_dir = output_dir / "cluster_stability"
+    stab_dir = output_dir / (output_subdir or "cluster_stability")
     stab_dir.mkdir(parents=True, exist_ok=True)
     results: dict = {}
 
@@ -213,13 +220,16 @@ def run_stability_analysis(
         multiplier_grid = list(_DEFAULT_MULTIPLIER_GRID)
 
     # ── Load RP gene IDs ─────────────────────────────────────────────
-    rp_gene_ids: set[str] = set()
-    if rp_ids_file and rp_ids_file.exists():
-        rp_gene_ids = {
-            line.strip()
-            for line in rp_ids_file.read_text().splitlines()
-            if line.strip()
-        }
+    if rp_gene_ids_override is not None:
+        rp_gene_ids = set(rp_gene_ids_override)
+    else:
+        rp_gene_ids: set[str] = set()
+        if rp_ids_file and rp_ids_file.exists():
+            rp_gene_ids = {
+                line.strip()
+                for line in rp_ids_file.read_text().splitlines()
+                if line.strip()
+            }
     if not rp_gene_ids:
         logger.warning(
             "No RP IDs for stability analysis of %s; skipping.", sample_id
