@@ -563,7 +563,7 @@ def run_single_genome(
     # ── Promote stability core set when available ────────────────────────────
     # When bootstrap stability analysis has been run, the core gene set
     # (genes above core_threshold membership frequency) replaces the
-    # Mahalanobis cluster for MELP scoring, gRodon2, and enrichment.
+    # Mahalanobis cluster for MELP scoring and enrichment.
     # The frequency-weighted RSCU replaces the distance-weighted RSCU.
     # Safeguard: only apply if core set has >= _MIN_CORE_FOR_OVERRIDE genes.
     _MIN_CORE_FOR_OVERRIDE = 30
@@ -577,7 +577,7 @@ def run_single_genome(
     ):
         logger.info(
             "Stability core set (%d genes, threshold=%.2f) replaces "
-            "Mahalanobis cluster (%s genes) for MELP/gRodon2/enrichment",
+            "Mahalanobis cluster (%s genes) for MELP/enrichment",
             len(stability_core_ids),
             stability_core_threshold,
             len(mahal_cluster_gene_ids) if mahal_cluster_gene_ids else 0,
@@ -663,7 +663,7 @@ def run_single_genome(
     elif stability_core_ids is not None and len(stability_core_ids) < _MIN_CORE_FOR_OVERRIDE:
         logger.warning(
             "Stability core set too small (%d < %d genes); keeping "
-            "Mahalanobis cluster for MELP/gRodon2. Consider lowering "
+            "Mahalanobis cluster for MELP/enrichment. Consider lowering "
             "--stability-core-threshold (currently %.2f).",
             len(stability_core_ids), _MIN_CORE_FOR_OVERRIDE,
             stability_core_threshold,
