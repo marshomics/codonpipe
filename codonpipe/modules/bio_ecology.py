@@ -139,6 +139,118 @@ def _parse_gff_gene_map(
     return gene_coords
 
 
+# ── CU-annotated GFF output ─────────────────────────────────────────────
+
+# Map dual-anchor categories to biologically meaningful CU class labels.
+_DUAL_CAT_TO_CU_CLASS = {
+    "both":      "streamlined_CU",
+    "rp_only":   "streamlined_CU",
+    "dens_only": "genome_standard_CU",
+    "neither":   "HGT_candidate",
+}
+
+
+def annotate_gff_with_cu_class(
+    gff_path: Path,
+    dual_anchor_df: pd.DataFrame,
+    output_path: Path,
+    hgt_df: pd.DataFrame | None = None,
+) -> Path:
+    """Write a new GFF3 file with a ``codon_usage_class`` attribute on each CDS.
+
+    Reads the original GFF line-by-line.  For each CDS feature, resolves
+    the gene ID against the dual-anchor DataFrame and appends a
+    ``codon_usage_class=`` attribute with one of three values:
+
+      - **streamlined_CU** — genes in the RP cluster (``both`` or
+        ``rp_only`` dual-anchor categories).  These share the
+        translationally optimised codon usage of ribosomal proteins.
+      - **genome_standard_CU** — genes in the density cluster only
+        (``dens_only``).  Typical compositional baseline for this genome.
+      - **HGT_candidate** — genes outside both clusters (``neither``).
+        Codon usage diverges from both the translational-selection
+        anchor and the genome-wide baseline.
+
+    When *hgt_df* is supplied (from :func:`detect_hgt_candidates`), a
+    secondary ``hgt_flag_combined`` attribute is added for CDS features
+    that were also flagged by the RSCU-space Mahalanobis HGT test.
+
+    Non-CDS lines (headers, ``gene`` features, ``##FASTA`` blocks, etc.)
+    are passed through unmodified.
+
+    Args:
+        gff_path: Path to the original Prokka/PGAP GFF3 file.
+        dual_anchor_df: DataFrame with ``gene`` and ``dual_category``
+            columns from dual-anchor clustering.
+        output_path: Destination path for the annotated GFF3.
+        hgt_df: Optional HGT candidates DataFrame with ``gene`` and
+            ``hgt_flag_combined`` columns.
+
+    Returns:
+        The *output_path* that was written.
+    """
+    # Build lookup: gene_id → CU class
+    cu_map: dict[str, str] = {}
+    for _, row in dual_anchor_df.iterrows():
+        gid = str(row["gene"])
+        cat = str(row.get("dual_category", ""))
+        cu_map[gid] = _DUAL_CAT_TO_CU_CLASS.get(cat, "unclassified")
+
+    # Optional HGT flag lookup
+    hgt_flag_map: dict[str, str] = {}
+    if hgt_df is not None and not hgt_df.empty and "hgt_flag_combined" in hgt_df.columns:
+        for _, row in hgt_df.iterrows():
+            gid = str(row["gene"])
+            flag = str(row["hgt_flag_combined"])
+            if flag.lower() in ("true", "1", "yes"):
+                hgt_flag_map[gid] = "True"
+
+    known_genes = set(cu_map.keys())
+    n_annotated = 0
+    n_cds_total = 0
+
+    with open(gff_path) as fin, open(output_path, "w") as fout:
+        for line in fin:
+            # Pass headers and FASTA blocks through unchanged
+            if line.startswith("#") or line.startswith(">"):
+                fout.write(line)
+                continue
+
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 9 or parts[2] != "CDS":
+                fout.write(line)
+                continue
+
+            n_cds_total += 1
+            attrs = parts[8]
+
+            # Resolve gene ID
+            candidates = _extract_gene_ids_from_attrs(attrs)
+            resolved = None
+            for cid in candidates:
+                if cid in known_genes:
+                    resolved = cid
+                    break
+
+            if resolved is not None:
+                cu_class = cu_map[resolved]
+                attrs = attrs.rstrip(";") + f";codon_usage_class={cu_class}"
+                if resolved in hgt_flag_map:
+                    attrs += ";hgt_mahal_flag=True"
+                n_annotated += 1
+            else:
+                attrs = attrs.rstrip(";") + ";codon_usage_class=unclassified"
+
+            parts[8] = attrs
+            fout.write("\t".join(parts) + "\n")
+
+    logger.info(
+        "CU-annotated GFF written to %s: %d/%d CDS features classified",
+        output_path.name, n_annotated, n_cds_total,
+    )
+    return output_path
+
+
 def detect_hgt_candidates(
     rscu_gene_df: pd.DataFrame,
     enc_df: pd.DataFrame,
@@ -1150,6 +1262,7 @@ def run_bio_ecology_analyses(
     mahal_cluster_rscu: dict[str, float] | pd.Series | None = None,
     mahal_cluster_gene_ids: list[str] | set[str] | None = None,
     mahal_cluster_ids_path: Path | str | None = None,
+    dual_anchor_df: pd.DataFrame | None = None,
 ) -> dict[str, pd.DataFrame | Path | dict]:
     """Run all biological and ecological analyses.
 
@@ -1178,6 +1291,10 @@ def run_bio_ecology_analyses(
             alongside *expr_df* containing MELP-based expression_class,
             gRodon2 uses the optimised set as the background and high-MELP
             genes as the highly-expressed set.
+        dual_anchor_df: Optional DataFrame from dual-anchor clustering with
+            'gene' and 'dual_category' columns.  When provided, a
+            ``dual_anchor_category`` column is merged into the HGT
+            candidates table.
 
     Returns:
         Dict of analysis names -> DataFrames/file paths. Includes nested dicts for
@@ -1203,6 +1320,15 @@ def run_bio_ecology_analyses(
         )
         if not hgt_df.empty:
             hgt_df = _annotate_df(hgt_df, ann_map, "gene")
+            # Merge dual-anchor category when available
+            if dual_anchor_df is not None and not dual_anchor_df.empty:
+                _da_map = dict(zip(
+                    dual_anchor_df["gene"].astype(str),
+                    dual_anchor_df["dual_category"].astype(str),
+                ))
+                hgt_df["dual_anchor_category"] = (
+                    hgt_df["gene"].astype(str).map(_da_map).fillna("unknown")
+                )
             out_path = eco_dir / f"{sample_id}_hgt_candidates.tsv"
             hgt_df.to_csv(out_path, sep="\t", index=False)
             outputs["hgt_candidates"] = hgt_df
