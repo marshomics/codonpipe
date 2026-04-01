@@ -2087,8 +2087,8 @@ def plot_coa_kde_dual_anchor(
         "dens_only": "Density-cluster only",
         "neither": "Neither",
     }
-    cat_alphas = {"both": 0.7, "rp_only": 0.7, "dens_only": 0.7, "neither": 0.12}
-    cat_sizes = {"both": 14, "rp_only": 14, "dens_only": 14, "neither": 4}
+    cat_alphas = {"both": 0.7, "rp_only": 0.7, "dens_only": 0.7, "neither": 0.35}
+    cat_sizes = {"both": 14, "rp_only": 14, "dens_only": 14, "neither": 8}
 
     # KDE background
     from scipy.stats import gaussian_kde
@@ -2100,8 +2100,8 @@ def plot_coa_kde_dual_anchor(
     Zi = kde(np.vstack([Xi.ravel(), Yi.ravel()])).reshape(Xi.shape)
 
     fig, ax = plt.subplots(figsize=(9, 7))
-    ax.contourf(Xi, Yi, Zi, levels=15, cmap="Greys", alpha=0.25)
-    ax.contour(Xi, Yi, Zi, levels=15, colors="gray", linewidths=0.2, alpha=0.25)
+    ax.contourf(Xi, Yi, Zi, levels=15, cmap="Greys", alpha=0.35)
+    ax.contour(Xi, Yi, Zi, levels=15, colors="gray", linewidths=0.4, alpha=0.45)
 
     # Plot genes by category, "neither" first
     legend_handles = []
