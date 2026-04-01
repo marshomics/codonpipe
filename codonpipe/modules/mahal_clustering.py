@@ -1661,12 +1661,74 @@ def run_mahal_clustering(
 
     median_rp_dist = float(np.median(rp_dists_clean))
 
-    # Adaptive threshold: find the natural break between RP-like genes
-    # and the genome bulk using KDE valley detection → Otsu → default.
-    threshold, threshold_diag = _find_adaptive_threshold(
-        distances, rp_dists_clean, median_rp_dist,
-        default_multiplier=distance_multiplier,
-    )
+    # ── Step 5b: Adaptive threshold via 2-D projection ───────────────
+    # The bimodal gap between RP-like genes and the genome bulk is most
+    # visible in the first 2 COA axes (which carry the most inertia).
+    # Higher dimensions add chi-squared noise that washes out the valley.
+    # Strategy: find the valley in 2-D Mahalanobis space, identify which
+    # genes fall below it, then set the full-dimensional threshold to the
+    # max full-dimensional distance among those genes.
+    if n_axes >= 2:
+        centroid_2d = centroid[:2]
+        cov_2d = cov[:2, :2]
+        try:
+            cov_2d_inv = np.linalg.inv(cov_2d)
+        except np.linalg.LinAlgError:
+            cov_2d_inv = np.linalg.pinv(cov_2d)
+
+        distances_2d = _compute_mahalanobis_distances(
+            X[:, :2], centroid_2d, cov_2d_inv,
+        )
+        rp_dists_2d_all = distances_2d[rp_indices]
+        rp_dists_2d_clean = rp_dists_2d_all[~rp_outlier_mask]
+        if len(rp_dists_2d_clean) == 0:
+            rp_dists_2d_clean = rp_dists_2d_all
+        median_rp_2d = float(np.median(rp_dists_2d_clean))
+
+        threshold_2d, threshold_diag = _find_adaptive_threshold(
+            distances_2d, rp_dists_2d_clean, median_rp_2d,
+            default_multiplier=distance_multiplier,
+        )
+        threshold_diag["projection"] = "2d"
+
+        # Translate 2-D threshold to full-dimensional space:
+        # find genes inside the 2-D boundary, then set the full-dim
+        # threshold to the maximum full-dim distance among them (plus a
+        # small margin to avoid clipping boundary genes).
+        genes_inside_2d = distances_2d <= threshold_2d
+        if genes_inside_2d.any():
+            full_dists_inside = distances[genes_inside_2d]
+            # Use 95th percentile of the full-dim distances of 2-D-selected
+            # genes as the threshold (avoids a single outlier inflating it)
+            threshold = float(np.percentile(full_dists_inside, 95))
+            threshold_diag["threshold_2d"] = round(threshold_2d, 4)
+            threshold_diag["n_genes_inside_2d"] = int(genes_inside_2d.sum())
+            threshold_diag["threshold"] = round(threshold, 4)
+            threshold_diag["effective_multiplier"] = round(
+                threshold / median_rp_dist, 4
+            )
+            logger.info(
+                "2-D adaptive threshold: valley at %.2f in 2-D → %d genes → "
+                "full-dim threshold %.2f (%.2f× median RP dist)",
+                threshold_2d, genes_inside_2d.sum(),
+                threshold, threshold / median_rp_dist,
+            )
+        else:
+            # Fallback if no genes inside 2-D boundary (shouldn't happen)
+            threshold = distance_multiplier * median_rp_dist
+            threshold_diag["threshold"] = round(threshold, 4)
+            logger.warning(
+                "No genes inside 2-D adaptive boundary; using default %.1f×",
+                distance_multiplier,
+            )
+    else:
+        # Only 2 axes — no projection needed, run directly on full distances
+        threshold, threshold_diag = _find_adaptive_threshold(
+            distances, rp_dists_clean, median_rp_dist,
+            default_multiplier=distance_multiplier,
+        )
+        threshold_diag["projection"] = "full"
+
     results["threshold_diagnostics"] = threshold_diag
 
     logger.info(
@@ -1851,8 +1913,11 @@ def run_mahal_clustering(
         "rp_outliers_removed": int(rp_outlier_mask.sum()),
         "mahalanobis_threshold": round(threshold, 4),
         "threshold_method": threshold_diag["method"],
+        "threshold_projection": threshold_diag.get("projection", "full"),
         "threshold_effective_multiplier": threshold_diag["effective_multiplier"],
         "threshold_kde_valley": threshold_diag.get("kde_valley"),
+        "threshold_2d": threshold_diag.get("threshold_2d"),
+        "threshold_n_genes_inside_2d": threshold_diag.get("n_genes_inside_2d"),
         "threshold_otsu": threshold_diag.get("otsu_threshold"),
         "median_rp_distance": round(median_rp_dist, 4),
         "rscu_pooling": "distance-weighted",
