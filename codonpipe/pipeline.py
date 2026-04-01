@@ -25,7 +25,7 @@ from codonpipe.modules.enrichment import run_enrichment_analysis
 from codonpipe.modules.advanced_analyses import run_advanced_analyses
 from codonpipe.modules.mahal_clustering import run_mahal_clustering
 from codonpipe.modules.cluster_stability import run_stability_analysis
-from codonpipe.modules.bio_ecology import run_bio_ecology_analyses
+from codonpipe.modules.bio_ecology import run_bio_ecology_analyses, annotate_gff_with_cu_class
 from codonpipe.modules.codon_table_formats import generate_all_codon_tables
 from codonpipe.modules.statistics import run_batch_statistics
 from codonpipe.modules.comparative import run_comparative_analyses
@@ -1014,6 +1014,7 @@ def run_single_genome(
             mahal_cluster_rscu=mahal_cluster_rscu,
             mahal_cluster_gene_ids=mahal_cluster_gene_ids,
             mahal_cluster_ids_path=mahal_cluster_ids_path,
+            dual_anchor_df=mahal_results.get("dual_anchor_df"),
         )
         # Normalize keys and flatten nested dicts for plotting compatibility
         _bio_key_map = {
@@ -1042,6 +1043,27 @@ def run_single_genome(
 
     if not bio_ecology_results:
         logger.info("SKIPPED: bio/ecology analyses produced no results")
+
+    # ── Step 10b: CU-annotated GFF ──────────────────────────────────────
+    # Write a copy of the Prokka GFF with codon_usage_class attributes on
+    # each CDS (streamlined_CU / genome_standard_CU / HGT_candidate)
+    # derived from dual-anchor clustering.
+    _dual_df = mahal_results.get("dual_anchor_df")
+    if resolved_gff is not None and _dual_df is not None and not _dual_df.empty:
+        try:
+            _hgt_df = bio_outputs.get("hgt_candidates") if bio_outputs else None
+            _cu_gff_path = output_dir / "prokka" / f"{sample_id}_cu_annotated.gff"
+            _cu_gff_path.parent.mkdir(parents=True, exist_ok=True)
+            annotate_gff_with_cu_class(
+                gff_path=resolved_gff,
+                dual_anchor_df=_dual_df,
+                output_path=_cu_gff_path,
+                hgt_df=_hgt_df,
+            )
+            all_outputs["cu_annotated_gff"] = _cu_gff_path
+            logger.info("[Step 10b] CU-annotated GFF saved to %s", _cu_gff_path)
+        except Exception as e:
+            logger.warning("CU-annotated GFF generation failed: %s. Continuing.", e, exc_info=True)
 
     # ── Step 11: Codon usage tables ──────────────────────────────────────
     logger.info("[Step 11/12] Generating codon usage tables in all standard formats")
