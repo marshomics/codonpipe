@@ -57,8 +57,12 @@ _MIN_CLUSTER_SIZE = 10        # Warn if optimized set has fewer genes than this
 
 # RP-anchored Mahalanobis approach
 _RP_OUTLIER_ALPHA = 0.025     # Chi-squared alpha for RP outlier detection
-_DISTANCE_MULTIPLIER = 2.0    # Threshold = multiplier x median RP Mahalanobis distance
+_DISTANCE_MULTIPLIER = 2.0    # Default threshold = multiplier x median RP distance (fallback)
 _MIN_RP_FOR_ROBUST = 10       # Min RP genes for MinCovDet; else empirical covariance
+_ADAPTIVE_MULT_MIN = 1.2      # Floor for adaptive multiplier (relative to median RP dist)
+_ADAPTIVE_MULT_MAX = 3.0      # Ceiling for adaptive multiplier
+_ADAPTIVE_KDE_N_POINTS = 512  # Resolution for 1-D KDE on distance distribution
+_ADAPTIVE_MIN_GENES = 100     # Minimum genes to attempt adaptive threshold
 
 # RP sub-cluster detection
 _RP_SUBCLUSTER_MIN = 15       # Minimum RP genes to attempt sub-cluster detection
@@ -630,6 +634,221 @@ def _classify_translational_selection(
         logger.warning("⚠ %s", result["caveat"])
 
     return result
+
+
+def _find_adaptive_threshold(
+    distances: np.ndarray,
+    rp_distances_clean: np.ndarray,
+    median_rp_dist: float,
+    default_multiplier: float = _DISTANCE_MULTIPLIER,
+    min_mult: float = _ADAPTIVE_MULT_MIN,
+    max_mult: float = _ADAPTIVE_MULT_MAX,
+    n_kde_points: int = _ADAPTIVE_KDE_N_POINTS,
+    min_genes: int = _ADAPTIVE_MIN_GENES,
+) -> tuple[float, dict]:
+    """Find a data-driven Mahalanobis distance threshold.
+
+    Attempts two methods in order:
+
+    1. **KDE valley detection** — fits a 1-D Gaussian KDE to the full distance
+       distribution and searches for the first local minimum after the RP peak.
+       The RP peak is defined as the KDE mode in the range [0, 2 × median_rp].
+       The valley must lie between the RP peak and the next local maximum
+       (the genome-bulk peak) to be accepted.
+
+    2. **Otsu's method** — if no valley is found, binarises the distance
+       histogram to maximise between-class variance.  This is robust to
+       unimodal distributions but produces a less precise boundary.
+
+    The result is clamped to [min_mult × median_rp, max_mult × median_rp]
+    so it can't collapse to near-zero or explode on pathological inputs.
+
+    If the genome has fewer than *min_genes* genes, or the median RP distance
+    is zero, the default multiplier is returned.
+
+    Args:
+        distances: (n_genes,) Mahalanobis distances for all genes.
+        rp_distances_clean: Distances for non-outlier RP genes.
+        median_rp_dist: Median of rp_distances_clean.
+        default_multiplier: Fallback multiplier if adaptive methods fail.
+        min_mult / max_mult: Bounds on the effective multiplier.
+        n_kde_points: Number of evaluation points for the 1-D KDE.
+        min_genes: Minimum genes required to attempt adaptive threshold.
+
+    Returns:
+        threshold: The chosen distance threshold.
+        diagnostics: Dict with method used, valley/Otsu location, effective
+            multiplier, and any intermediate values.
+    """
+    from scipy.stats import gaussian_kde as gkde
+
+    diag: dict = {
+        "method": "default",
+        "threshold": default_multiplier * median_rp_dist,
+        "effective_multiplier": default_multiplier,
+        "kde_valley": None,
+        "kde_rp_peak": None,
+        "kde_bulk_peak": None,
+        "otsu_threshold": None,
+    }
+
+    floor = min_mult * median_rp_dist
+    ceiling = max_mult * median_rp_dist
+
+    if len(distances) < min_genes or median_rp_dist <= 0:
+        logger.info(
+            "Adaptive threshold: too few genes (%d) or zero median RP dist; "
+            "using default %.1f×",
+            len(distances), default_multiplier,
+        )
+        diag["threshold"] = np.clip(diag["threshold"], floor, ceiling)
+        diag["effective_multiplier"] = diag["threshold"] / median_rp_dist
+        return diag["threshold"], diag
+
+    # Evaluation range: 0 to 99th percentile (ignore extreme outliers)
+    d_max = float(np.percentile(distances, 99))
+    d_eval = np.linspace(0, d_max, n_kde_points)
+
+    # ── Method 1: KDE valley detection ───────────────────────────────
+    try:
+        kde = gkde(distances, bw_method="scott")
+        density = kde(d_eval)
+
+        # Find local extrema
+        # A local min at index i: density[i] < density[i-1] and density[i] < density[i+1]
+        local_mins = []
+        local_maxs = []
+        for i in range(1, len(density) - 1):
+            if density[i] < density[i - 1] and density[i] < density[i + 1]:
+                local_mins.append((d_eval[i], density[i]))
+            if density[i] > density[i - 1] and density[i] > density[i + 1]:
+                local_maxs.append((d_eval[i], density[i]))
+
+        # RP peak: the highest local max in [0, 2 × median_rp_dist]
+        rp_peak_limit = 2.0 * median_rp_dist
+        rp_peaks = [(d, v) for d, v in local_maxs if d <= rp_peak_limit]
+        if not rp_peaks:
+            # Fallback: global max of density in [0, rp_peak_limit]
+            mask = d_eval <= rp_peak_limit
+            if mask.any():
+                idx = np.argmax(density[mask])
+                rp_peaks = [(d_eval[mask][idx], density[mask][idx])]
+
+        if rp_peaks:
+            rp_peak_d = max(rp_peaks, key=lambda x: x[1])[0]
+            diag["kde_rp_peak"] = round(float(rp_peak_d), 4)
+
+            # Find the first valley AFTER the RP peak
+            valid_valleys = [
+                (d, v) for d, v in local_mins
+                if d > rp_peak_d and d > median_rp_dist
+            ]
+
+            if valid_valleys:
+                valley_d = valid_valleys[0][0]
+
+                # Sanity: there should be a bulk peak after the valley
+                bulk_peaks = [
+                    (d, v) for d, v in local_maxs if d > valley_d
+                ]
+                if bulk_peaks:
+                    diag["kde_bulk_peak"] = round(float(bulk_peaks[0][0]), 4)
+
+                valley_clamped = float(np.clip(valley_d, floor, ceiling))
+                diag["kde_valley"] = round(float(valley_d), 4)
+                diag["method"] = "kde_valley"
+                diag["threshold"] = valley_clamped
+                diag["effective_multiplier"] = round(
+                    valley_clamped / median_rp_dist, 4
+                )
+
+                logger.info(
+                    "Adaptive threshold (KDE valley): raw=%.3f, clamped=%.3f "
+                    "(%.2f× median RP dist). RP peak=%.3f, valley=%.3f",
+                    valley_d, valley_clamped,
+                    valley_clamped / median_rp_dist,
+                    rp_peak_d, valley_d,
+                )
+                return valley_clamped, diag
+
+        logger.debug("KDE valley detection: no valid valley found after RP peak")
+
+    except Exception as e:
+        logger.debug("KDE valley detection failed: %s", e)
+
+    # ── Method 2: Otsu's method ──────────────────────────────────────
+    try:
+        # Histogram the distances
+        n_bins = 256
+        hist_range = (0, d_max)
+        counts, bin_edges = np.histogram(distances, bins=n_bins, range=hist_range)
+        bin_centres = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+        total = counts.sum()
+        if total == 0:
+            raise ValueError("Empty histogram")
+
+        # Otsu: maximise between-class variance
+        best_t = default_multiplier * median_rp_dist
+        best_var = -1.0
+
+        cum_sum = 0.0
+        cum_count = 0
+        total_sum = float((counts * bin_centres).sum())
+
+        for i in range(n_bins):
+            cum_count += counts[i]
+            if cum_count == 0:
+                continue
+            bg_count = total - cum_count
+            if bg_count == 0:
+                break
+
+            cum_sum += counts[i] * bin_centres[i]
+            mean_bg = (total_sum - cum_sum) / bg_count
+            mean_fg = cum_sum / cum_count
+
+            var_between = cum_count * bg_count * (mean_fg - mean_bg) ** 2
+            if var_between > best_var:
+                best_var = var_between
+                best_t = bin_centres[i]
+
+        # Only accept Otsu threshold if it's above the median RP distance
+        # (otherwise it's splitting within the RP peak, which is wrong)
+        if best_t > median_rp_dist:
+            otsu_clamped = float(np.clip(best_t, floor, ceiling))
+            diag["otsu_threshold"] = round(float(best_t), 4)
+            diag["method"] = "otsu"
+            diag["threshold"] = otsu_clamped
+            diag["effective_multiplier"] = round(
+                otsu_clamped / median_rp_dist, 4
+            )
+
+            logger.info(
+                "Adaptive threshold (Otsu): raw=%.3f, clamped=%.3f "
+                "(%.2f× median RP dist)",
+                best_t, otsu_clamped, otsu_clamped / median_rp_dist,
+            )
+            return otsu_clamped, diag
+
+        logger.debug(
+            "Otsu threshold (%.3f) is below median RP distance (%.3f); "
+            "rejecting", best_t, median_rp_dist,
+        )
+
+    except Exception as e:
+        logger.debug("Otsu threshold failed: %s", e)
+
+    # ── Fallback: default multiplier ─────────────────────────────────
+    fallback = float(np.clip(default_multiplier * median_rp_dist, floor, ceiling))
+    diag["threshold"] = fallback
+    diag["effective_multiplier"] = round(fallback / median_rp_dist, 4)
+
+    logger.info(
+        "Adaptive threshold: no valley or Otsu found; using default "
+        "%.1f× = %.3f", default_multiplier, fallback,
+    )
+    return fallback, diag
 
 
 def _compute_mahalanobis_distances(
@@ -1441,11 +1660,20 @@ def run_mahal_clustering(
         rp_dists_clean = rp_dists_all
 
     median_rp_dist = float(np.median(rp_dists_clean))
-    threshold = distance_multiplier * median_rp_dist
+
+    # Adaptive threshold: find the natural break between RP-like genes
+    # and the genome bulk using KDE valley detection → Otsu → default.
+    threshold, threshold_diag = _find_adaptive_threshold(
+        distances, rp_dists_clean, median_rp_dist,
+        default_multiplier=distance_multiplier,
+    )
+    results["threshold_diagnostics"] = threshold_diag
 
     logger.info(
-        "Mahalanobis threshold: %.2f x %.2f = %.2f",
-        distance_multiplier, median_rp_dist, threshold,
+        "Mahalanobis threshold: %.2f (method=%s, effective multiplier=%.2f×, "
+        "median RP dist=%.2f)",
+        threshold, threshold_diag["method"],
+        threshold_diag["effective_multiplier"], median_rp_dist,
     )
 
     # Store RP-anchor geometry for downstream plotting
@@ -1622,6 +1850,10 @@ def run_mahal_clustering(
         "total_rp_genes": len(rp_gene_ids),
         "rp_outliers_removed": int(rp_outlier_mask.sum()),
         "mahalanobis_threshold": round(threshold, 4),
+        "threshold_method": threshold_diag["method"],
+        "threshold_effective_multiplier": threshold_diag["effective_multiplier"],
+        "threshold_kde_valley": threshold_diag.get("kde_valley"),
+        "threshold_otsu": threshold_diag.get("otsu_threshold"),
         "median_rp_distance": round(median_rp_dist, 4),
         "rscu_pooling": "distance-weighted",
         "mean_rscu_weight": round(mean_weight, 4),
