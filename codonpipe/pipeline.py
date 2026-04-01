@@ -594,6 +594,72 @@ def run_single_genome(
                 expr_df[COL_IN_MAHAL_CLUSTER] = expr_df[COL_GENE].isin(stability_core_ids)
             except Exception:
                 pass
+
+        # ── Recompute dual-anchor categories against stability core ──────
+        # The original dual-anchor categories were computed inside
+        # run_mahal_clustering using the raw Mahalanobis cluster.  Now that
+        # stability refinement has replaced that set with a (usually
+        # smaller) core, recompute so that downstream plots and the
+        # dual_anchor_df stay consistent.
+        _density_ids = mahal_results.get("density_cluster_gene_ids")
+        _gene_dists = mahal_results.get("mahal_gene_distances")  # pd.Series
+        _old_dual_df = mahal_results.get("dual_anchor_df")
+
+        if _density_ids is not None and _old_dual_df is not None and not _old_dual_df.empty:
+            _new_rp_set = set(stability_core_ids)
+            _new_cats = []
+            for gid in _old_dual_df["gene"]:
+                in_rp = gid in _new_rp_set
+                in_dens = gid in _density_ids
+                if in_rp and in_dens:
+                    _new_cats.append("both")
+                elif in_rp:
+                    _new_cats.append("rp_only")
+                elif in_dens:
+                    _new_cats.append("dens_only")
+                else:
+                    _new_cats.append("neither")
+
+            _old_dual_df = _old_dual_df.copy()
+            _old_dual_df["in_rp_cluster"] = _old_dual_df["gene"].isin(_new_rp_set)
+            _old_dual_df["dual_category"] = _new_cats
+            mahal_results["dual_anchor_df"] = _old_dual_df
+
+            # Update rp_threshold to the effective boundary of the
+            # stability core (max Mahalanobis distance among core genes).
+            if _gene_dists is not None:
+                _core_dists = _gene_dists.loc[
+                    _gene_dists.index.isin(_new_rp_set)
+                ]
+                if not _core_dists.empty:
+                    _effective_thresh = float(_core_dists.max())
+                    mahal_results["rp_threshold"] = _effective_thresh
+                    logger.info(
+                        "Dual-anchor recomputed against stability core "
+                        "(%d genes): effective RP threshold %.2f",
+                        len(_new_rp_set), _effective_thresh,
+                    )
+
+            # Re-save the dual-anchor TSV
+            _dual_path = mahal_results.get("dual_anchor_path")
+            if _dual_path is not None:
+                try:
+                    _old_dual_df.to_csv(_dual_path, sep="\t", index=False)
+                except Exception as e:
+                    logger.warning("Could not re-save dual-anchor TSV: %s", e)
+
+            # Log updated category counts
+            from collections import Counter
+            _cat_counts = Counter(_new_cats)
+            logger.info(
+                "Post-stability dual-anchor categories: both=%d, "
+                "rp_only=%d, dens_only=%d, neither=%d",
+                _cat_counts.get("both", 0),
+                _cat_counts.get("rp_only", 0),
+                _cat_counts.get("dens_only", 0),
+                _cat_counts.get("neither", 0),
+            )
+
     elif stability_core_ids is not None and len(stability_core_ids) < _MIN_CORE_FOR_OVERRIDE:
         logger.warning(
             "Stability core set too small (%d < %d genes); keeping "
