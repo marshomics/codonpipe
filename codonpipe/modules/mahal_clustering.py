@@ -73,7 +73,7 @@ _RP_SUBCLUSTER_MIN_FRAC = 0.20    # Sub-cluster must contain >= 20% of total RPs
 # Density-anchor mode
 _DENSITY_KDE_BANDWIDTH = "scott"  # KDE bandwidth for density peak detection
 _DENSITY_SEED_RADIUS_PCTL = 30   # Percentile of distances for initial seed set
-_DENSITY_MULTIPLIER = 2.5         # Threshold = multiplier × median seed distance
+# _DENSITY_MULTIPLIER = 2.5       # (deprecated: replaced by chi-squared threshold)
 
 # Translational selection strength classification
 # Thresholds are applied in order: "strong" requires ALL strong criteria,
@@ -2040,76 +2040,29 @@ def run_mahal_clustering(
             X[:, :n_axes], density_centroid, density_cov_inv,
         )
 
-        # Seed distances (reference set for threshold computation)
-        seed_set = set(density_seed_ids)
-        seed_indices = np.array([
-            i for i, gid in enumerate(gene_ids) if gid in seed_set
-        ])
-        seed_dists = density_distances[seed_indices] if len(seed_indices) > 0 else density_distances
-        density_median = float(np.median(seed_dists))
+        # Chi-squared threshold for the density cluster.
+        #
+        # The density anchor represents the genome's compositional centre.
+        # Unlike the RP anchor (two populations: RP-like vs bulk), the
+        # density distance distribution is unimodal with an outlier tail.
+        # A chi-squared critical value is the natural boundary: genes
+        # whose Mahalanobis distance exceeds the critical value for
+        # n_axes degrees of freedom are statistical outliers.
+        _DENSITY_CHI2_ALPHA = 0.95
+        density_chi2_crit = float(np.sqrt(chi2.ppf(_DENSITY_CHI2_ALPHA, df=n_axes)))
+        density_threshold = density_chi2_crit
 
-        # Adaptive threshold via 2-D projection (mirrors RP approach)
-        density_threshold = _DENSITY_MULTIPLIER * density_median  # default
         density_thresh_diag: dict = {
-            "method": "fixed_multiplier",
-            "effective_multiplier": _DENSITY_MULTIPLIER,
-            "projection": "full",
+            "method": "chi2",
+            "chi2_alpha": _DENSITY_CHI2_ALPHA,
+            "chi2_df": n_axes,
+            "chi2_critical_value": round(density_chi2_crit, 4),
         }
-        if n_axes >= 2 and len(gene_ids) >= _ADAPTIVE_MIN_GENES:
-            try:
-                dens_centroid_2d = density_centroid[:2]
-                dens_cov_2d = density_cov[:2, :2]
-                try:
-                    dens_cov_2d_inv = np.linalg.inv(dens_cov_2d)
-                except np.linalg.LinAlgError:
-                    dens_cov_2d_inv = np.linalg.pinv(dens_cov_2d)
 
-                dens_dists_2d = _compute_mahalanobis_distances(
-                    X[:, :2], dens_centroid_2d, dens_cov_2d_inv,
-                )
-                seed_dists_2d = dens_dists_2d[seed_indices] if len(seed_indices) > 0 else dens_dists_2d
-                median_seed_2d = float(np.median(seed_dists_2d))
-
-                thresh_2d, density_thresh_diag = _find_adaptive_threshold(
-                    dens_dists_2d, seed_dists_2d, median_seed_2d,
-                    default_multiplier=_DENSITY_MULTIPLIER,
-                    min_mult=_ADAPTIVE_MULT_MIN,
-                    max_mult=_ADAPTIVE_MULT_MAX,
-                )
-                density_thresh_diag["projection"] = "2d"
-
-                genes_inside_2d = dens_dists_2d <= thresh_2d
-                if genes_inside_2d.any():
-                    full_dists_inside = density_distances[genes_inside_2d]
-                    density_threshold = float(np.percentile(full_dists_inside, 95))
-                    density_thresh_diag["threshold_2d"] = round(thresh_2d, 4)
-                    density_thresh_diag["n_genes_inside_2d"] = int(genes_inside_2d.sum())
-                    density_thresh_diag["effective_multiplier"] = round(
-                        density_threshold / density_median, 4,
-                    ) if density_median > 0 else _DENSITY_MULTIPLIER
-                    logger.info(
-                        "Density adaptive threshold: 2-D %s at %.2f → "
-                        "%d genes inside → full-dim 95th pctl = %.2f "
-                        "(%.2f× median seed)",
-                        density_thresh_diag["method"], thresh_2d,
-                        genes_inside_2d.sum(), density_threshold,
-                        density_thresh_diag["effective_multiplier"],
-                    )
-                else:
-                    logger.warning(
-                        "No genes inside 2-D density boundary; "
-                        "using default %.1f×", _DENSITY_MULTIPLIER,
-                    )
-            except Exception as e:
-                logger.warning(
-                    "Density adaptive threshold failed (%s); "
-                    "using default %.1f×", e, _DENSITY_MULTIPLIER,
-                )
-        else:
-            logger.info(
-                "Density-anchor threshold: %.2f × %.2f = %.2f (fixed multiplier)",
-                _DENSITY_MULTIPLIER, density_median, density_threshold,
-            )
+        logger.info(
+            "Density-anchor threshold: chi2(df=%d, alpha=%.2f) = %.3f",
+            n_axes, _DENSITY_CHI2_ALPHA, density_threshold,
+        )
         results["density_threshold_diagnostics"] = density_thresh_diag
 
         density_optimized_mask = density_distances <= density_threshold
