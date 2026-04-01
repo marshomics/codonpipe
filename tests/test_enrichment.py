@@ -111,9 +111,9 @@ class TestExpressionClassification:
 
         vals = pd.Series(list(range(100)))
         classes = _classify_by_percentile(vals)
-        assert (classes == "high").sum() == 5  # >= 95th percentile (95-99)
-        assert (classes == "low").sum() == 5  # <= 5th percentile (0-4)
-        assert (classes == "medium").sum() == 90
+        assert (classes == "high").sum() == 10  # >= 90th percentile (90-99)
+        assert (classes == "low").sum() == 10  # <= 10th percentile (0-9)
+        assert (classes == "medium").sum() == 80
 
     def test_classify_all_nan(self):
         from codonpipe.modules.expression import _classify_by_percentile

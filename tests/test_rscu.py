@@ -10,8 +10,8 @@ from codonpipe.modules.rscu import (
     count_codons,
     _calculate_enc,
     _calculate_gc3,
-    _codon_to_col_name,
 )
+from codonpipe.utils.codon_tables import codon_to_col_name as _codon_to_col_name
 
 
 class TestCountCodons:
@@ -63,10 +63,10 @@ class TestComputeRSCU:
             assert abs(rscu[codon_col] - 1.0) < 0.01
 
     def test_zero_amino_acid(self):
-        """If an amino acid has zero total counts, RSCU should be 0."""
+        """If an amino acid has zero total counts, RSCU should be NaN."""
         counts = Counter()  # empty
         rscu = compute_rscu_from_counts(counts)
-        assert rscu["Phe-UUU"] == 0.0
+        assert np.isnan(rscu["Phe-UUU"])
 
 
 class TestCodonToColName:
@@ -111,7 +111,7 @@ class TestENC:
             "AUU": 100, "AUC": 0, "AUA": 0,  # Ile
             "GUU": 100, "GUC": 0, "GUA": 0, "GUG": 0,  # Val
         })
-        enc = _calculate_enc(counts)
+        enc, _ = _calculate_enc(counts)
         # With extreme bias, ENC should be relatively low
         assert enc < 40
 
@@ -122,5 +122,5 @@ class TestENC:
         for aa, codons in AA_CODON_GROUPS.items():
             for codon in codons:
                 counts[codon] = 100
-        enc = _calculate_enc(counts)
+        enc, _ = _calculate_enc(counts)
         assert enc > 50

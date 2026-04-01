@@ -373,7 +373,7 @@ def detect_hgt_candidates(
         ref_vals = np.array([ref_series.get(c, np.nan) for c in rscu_cols])
         if np.any(np.isnan(ref_vals)):
             # Fill missing codons with genome mean for those positions
-            genome_mean = X.mean(axis=0) if not pca_applied else rscu_df[rscu_cols].values.mean(axis=0)
+            genome_mean = X.mean(axis=0) if not pca_applied else rscu_gene_df[rscu_cols].values.mean(axis=0)
             nan_mask = np.isnan(ref_vals)
             ref_vals[nan_mask] = genome_mean[nan_mask]
         # If PCA was applied, project reference into PCA space
