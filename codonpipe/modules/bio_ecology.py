@@ -156,27 +156,29 @@ def annotate_gff_with_cu_class(
     output_path: Path,
     hgt_df: pd.DataFrame | None = None,
 ) -> Path:
-    """Write a new GFF3 file with a ``codon_usage_class`` attribute on each CDS.
+    """Write a new GFF3 with codon-usage annotations as a separate track.
 
-    Reads the original GFF line-by-line.  For each CDS feature, resolves
-    the gene ID against the dual-anchor DataFrame and appends a
-    ``codon_usage_class=`` attribute with one of three values:
+    All original features are preserved unchanged.  For each CDS that can
+    be resolved against the dual-anchor DataFrame, a new companion
+    feature is emitted immediately after the original CDS line:
 
-      - **streamlined_CU** — genes in the RP cluster (``both`` or
-        ``rp_only`` dual-anchor categories).  These share the
-        translationally optimised codon usage of ribosomal proteins.
-      - **genome_standard_CU** — genes in the density cluster only
-        (``dens_only``).  Typical compositional baseline for this genome.
-      - **HGT_candidate** — genes outside both clusters (``neither``).
-        Codon usage diverges from both the translational-selection
-        anchor and the genome-wide baseline.
+    .. code-block:: text
 
-    When *hgt_df* is supplied (from :func:`detect_hgt_candidates`), a
-    secondary ``hgt_flag_combined`` attribute is added for CDS features
-    that were also flagged by the RSCU-space Mahalanobis HGT test.
+       seqname  CodonPipe  codon_usage  start  end  .  strand  .  ID=<gene>_cu;Parent=<gene>;Name=streamlined_CU;...
 
-    Non-CDS lines (headers, ``gene`` features, ``##FASTA`` blocks, etc.)
-    are passed through unmodified.
+    The new features use source ``CodonPipe`` and type ``codon_usage``,
+    making them a distinct annotation category that genome browsers
+    (Artemis, IGV, JBrowse) render as a separate track.
+
+    Each ``codon_usage`` feature carries these attributes:
+
+      - ``Name`` — the codon-usage class (``streamlined_CU``,
+        ``genome_standard_CU``, or ``HGT_candidate``).
+      - ``codon_usage_class`` — same value (for programmatic access).
+      - ``dual_anchor_category`` — the raw dual-anchor label
+        (``both``, ``rp_only``, ``dens_only``, ``neither``).
+      - ``hgt_mahal_flag=True`` — present only when the gene was also
+        flagged by the RSCU-space Mahalanobis HGT test.
 
     Args:
         gff_path: Path to the original Prokka/PGAP GFF3 file.
@@ -189,21 +191,21 @@ def annotate_gff_with_cu_class(
     Returns:
         The *output_path* that was written.
     """
-    # Build lookup: gene_id → CU class
-    cu_map: dict[str, str] = {}
+    # Build lookup: gene_id → (cu_class, raw_category)
+    cu_map: dict[str, tuple[str, str]] = {}
     for _, row in dual_anchor_df.iterrows():
         gid = str(row["gene"])
         cat = str(row.get("dual_category", ""))
-        cu_map[gid] = _DUAL_CAT_TO_CU_CLASS.get(cat, "unclassified")
+        cu_class = _DUAL_CAT_TO_CU_CLASS.get(cat, "unclassified")
+        cu_map[gid] = (cu_class, cat)
 
     # Optional HGT flag lookup
-    hgt_flag_map: dict[str, str] = {}
+    hgt_flag_set: set[str] = set()
     if hgt_df is not None and not hgt_df.empty and "hgt_flag_combined" in hgt_df.columns:
         for _, row in hgt_df.iterrows():
-            gid = str(row["gene"])
             flag = str(row["hgt_flag_combined"])
             if flag.lower() in ("true", "1", "yes"):
-                hgt_flag_map[gid] = "True"
+                hgt_flag_set.add(str(row["gene"]))
 
     known_genes = set(cu_map.keys())
     n_annotated = 0
@@ -211,20 +213,20 @@ def annotate_gff_with_cu_class(
 
     with open(gff_path) as fin, open(output_path, "w") as fout:
         for line in fin:
-            # Pass headers and FASTA blocks through unchanged
+            # Always write the original line unchanged
+            fout.write(line)
+
             if line.startswith("#") or line.startswith(">"):
-                fout.write(line)
                 continue
 
             parts = line.rstrip("\n").split("\t")
             if len(parts) < 9 or parts[2] != "CDS":
-                fout.write(line)
                 continue
 
             n_cds_total += 1
-            attrs = parts[8]
 
-            # Resolve gene ID
+            # Resolve gene ID from the CDS attributes
+            attrs = parts[8]
             candidates = _extract_gene_ids_from_attrs(attrs)
             resolved = None
             for cid in candidates:
@@ -232,20 +234,40 @@ def annotate_gff_with_cu_class(
                     resolved = cid
                     break
 
-            if resolved is not None:
-                cu_class = cu_map[resolved]
-                attrs = attrs.rstrip(";") + f";codon_usage_class={cu_class}"
-                if resolved in hgt_flag_map:
-                    attrs += ";hgt_mahal_flag=True"
-                n_annotated += 1
-            else:
-                attrs = attrs.rstrip(";") + ";codon_usage_class=unclassified"
+            if resolved is None:
+                continue
 
-            parts[8] = attrs
-            fout.write("\t".join(parts) + "\n")
+            cu_class, raw_cat = cu_map[resolved]
+            n_annotated += 1
+
+            # Build the companion codon_usage feature
+            # Same seqname, coordinates, strand as the CDS
+            cu_attrs = (
+                f"ID={resolved}_cu;"
+                f"Parent={resolved};"
+                f"Name={cu_class};"
+                f"codon_usage_class={cu_class};"
+                f"dual_anchor_category={raw_cat}"
+            )
+            if resolved in hgt_flag_set:
+                cu_attrs += ";hgt_mahal_flag=True"
+
+            cu_parts = [
+                parts[0],       # seqname
+                "CodonPipe",    # source
+                "codon_usage",  # type
+                parts[3],       # start
+                parts[4],       # end
+                ".",            # score
+                parts[6],       # strand
+                ".",            # phase
+                cu_attrs,       # attributes
+            ]
+            fout.write("\t".join(cu_parts) + "\n")
 
     logger.info(
-        "CU-annotated GFF written to %s: %d/%d CDS features classified",
+        "CU-annotated GFF written to %s: %d/%d CDS features annotated "
+        "(source=CodonPipe, type=codon_usage)",
         output_path.name, n_annotated, n_cds_total,
     )
     return output_path
