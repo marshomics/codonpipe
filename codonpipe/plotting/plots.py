@@ -2196,6 +2196,133 @@ def plot_coa_kde_dual_anchor(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Codon-usage genome landscape (line plot across genome position)
+# ═══════════════════════════════════════════════════════════════════════
+
+def plot_cu_genome_landscape(
+    dual_anchor_df: pd.DataFrame,
+    rscu_gene_df: pd.DataFrame,
+    enc_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+    gff_path: "Path | None" = None,
+    bin_size: int = 30,
+):
+    """Codon-usage classification landscape across genome position.
+
+    Genes are ordered by genomic position (from GFF coordinates when
+    available, otherwise FASTA/RSCU file order) and grouped into
+    non-overlapping bins of *bin_size* genes.  Three lines are plotted:
+
+      - **Streamlined CU** (teal) — mean RP-cluster membership score
+        per bin.  Peaks indicate runs of genes with translationally
+        optimised codon usage similar to ribosomal proteins.
+      - **Genome-standard CU** (purple) — mean density-cluster
+        membership score per bin.  Peaks indicate genes whose codon
+        usage matches the genome's compositional baseline.
+      - **Divergent CU / HGT** (coral) — mean divergence score per
+        bin, computed as ``1 − max(rp_membership, density_membership)``.
+        Peaks indicate genomic islands where codon usage departs from
+        both the translational-selection and compositional anchors,
+        suggesting horizontal gene transfer or other atypical origin.
+
+    Args:
+        dual_anchor_df: DataFrame with ``gene``, ``rp_membership``,
+            ``density_membership``, and ``dual_category`` columns.
+        rscu_gene_df: Per-gene RSCU table (used for gene ordering
+            fallback).
+        enc_df: ENC table (used for gene ordering fallback).
+        output_path: Base path (without extension).
+        sample_id: Genome label for the title.
+        gff_path: Optional GFF3 file for genomic coordinates.
+        bin_size: Number of genes per bin (default 30).
+    """
+    _apply_style()
+    if dual_anchor_df is None or dual_anchor_df.empty:
+        return
+    if "rp_membership" not in dual_anchor_df.columns:
+        return
+    if "density_membership" not in dual_anchor_df.columns:
+        return
+
+    # ── Gene order along the genome ──────────────────────────────────
+    gene_positions = _get_gene_positions(rscu_gene_df, enc_df, gff_path)
+    if gene_positions.empty or len(gene_positions) < bin_size:
+        return
+    ordered_genes = gene_positions["gene"].tolist()
+
+    # Align dual-anchor data to genome order
+    da_map = {}
+    for _, row in dual_anchor_df.iterrows():
+        da_map[str(row["gene"])] = {
+            "rp": float(row.get("rp_membership", 0.0)),
+            "dens": float(row.get("density_membership", 0.0)),
+        }
+
+    genes_with_data = [g for g in ordered_genes if g in da_map]
+    if len(genes_with_data) < bin_size:
+        return
+
+    rp_scores = np.array([da_map[g]["rp"] for g in genes_with_data])
+    dens_scores = np.array([da_map[g]["dens"] for g in genes_with_data])
+    div_scores = 1.0 - np.maximum(rp_scores, dens_scores)
+
+    # ── Bin into non-overlapping groups ──────────────────────────────
+    n_genes = len(genes_with_data)
+    n_bins = n_genes // bin_size
+    if n_bins < 2:
+        return
+
+    # Trim to exact multiple of bin_size
+    n_used = n_bins * bin_size
+    rp_binned = rp_scores[:n_used].reshape(n_bins, bin_size).mean(axis=1)
+    dens_binned = dens_scores[:n_used].reshape(n_bins, bin_size).mean(axis=1)
+    div_binned = div_scores[:n_used].reshape(n_bins, bin_size).mean(axis=1)
+
+    # X-axis: use midpoint genome position of each bin (kb) if GFF
+    # available, otherwise bin index
+    pos_arr = gene_positions.set_index("gene").reindex(genes_with_data)["position"].values
+    pos_used = pos_arr[:n_used].reshape(n_bins, bin_size)
+    bin_midpoints = pos_used.mean(axis=1)
+
+    # Determine x-axis label
+    has_gff_positions = gff_path is not None and not np.all(
+        np.diff(bin_midpoints) == bin_midpoints[1] - bin_midpoints[0]
+    )
+    x_label = "Genome position (kb)" if has_gff_positions else "Gene bin"
+
+    # ── Plot ─────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(14, 4.5))
+
+    ax.fill_between(bin_midpoints, rp_binned, alpha=0.15, color="#1b9e77")
+    ax.fill_between(bin_midpoints, div_binned, alpha=0.12, color="#d95f02")
+
+    ax.plot(bin_midpoints, rp_binned, color="#1b9e77", linewidth=1.6,
+            label="Streamlined CU (RP-cluster)", zorder=3)
+    ax.plot(bin_midpoints, dens_binned, color="#7570b3", linewidth=1.6,
+            label="Genome-standard CU (density-cluster)", zorder=3)
+    ax.plot(bin_midpoints, div_binned, color="#d95f02", linewidth=1.6,
+            label="Divergent CU (HGT candidates)", zorder=3)
+
+    ax.set_xlabel(x_label, fontsize=10)
+    ax.set_ylabel("Mean membership score per bin", fontsize=10)
+    ax.set_title(
+        f"{sample_id}: codon-usage landscape "
+        f"({n_genes} genes, {bin_size}-gene bins)",
+        fontsize=11,
+    )
+
+    ax.set_ylim(-0.02, min(1.02, max(rp_binned.max(), dens_binned.max(),
+                                       div_binned.max()) * 1.15))
+    ax.set_xlim(bin_midpoints[0], bin_midpoints[-1])
+
+    ax.legend(fontsize=8, loc="upper right", framealpha=0.8)
+    ax.grid(axis="y", linewidth=0.3, alpha=0.4)
+
+    _save_fig(fig, output_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Codon usage similarity network
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -5803,6 +5930,22 @@ def generate_single_genome_plots(
             outputs["coa_kde_dual_anchor"] = p.with_suffix(".png")
         except Exception as e:
             logger.warning("COA KDE + dual-anchor overlay plot failed: %s", e)
+
+    # ── CU genome landscape (30-gene bins) ─────────────────────────────
+    if dual_anchor_df is not None and not dual_anchor_df.empty:
+        try:
+            p = plot_dir / f"{sample_id}_cu_genome_landscape"
+            plot_cu_genome_landscape(
+                dual_anchor_df=dual_anchor_df,
+                rscu_gene_df=rscu_gene_df,
+                enc_df=enc_df,
+                output_path=p,
+                sample_id=sample_id,
+                gff_path=gff_path,
+            )
+            outputs["cu_genome_landscape"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("CU genome landscape plot failed: %s", e)
 
     # ── Per-gene UMAP grid (2-D, multiple hyperparameters) ──────────────
     if rscu_gene_df is not None and not rscu_gene_df.empty:
