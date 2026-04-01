@@ -1830,6 +1830,371 @@ def plot_coa_kde(
     _save_fig(fig, output_path)
 
 
+def plot_coa_kde_mahal(
+    coa_coords: pd.DataFrame,
+    coa_inertia: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+    rp_gene_ids: set[str] | None = None,
+    mahal_cluster_gene_ids: set[str] | None = None,
+    mahal_gene_distances: "pd.Series | None" = None,
+    distance_threshold: float | None = None,
+):
+    """COA KDE density plot with Mahalanobis cluster boundary overlay.
+
+    Identical to :func:`plot_coa_kde` but adds:
+    * A filled ellipse (or convex hull) showing the Mahalanobis cluster
+      boundary projected onto the Axis 1 / Axis 2 plane.
+    * Cluster member genes coloured distinctly from background.
+    * RP genes highlighted with open markers.
+
+    The cluster boundary is drawn as the 2-D covariance ellipse of the
+    in-cluster genes scaled to match the Mahalanobis distance threshold,
+    giving a visual approximation of the multi-dimensional boundary in
+    the two most informative COA dimensions.
+
+    Args:
+        coa_coords: Gene COA coordinates (gene, Axis1, Axis2, …).
+        coa_inertia: Inertia table.
+        output_path: Base path (without extension).
+        sample_id: Genome label.
+        rp_gene_ids: Ribosomal protein gene IDs.
+        mahal_cluster_gene_ids: Gene IDs inside the Mahalanobis cluster.
+        mahal_gene_distances: Series indexed by gene ID with Mahalanobis
+            distances (used for colour-coding cluster members).
+        distance_threshold: Mahalanobis distance threshold used to define
+            the cluster (for legend annotation).
+    """
+    _apply_style()
+    if len(coa_coords) < 30 or "Axis1" not in coa_coords.columns:
+        return
+
+    x = coa_coords["Axis1"].values
+    y = coa_coords["Axis2"].values
+    gene_ids = coa_coords["gene"].astype(str).values
+
+    _axis1 = coa_inertia.loc[coa_inertia["axis"] == 1, "pct_inertia"].values
+    _axis2 = coa_inertia.loc[coa_inertia["axis"] == 2, "pct_inertia"].values
+    pct1 = _axis1[0] if len(_axis1) > 0 else 0
+    pct2 = _axis2[0] if len(_axis2) > 0 else 0
+
+    # ── KDE (same as plot_coa_kde) ────────────────────────────────────
+    from scipy.stats import gaussian_kde
+    xy_stack = np.vstack([x, y])
+    kde = gaussian_kde(xy_stack, bw_method="scott")
+    xi = np.linspace(x.min() - 0.08 * np.ptp(x), x.max() + 0.08 * np.ptp(x), 200)
+    yi = np.linspace(y.min() - 0.08 * np.ptp(y), y.max() + 0.08 * np.ptp(y), 200)
+    Xi, Yi = np.meshgrid(xi, yi)
+    Zi = kde(np.vstack([Xi.ravel(), Yi.ravel()])).reshape(Xi.shape)
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+
+    cf = ax.contourf(Xi, Yi, Zi, levels=15, cmap="Blues", alpha=0.55)
+    ax.contour(Xi, Yi, Zi, levels=15, colors="navy", linewidths=0.3, alpha=0.3)
+    cbar = fig.colorbar(cf, ax=ax, shrink=0.75, pad=0.02)
+    cbar.set_label("Gene density (KDE)", fontsize=9)
+
+    # ── Background genes ──────────────────────────────────────────────
+    ax.scatter(x, y, s=3, alpha=0.12, c="black", edgecolors="none",
+               rasterized=True, zorder=1)
+
+    # ── Mahalanobis cluster members ───────────────────────────────────
+    if mahal_cluster_gene_ids:
+        cluster_mask = np.array([g in mahal_cluster_gene_ids for g in gene_ids])
+        non_cluster_mask = ~cluster_mask
+
+        # Colour cluster members by distance if available
+        if mahal_gene_distances is not None:
+            dists = np.array([
+                mahal_gene_distances.get(g, np.nan)
+                if isinstance(mahal_gene_distances, dict)
+                else mahal_gene_distances.loc[g] if g in mahal_gene_distances.index else np.nan
+                for g in gene_ids
+            ])
+            cluster_dists = dists[cluster_mask]
+            vmax = np.nanpercentile(cluster_dists, 95) if np.any(~np.isnan(cluster_dists)) else 1.0
+            sc = ax.scatter(
+                x[cluster_mask], y[cluster_mask],
+                c=cluster_dists, cmap="YlOrRd_r", vmin=0, vmax=vmax,
+                s=12, alpha=0.7, edgecolors="none", zorder=2, rasterized=True,
+            )
+            cbar2 = fig.colorbar(sc, ax=ax, shrink=0.5, pad=0.06, location="left")
+            cbar2.set_label("Mahalanobis distance", fontsize=8)
+        else:
+            ax.scatter(
+                x[cluster_mask], y[cluster_mask],
+                s=12, alpha=0.6, c="#2ecc71", edgecolors="none",
+                zorder=2, rasterized=True,
+                label=f"Mahal. cluster (n={int(cluster_mask.sum())})",
+            )
+
+        # ── Cluster boundary ellipse ──────────────────────────────────
+        # Fit a 2-D covariance to cluster members in Axis1/Axis2, then
+        # draw the ellipse at the threshold radius.
+        cx = x[cluster_mask]
+        cy = y[cluster_mask]
+        if len(cx) >= 5:
+            try:
+                mean_x, mean_y = cx.mean(), cy.mean()
+                cov_2d = np.cov(cx, cy)
+                # Eigendecomposition for ellipse orientation + radii
+                eigvals, eigvecs = np.linalg.eigh(cov_2d)
+                # Sort descending
+                order = eigvals.argsort()[::-1]
+                eigvals = eigvals[order]
+                eigvecs = eigvecs[:, order]
+
+                # Scale factor: use chi-squared 95% quantile for 2 DoF
+                # to give a ~95% coverage ellipse of cluster members
+                from scipy.stats import chi2 as chi2_dist
+                scale = np.sqrt(chi2_dist.ppf(0.95, df=2))
+
+                angle = np.degrees(np.arctan2(eigvecs[1, 0], eigvecs[0, 0]))
+                width = 2 * scale * np.sqrt(max(eigvals[0], 0))
+                height = 2 * scale * np.sqrt(max(eigvals[1], 0))
+
+                from matplotlib.patches import Ellipse
+                ellipse = Ellipse(
+                    (mean_x, mean_y), width, height, angle=angle,
+                    facecolor="#2ecc71", alpha=0.12,
+                    edgecolor="#27ae60", linewidth=2.0, linestyle="-",
+                    zorder=3,
+                )
+                ax.add_patch(ellipse)
+
+                # Threshold annotation
+                thresh_label = (
+                    f"Mahal. cluster boundary (n={int(cluster_mask.sum())}"
+                )
+                if distance_threshold is not None:
+                    thresh_label += f", d≤{distance_threshold:.1f}"
+                thresh_label += ")"
+
+                # Invisible artist for legend
+                from matplotlib.patches import Patch
+                ellipse_legend = Patch(
+                    facecolor="#2ecc71", alpha=0.2,
+                    edgecolor="#27ae60", linewidth=1.5,
+                    label=thresh_label,
+                )
+            except Exception as e:
+                logger.debug("Cluster ellipse failed: %s", e)
+                ellipse_legend = None
+        else:
+            ellipse_legend = None
+
+    # ── Ribosomal proteins ────────────────────────────────────────────
+    rp_legend = None
+    if rp_gene_ids:
+        rp_mask = np.array([g in rp_gene_ids for g in gene_ids])
+        if rp_mask.any():
+            ax.scatter(
+                x[rp_mask], y[rp_mask],
+                facecolors="none", edgecolors="crimson", s=35,
+                linewidths=0.9, zorder=5,
+            )
+            rp_legend = plt.Line2D(
+                [], [], marker="o", color="crimson", markerfacecolor="none",
+                markersize=6, linewidth=0,
+                label=f"Ribosomal proteins (n={int(rp_mask.sum())})",
+            )
+
+    # ── Legend ─────────────────────────────────────────────────────────
+    legend_handles = []
+    if mahal_cluster_gene_ids and ellipse_legend is not None:
+        legend_handles.append(ellipse_legend)
+    if rp_legend is not None:
+        legend_handles.append(rp_legend)
+    if legend_handles:
+        ax.legend(handles=legend_handles, fontsize=8, loc="best", framealpha=0.7)
+
+    ax.set_xlabel(f"COA Axis 1 ({pct1:.1f}% inertia)")
+    ax.set_ylabel(f"COA Axis 2 ({pct2:.1f}% inertia)")
+    ax.axhline(0, color="gray", linewidth=0.3, linestyle="--", alpha=0.3)
+    ax.axvline(0, color="gray", linewidth=0.3, linestyle="--", alpha=0.3)
+    ax.set_title(
+        f"{sample_id}: COA density with Mahalanobis cluster ({len(gene_ids)} genes)",
+        fontsize=11,
+    )
+
+    _save_fig(fig, output_path)
+
+
+def plot_coa_kde_dual_anchor(
+    coa_coords: pd.DataFrame,
+    coa_inertia: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+    rp_gene_ids: set[str] | None = None,
+    dual_anchor_df: pd.DataFrame | None = None,
+    rp_centroid: "np.ndarray | None" = None,
+    density_centroid: "np.ndarray | None" = None,
+    rp_cov: "np.ndarray | None" = None,
+    density_cov: "np.ndarray | None" = None,
+    rp_threshold: float | None = None,
+    density_threshold: float | None = None,
+):
+    """COA KDE density plot coloured by dual-anchor category.
+
+    Genes are colour-coded by their dual-anchor classification:
+      both      — teal (#1b9e77)
+      rp_only   — coral (#d95f02)
+      dens_only — purple (#7570b3)
+      neither   — light grey
+
+    Both cluster boundary ellipses are overlaid (RP = dashed coral,
+    density = dotted purple) with their centroids marked.
+
+    Args:
+        coa_coords: Gene COA coordinates.
+        coa_inertia: Inertia table.
+        output_path: Base path (without extension).
+        sample_id: Genome label.
+        rp_gene_ids: Ribosomal protein gene IDs.
+        dual_anchor_df: DataFrame with 'gene' and 'dual_category' columns.
+        rp_centroid / density_centroid: Anchor centroids (n_axes,).
+        rp_cov / density_cov: Anchor covariance matrices (n_axes, n_axes).
+        rp_threshold / density_threshold: Mahalanobis thresholds.
+    """
+    _apply_style()
+    if dual_anchor_df is None or dual_anchor_df.empty:
+        return
+    if len(coa_coords) < 30 or "Axis1" not in coa_coords.columns:
+        return
+
+    x = coa_coords["Axis1"].values
+    y = coa_coords["Axis2"].values
+    gene_ids = coa_coords["gene"].astype(str).values
+
+    _axis1 = coa_inertia.loc[coa_inertia["axis"] == 1, "pct_inertia"].values
+    _axis2 = coa_inertia.loc[coa_inertia["axis"] == 2, "pct_inertia"].values
+    pct1 = _axis1[0] if len(_axis1) > 0 else 0
+    pct2 = _axis2[0] if len(_axis2) > 0 else 0
+
+    # Category lookup
+    cat_map = dict(zip(dual_anchor_df["gene"].astype(str),
+                        dual_anchor_df["dual_category"].astype(str)))
+
+    cat_colors = {
+        "both": "#1b9e77",
+        "rp_only": "#d95f02",
+        "dens_only": "#7570b3",
+        "neither": "#d0d0d0",
+    }
+    cat_labels = {
+        "both": "Both clusters",
+        "rp_only": "RP-cluster only",
+        "dens_only": "Density-cluster only",
+        "neither": "Neither",
+    }
+    cat_alphas = {"both": 0.7, "rp_only": 0.7, "dens_only": 0.7, "neither": 0.12}
+    cat_sizes = {"both": 14, "rp_only": 14, "dens_only": 14, "neither": 4}
+
+    # KDE background
+    from scipy.stats import gaussian_kde
+    xy_stack = np.vstack([x, y])
+    kde = gaussian_kde(xy_stack, bw_method="scott")
+    xi = np.linspace(x.min() - 0.08 * np.ptp(x), x.max() + 0.08 * np.ptp(x), 200)
+    yi = np.linspace(y.min() - 0.08 * np.ptp(y), y.max() + 0.08 * np.ptp(y), 200)
+    Xi, Yi = np.meshgrid(xi, yi)
+    Zi = kde(np.vstack([Xi.ravel(), Yi.ravel()])).reshape(Xi.shape)
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    ax.contourf(Xi, Yi, Zi, levels=15, cmap="Greys", alpha=0.25)
+    ax.contour(Xi, Yi, Zi, levels=15, colors="gray", linewidths=0.2, alpha=0.25)
+
+    # Plot genes by category, "neither" first
+    legend_handles = []
+    for cat in ["neither", "dens_only", "rp_only", "both"]:
+        mask = np.array([cat_map.get(g, "neither") == cat for g in gene_ids])
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        ax.scatter(
+            x[mask], y[mask],
+            c=cat_colors[cat], alpha=cat_alphas[cat], s=cat_sizes[cat],
+            edgecolors="none", rasterized=True, zorder=2 if cat != "neither" else 1,
+        )
+        from matplotlib.patches import Patch
+        legend_handles.append(
+            Patch(facecolor=cat_colors[cat], alpha=0.8,
+                  label=f"{cat_labels[cat]} (n={n})")
+        )
+
+    # RP markers
+    if rp_gene_ids:
+        rp_mask = np.array([g in rp_gene_ids for g in gene_ids])
+        if rp_mask.any():
+            ax.scatter(
+                x[rp_mask], y[rp_mask],
+                facecolors="none", edgecolors="black", s=35,
+                linewidths=0.8, zorder=5,
+            )
+            legend_handles.append(
+                plt.Line2D([], [], marker="o", color="black",
+                           markerfacecolor="none", markersize=6, linewidth=0,
+                           label=f"Ribosomal proteins (n={int(rp_mask.sum())})")
+            )
+
+    # Ellipses for both anchors
+    def _draw_boundary_ellipse(centroid, cov_mat, thresh, color, ls, label):
+        if centroid is None or cov_mat is None or thresh is None:
+            return
+        try:
+            cov_2d = cov_mat[:2, :2]
+            eigvals, eigvecs = np.linalg.eigh(cov_2d)
+            if np.all(eigvals > 0):
+                angle = np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1]))
+                width = 2 * thresh * np.sqrt(eigvals[1])
+                height = 2 * thresh * np.sqrt(eigvals[0])
+                from matplotlib.patches import Ellipse as MplEllipse
+                ell = MplEllipse(
+                    (centroid[0], centroid[1]), width, height, angle=angle,
+                    facecolor="none", edgecolor=color, linewidth=2.0,
+                    linestyle=ls, alpha=0.8, zorder=4,
+                )
+                ax.add_patch(ell)
+                legend_handles.append(
+                    Patch(facecolor="none", edgecolor=color,
+                          linewidth=1.5, linestyle=ls, label=label)
+                )
+        except Exception as e:
+            logger.debug("Dual-anchor ellipse failed: %s", e)
+
+    _draw_boundary_ellipse(
+        rp_centroid, rp_cov, rp_threshold,
+        "#d95f02", "--",
+        f"RP boundary (d≤{rp_threshold:.1f})" if rp_threshold else "RP boundary",
+    )
+    _draw_boundary_ellipse(
+        density_centroid, density_cov, density_threshold,
+        "#7570b3", ":",
+        f"Density boundary (d≤{density_threshold:.1f})" if density_threshold else "Density boundary",
+    )
+
+    # Centroids
+    if rp_centroid is not None:
+        ax.scatter(rp_centroid[0], rp_centroid[1], marker="*", s=200,
+                   color="#d95f02", edgecolors="black", linewidths=0.5, zorder=7)
+    if density_centroid is not None:
+        ax.scatter(density_centroid[0], density_centroid[1], marker="D", s=80,
+                   color="#7570b3", edgecolors="black", linewidths=0.5, zorder=7)
+
+    if legend_handles:
+        ax.legend(handles=legend_handles, fontsize=7, loc="best", framealpha=0.7)
+
+    ax.set_xlabel(f"COA Axis 1 ({pct1:.1f}% inertia)")
+    ax.set_ylabel(f"COA Axis 2 ({pct2:.1f}% inertia)")
+    ax.axhline(0, color="gray", linewidth=0.3, linestyle="--", alpha=0.3)
+    ax.axvline(0, color="gray", linewidth=0.3, linestyle="--", alpha=0.3)
+    ax.set_title(
+        f"{sample_id}: dual-anchor COA classification ({len(gene_ids)} genes)",
+        fontsize=11,
+    )
+
+    _save_fig(fig, output_path)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Codon usage similarity network
 # ═══════════════════════════════════════════════════════════════════════
@@ -4285,13 +4650,15 @@ def plot_codon_deviation_heatmap(
     sample_id: str = "",
     gff_path: Path | None = None,
     window_size: int = 30,
+    dual_anchor_df: pd.DataFrame | None = None,
 ):
     """Per-codon ΔRSCU heatmap with genes ordered by genomic position.
 
     Each cell shows the deviation of a gene's (or gene-window's) RSCU from the
     Mahalanobis cluster mean for a given codon.  Rows = codons (hierarchically
     clustered), columns = genes/windows in genome order.  Top annotation tracks
-    mark Mahalanobis cluster membership, HGT candidates, and MGE/phage genes.
+    mark Mahalanobis cluster membership, HGT candidates, MGE/phage genes, and
+    (when available) dual-anchor category.
 
     For genomes with >200 genes, a sliding window of *window_size* genes is
     applied, showing the mean ΔRSCU per window.
@@ -4308,6 +4675,8 @@ def plot_codon_deviation_heatmap(
         sample_id: Sample identifier.
         gff_path: GFF3 file for genomic coordinates (optional).
         window_size: Sliding window width when gene count exceeds 200.
+        dual_anchor_df: Dual-anchor comparison DataFrame with 'gene' and
+            'dual_category' columns (optional).
     """
     _apply_style()
     if mahal_cluster_rscu is None or rscu_gene_df is None or rscu_gene_df.empty:
@@ -4349,6 +4718,21 @@ def plot_codon_deviation_heatmap(
     if hgt_df is not None and "hgt_flag" in hgt_df.columns:
         hgt_genes = set(hgt_df.loc[hgt_df["hgt_flag"], "gene"]) - mge_genes
 
+    # Dual-anchor category lookup (gene → category string)
+    _dual_cat_map: dict[str, str] = {}
+    has_dual = dual_anchor_df is not None and not dual_anchor_df.empty
+    if has_dual:
+        _dual_cat_map = dict(zip(dual_anchor_df["gene"].astype(str),
+                                  dual_anchor_df["dual_category"].astype(str)))
+    # Category → RGB colour for the dual-anchor annotation track
+    _DUAL_CAT_RGB = {
+        "both":      (0.106, 0.620, 0.467),   # teal  #1b9e77
+        "rp_only":   (0.851, 0.373, 0.008),   # coral #d95f02
+        "dens_only": (0.459, 0.439, 0.702),   # purple #7570b3
+        "neither":   (0.816, 0.816, 0.816),   # light grey #d0d0d0
+    }
+    _DUAL_BG = (0.94, 0.94, 0.94)  # fallback if gene has no category
+
     # Apply sliding window if genome is large
     use_window = len(ordered_genes) > 200
     if use_window:
@@ -4373,6 +4757,20 @@ def plot_codon_deviation_heatmap(
             sum(1 for g in ordered_genes[i:i + window_size] if g in hgt_genes) / window_size
             for i in range(n_windows)
         ])
+        # Dual-anchor track: blend category colours by fraction of window
+        if has_dual:
+            window_dual = np.zeros((n_windows, 3))
+            for wi in range(n_windows):
+                cat_counts: dict[str, int] = {}
+                for g in ordered_genes[wi:wi + window_size]:
+                    cat = _dual_cat_map.get(g, "neither")
+                    cat_counts[cat] = cat_counts.get(cat, 0) + 1
+                rgb = np.zeros(3)
+                for cat, cnt in cat_counts.items():
+                    frac = cnt / window_size
+                    c = _DUAL_CAT_RGB.get(cat, _DUAL_BG)
+                    rgb += frac * np.array(c)
+                window_dual[wi] = rgb
         plot_matrix = window_delta.T  # (n_codons, n_windows)
         x_label = f"Genome position (sliding window, w={window_size} genes)"
         n_cols = n_windows
@@ -4381,6 +4779,11 @@ def plot_codon_deviation_heatmap(
         window_mahal = np.array([1.0 if g in mahal_set else 0.0 for g in ordered_genes])
         window_mge = np.array([1.0 if g in mge_genes else 0.0 for g in ordered_genes])
         window_hgt = np.array([1.0 if g in hgt_genes else 0.0 for g in ordered_genes])
+        if has_dual:
+            window_dual = np.array([
+                _DUAL_CAT_RGB.get(_dual_cat_map.get(g, "neither"), _DUAL_BG)
+                for g in ordered_genes
+            ])
         x_label = "Gene (genome order)"
         n_cols = len(ordered_genes)
 
@@ -4409,21 +4812,34 @@ def plot_codon_deviation_heatmap(
     vmax = max(vmax, 0.1)
 
     # Figure layout: annotation tracks on top, heatmap below, AA sidebar left
+    # Extra track row when dual-anchor data is available
+    n_track_rows = 4 if has_dual else 3
+    track_heights = [0.3] * n_track_rows
     fig_width = max(10, min(22, n_cols * 0.03 + 3))
     fig = plt.figure(figsize=(fig_width, 10))
     gs = gridspec.GridSpec(
-        4, 2, figure=fig,
-        height_ratios=[0.3, 0.3, 0.3, 10],
+        n_track_rows + 1, 2, figure=fig,
+        height_ratios=track_heights + [10],
         width_ratios=[0.5, 20],
         hspace=0.05, wspace=0.02,
     )
 
-    # Annotation tracks (top 3 rows, right column)
-    ax_mahal_track = fig.add_subplot(gs[0, 1])
-    ax_hgt_track = fig.add_subplot(gs[1, 1], sharex=ax_mahal_track)
-    ax_mge_track = fig.add_subplot(gs[2, 1], sharex=ax_mahal_track)
-    ax_heat = fig.add_subplot(gs[3, 1], sharex=ax_mahal_track)
-    ax_aa = fig.add_subplot(gs[3, 0], sharey=ax_heat)
+    # Annotation tracks (top rows, right column)
+    track_idx = 0
+    ax_mahal_track = fig.add_subplot(gs[track_idx, 1])
+    track_idx += 1
+    ax_hgt_track = fig.add_subplot(gs[track_idx, 1], sharex=ax_mahal_track)
+    track_idx += 1
+    ax_mge_track = fig.add_subplot(gs[track_idx, 1], sharex=ax_mahal_track)
+    track_idx += 1
+
+    ax_dual_track = None
+    if has_dual:
+        ax_dual_track = fig.add_subplot(gs[track_idx, 1], sharex=ax_mahal_track)
+        track_idx += 1
+
+    ax_heat = fig.add_subplot(gs[track_idx, 1], sharex=ax_mahal_track)
+    ax_aa = fig.add_subplot(gs[track_idx, 0], sharey=ax_heat)
 
     # Mahalanobis cluster track
     ax_mahal_track.imshow(
@@ -4451,6 +4867,15 @@ def plot_codon_deviation_heatmap(
     ax_mge_track.set_ylabel("MGE", fontsize=7, rotation=0, ha="right", va="center")
     ax_mge_track.set_yticks([])
     ax_mge_track.tick_params(labelbottom=False)
+
+    # Dual-anchor category track (RGB image)
+    if ax_dual_track is not None and has_dual:
+        ax_dual_track.imshow(
+            window_dual[np.newaxis, :, :], aspect="auto", interpolation="nearest",
+        )
+        ax_dual_track.set_ylabel("Dual", fontsize=7, rotation=0, ha="right", va="center")
+        ax_dual_track.set_yticks([])
+        ax_dual_track.tick_params(labelbottom=False)
 
     # Main heatmap
     im = ax_heat.imshow(
@@ -5010,6 +5435,13 @@ def generate_single_genome_plots(
     stability_results: dict | None = None,
     rp_gene_ids: set[str] | None = None,
     mahal_gene_distances: "pd.Series | None" = None,
+    dual_anchor_df: pd.DataFrame | None = None,
+    rp_centroid: "np.ndarray | None" = None,
+    rp_cov: "np.ndarray | None" = None,
+    rp_threshold: float | None = None,
+    density_centroid: "np.ndarray | None" = None,
+    density_cov: "np.ndarray | None" = None,
+    density_threshold: float | None = None,
 ) -> dict[str, Path]:
     """Generate all single-genome plots.
 
@@ -5312,6 +5744,64 @@ def generate_single_genome_plots(
             outputs["coa_kde"] = p.with_suffix(".png")
         except Exception as e:
             logger.warning("COA KDE density plot failed: %s", e)
+
+    # ── COA KDE + Mahalanobis cluster overlay ──────────────────────────
+    if (_coa_coords_for_landscape is not None
+            and _coa_inertia_for_landscape is not None
+            and mahal_cluster_gene_ids):
+        try:
+            # Derive distance threshold from cluster members if available
+            _dist_thresh = None
+            if mahal_gene_distances is not None:
+                _cluster_dists = {
+                    g: (mahal_gene_distances[g]
+                        if isinstance(mahal_gene_distances, dict)
+                        else mahal_gene_distances.loc[g]
+                           if g in mahal_gene_distances.index else None)
+                    for g in mahal_cluster_gene_ids
+                }
+                _valid = [v for v in _cluster_dists.values() if v is not None]
+                if _valid:
+                    _dist_thresh = float(max(_valid))
+
+            p = plot_dir / f"{sample_id}_coa_kde_mahal"
+            plot_coa_kde_mahal(
+                _coa_coords_for_landscape,
+                _coa_inertia_for_landscape,
+                p,
+                sample_id=sample_id,
+                rp_gene_ids=rp_gene_ids,
+                mahal_cluster_gene_ids=mahal_cluster_gene_ids,
+                mahal_gene_distances=mahal_gene_distances,
+                distance_threshold=_dist_thresh,
+            )
+            outputs["coa_kde_mahal"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("COA KDE + Mahalanobis overlay plot failed: %s", e)
+
+    # ── COA KDE + dual-anchor category overlay ────────────────────────
+    if (_coa_coords_for_landscape is not None
+            and _coa_inertia_for_landscape is not None
+            and dual_anchor_df is not None and not dual_anchor_df.empty):
+        try:
+            p = plot_dir / f"{sample_id}_coa_kde_dual_anchor"
+            plot_coa_kde_dual_anchor(
+                _coa_coords_for_landscape,
+                _coa_inertia_for_landscape,
+                p,
+                sample_id=sample_id,
+                rp_gene_ids=rp_gene_ids,
+                dual_anchor_df=dual_anchor_df,
+                rp_centroid=rp_centroid,
+                density_centroid=density_centroid,
+                rp_cov=rp_cov,
+                density_cov=density_cov,
+                rp_threshold=rp_threshold,
+                density_threshold=density_threshold,
+            )
+            outputs["coa_kde_dual_anchor"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("COA KDE + dual-anchor overlay plot failed: %s", e)
 
     # ── Per-gene UMAP grid (2-D, multiple hyperparameters) ──────────────
     if rscu_gene_df is not None and not rscu_gene_df.empty:
@@ -5708,10 +6198,26 @@ def _generate_bio_ecology_plots(
                 mahal_cluster_gene_ids=mahal_cluster_gene_ids,
                 hgt_df=hgt_data, phage_mobile_df=phage_data,
                 output_path=p, sample_id=sample_id, gff_path=gff_path,
+                dual_anchor_df=dual_anchor_df,
             )
             outputs["codon_deviation_heatmap"] = p.with_suffix(".png")
         except Exception as e:
             logger.warning("Codon deviation heatmap failed: %s", e, exc_info=True)
+        # Higher-resolution 10-gene window variant
+        try:
+            p10 = plot_dir / f"{sample_id}_codon_deviation_heatmap_w10"
+            plot_codon_deviation_heatmap(
+                rscu_gene_df, enc_df,
+                mahal_cluster_rscu=dict(mahal_cluster_rscu) if mahal_cluster_rscu is not None else None,
+                mahal_cluster_gene_ids=mahal_cluster_gene_ids,
+                hgt_df=hgt_data, phage_mobile_df=phage_data,
+                output_path=p10, sample_id=sample_id, gff_path=gff_path,
+                window_size=10,
+                dual_anchor_df=dual_anchor_df,
+            )
+            outputs["codon_deviation_heatmap_w10"] = p10.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Codon deviation heatmap (w=10) failed: %s", e, exc_info=True)
     else:
         logger.info("SKIPPED: codon deviation heatmap (no Mahalanobis cluster RSCU)")
 
