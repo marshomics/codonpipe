@@ -67,7 +67,7 @@ _ADAPTIVE_MIN_GENES = 100     # Minimum genes to attempt adaptive threshold
 # RP sub-cluster detection
 _RP_SUBCLUSTER_MIN = 15       # Minimum RP genes to attempt sub-cluster detection
 _RP_SUBCLUSTER_MAX_K = 4      # Maximum sub-clusters to test
-_RP_SUBCLUSTER_SIL_THRESH = 0.45  # Silhouette score above which we accept a split
+_RP_SUBCLUSTER_SIL_THRESH = 0.25  # Silhouette score above which we accept a split
 _RP_SUBCLUSTER_MIN_FRAC = 0.20    # Sub-cluster must contain >= 20% of total RPs
 
 # Density-anchor mode
@@ -297,12 +297,14 @@ def _select_rp_subcluster(
     best_k = 1
     best_sil = -1.0
     best_labels = None
+    sil_per_k: dict[int, float] = {}
 
     for k in range(2, min(max_k + 1, n_rp)):
         try:
             agg = AgglomerativeClustering(n_clusters=k, linkage="ward")
             labels = agg.fit_predict(X_rp)
             sil = silhouette_score(X_rp, labels)
+            sil_per_k[k] = round(sil, 4)
             if sil > best_sil:
                 best_sil = sil
                 best_k = k
@@ -312,6 +314,13 @@ def _select_rp_subcluster(
 
     diag["best_k"] = best_k
     diag["best_silhouette"] = round(float(best_sil), 4)
+    diag["silhouette_per_k"] = sil_per_k
+
+    logger.info(
+        "RP sub-cluster detection: silhouette per k=%s, best k=%d (sil=%.3f), "
+        "threshold=%.2f",
+        sil_per_k, best_k, best_sil, sil_threshold,
+    )
 
     if best_sil < sil_threshold or best_labels is None:
         logger.info(
