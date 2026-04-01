@@ -5685,6 +5685,7 @@ def generate_single_genome_plots(
             mahal_cluster_gene_ids=mahal_cluster_gene_ids,
             mahal_coa_coords=mahal_coa_coords,
             coa_inertia=coa_inertia,
+            dual_anchor_df=dual_anchor_df,
         )
     else:
         logger.info("SKIPPED: bio/ecology plots (no bio/ecology analysis data)")
@@ -6059,6 +6060,7 @@ def _generate_bio_ecology_plots(
     mahal_cluster_gene_ids: set | None = None,
     mahal_coa_coords: pd.DataFrame | None = None,
     coa_inertia: pd.DataFrame | None = None,
+    dual_anchor_df: pd.DataFrame | None = None,
 ):
     """Generate bio/ecology analysis plots from pre-computed data.
 
