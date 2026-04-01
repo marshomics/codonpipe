@@ -201,14 +201,39 @@ def _fit_robust_rp_reference(
         X_rp_clean = X_rp
         rp_outlier_mask = np.zeros(n_rp, dtype=bool)
 
-    centroid = X_rp_clean.mean(axis=0)
-    cov = _empirical_cov(X_rp_clean)
-    cov_inv = _safe_inv(cov)
+    # Use MinCovDet on the clean set to anchor the centroid and
+    # covariance to the densest core of RP genes.  Empirical mean +
+    # covariance on a spread-out RP set drifts the centroid toward the
+    # genome center and inflates the ellipse, capturing most of the
+    # genome instead of the translationally optimised core.
+    if len(X_rp_clean) >= min_rp:
+        try:
+            support_frac_2 = max(0.5, min(0.9, (len(X_rp_clean) - 2) / len(X_rp_clean)))
+            mcd2 = MinCovDet(random_state=42, support_fraction=support_frac_2).fit(X_rp_clean)
+            centroid = mcd2.location_
+            cov = mcd2.covariance_
+            logger.info(
+                "Pass 2: MinCovDet centroid from %d non-outlier RP genes "
+                "(support fraction=%.2f)",
+                len(X_rp_clean), support_frac_2,
+            )
+        except Exception as e:
+            logger.warning(
+                "Pass 2 MinCovDet failed (%s); falling back to empirical",
+                e,
+            )
+            centroid = X_rp_clean.mean(axis=0)
+            cov = _empirical_cov(X_rp_clean)
+    else:
+        centroid = X_rp_clean.mean(axis=0)
+        cov = _empirical_cov(X_rp_clean)
+        logger.info(
+            "Pass 2: empirical centroid from %d non-outlier RP genes "
+            "(below MinCovDet minimum)",
+            len(X_rp_clean),
+        )
 
-    logger.info(
-        "Pass 2: centroid computed from %d non-outlier RP genes",
-        len(X_rp_clean),
-    )
+    cov_inv = _safe_inv(cov)
 
     return centroid, cov, cov_inv, rp_outlier_mask
 
