@@ -293,18 +293,29 @@ def _select_rp_subcluster(
 
     diag["attempted"] = True
 
-    # Test k=2..max_k with agglomerative (Ward) clustering
+    # Cluster in 2-D projection (first 2 COA axes) where RP group
+    # separation is strongest.  Higher COA axes add noise that masks
+    # the gaps between sub-populations — the same reason the adaptive
+    # threshold uses a 2-D projection.
+    n_dims = X_rp.shape[1]
+    X_rp_2d = X_rp[:, :2] if n_dims >= 2 else X_rp
+
+    # Test k=2..max_k with agglomerative (Ward) clustering on 2-D
     best_k = 1
     best_sil = -1.0
     best_labels = None
     sil_per_k: dict[int, float] = {}
+    # Also compute full-dimensional silhouette for diagnostics
+    sil_full_per_k: dict[int, float] = {}
 
     for k in range(2, min(max_k + 1, n_rp)):
         try:
             agg = AgglomerativeClustering(n_clusters=k, linkage="ward")
-            labels = agg.fit_predict(X_rp)
-            sil = silhouette_score(X_rp, labels)
+            labels = agg.fit_predict(X_rp_2d)
+            sil = silhouette_score(X_rp_2d, labels)
             sil_per_k[k] = round(sil, 4)
+            if n_dims > 2:
+                sil_full_per_k[k] = round(silhouette_score(X_rp, labels), 4)
             if sil > best_sil:
                 best_sil = sil
                 best_k = k
@@ -314,17 +325,19 @@ def _select_rp_subcluster(
 
     diag["best_k"] = best_k
     diag["best_silhouette"] = round(float(best_sil), 4)
-    diag["silhouette_per_k"] = sil_per_k
+    diag["silhouette_per_k_2d"] = sil_per_k
+    diag["silhouette_per_k_full"] = sil_full_per_k
 
     logger.info(
-        "RP sub-cluster detection: silhouette per k=%s, best k=%d (sil=%.3f), "
-        "threshold=%.2f",
+        "RP sub-cluster detection (2-D): silhouette per k=%s, best k=%d "
+        "(sil=%.3f), threshold=%.2f%s",
         sil_per_k, best_k, best_sil, sil_threshold,
+        f" | full-dim silhouette: {sil_full_per_k}" if sil_full_per_k else "",
     )
 
     if best_sil < sil_threshold or best_labels is None:
         logger.info(
-            "RP sub-cluster detection: best silhouette=%.3f (k=%d) below "
+            "RP sub-cluster detection: best 2-D silhouette=%.3f (k=%d) below "
             "threshold %.2f; RPs form a single coherent group",
             best_sil, best_k, sil_threshold,
         )
