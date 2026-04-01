@@ -707,6 +707,42 @@ def run_single_genome(
         except (FileNotFoundError, RuntimeError) as e:
             logger.warning("RP-based expression analysis failed: %s. Continuing.", e, exc_info=True)
 
+    # ── Step 9b-caveat: Flag weak translational selection ─────────────────
+    # If the dual-anchor analysis determined that translational selection is
+    # weak or moderate, annotate the expression DataFrame so downstream
+    # consumers know the scores are unreliable.
+    tss_info = mahal_results.get("translational_selection_strength")
+    if tss_info and expr_df is not None and not expr_df.empty:
+        tss_class = tss_info.get("classification", "unknown")
+        tss_caveat = tss_info.get("caveat") or ""
+
+        expr_df["translational_selection_strength"] = tss_class
+        if tss_caveat:
+            expr_df["tss_caveat"] = tss_caveat
+        else:
+            expr_df["tss_caveat"] = ""
+
+        if tss_class == "weak":
+            logger.warning(
+                "⚠ WEAK translational selection for %s: RP-based expression "
+                "scores (MELP, CAI, Fop) are unreliable. %s",
+                sample_id, tss_caveat,
+            )
+        elif tss_class == "moderate":
+            logger.warning(
+                "⚠ MODERATE translational selection for %s: RP-based "
+                "expression scores should be interpreted with caution. %s",
+                sample_id, tss_caveat,
+            )
+
+        # Re-save expression TSV with the new columns
+        expr_combined_path = output_dir / "expression" / f"{sample_id}_expression.tsv"
+        if expr_combined_path.exists():
+            try:
+                expr_df.to_csv(expr_combined_path, sep="\t", index=False)
+            except Exception as e:
+                logger.debug("Could not re-save expression TSV with TSS caveat: %s", e)
+
     # ── Step 9c: Re-run pathway enrichment on Mahalanobis-based expression tiers ─
     # Step 7 enrichment used RP-only expression tiers.  Now that genes are
     # re-scored against the Mahalanobis cluster, re-run enrichment so downstream
@@ -982,6 +1018,13 @@ def run_single_genome(
             stability_results=stability_results if stability_results else None,
             rp_gene_ids=_load_rp_ids(rp_ids_file) if rp_ids_file else None,
             mahal_gene_distances=mahal_results.get("mahal_gene_distances"),
+            dual_anchor_df=mahal_results.get("dual_anchor_df"),
+            rp_centroid=mahal_results.get("rp_centroid"),
+            rp_cov=mahal_results.get("rp_cov"),
+            rp_threshold=mahal_results.get("rp_threshold"),
+            density_centroid=mahal_results.get("density_centroid"),
+            density_cov=mahal_results.get("density_cov"),
+            density_threshold=mahal_results.get("density_threshold"),
         )
         all_outputs.update(plot_outputs)
     except Exception as e:
