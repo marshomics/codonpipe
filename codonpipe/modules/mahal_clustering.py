@@ -33,6 +33,7 @@ from scipy.stats import chi2
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.covariance import MinCovDet
 from sklearn.metrics import silhouette_score
+from sklearn.mixture import GaussianMixture
 
 from Bio import SeqIO
 
@@ -300,46 +301,54 @@ def _select_rp_subcluster(
     n_dims = X_rp.shape[1]
     X_rp_2d = X_rp[:, :2] if n_dims >= 2 else X_rp
 
-    # Test k=2..max_k with agglomerative (Ward) clustering on 2-D
+    # Use Gaussian Mixture Models with BIC for model selection.
+    # BIC naturally penalizes overfitting — if k=1 has the lowest BIC,
+    # the RP population is unimodal and no split is needed.  If k>1
+    # wins, the RP genes form distinct sub-populations.
+    bic_per_k: dict[int, float] = {}
+    gmm_per_k: dict[int, GaussianMixture] = {}
     best_k = 1
-    best_sil = -1.0
-    best_labels = None
-    sil_per_k: dict[int, float] = {}
-    # Also compute full-dimensional silhouette for diagnostics
-    sil_full_per_k: dict[int, float] = {}
+    best_bic = np.inf
 
-    for k in range(2, min(max_k + 1, n_rp)):
+    for k in range(1, min(max_k + 1, n_rp)):
         try:
-            agg = AgglomerativeClustering(n_clusters=k, linkage="ward")
-            labels = agg.fit_predict(X_rp_2d)
-            sil = silhouette_score(X_rp_2d, labels)
-            sil_per_k[k] = round(sil, 4)
-            if n_dims > 2:
-                sil_full_per_k[k] = round(silhouette_score(X_rp, labels), 4)
-            if sil > best_sil:
-                best_sil = sil
+            gmm = GaussianMixture(
+                n_components=k, random_state=42,
+                covariance_type="full", n_init=3,
+            )
+            gmm.fit(X_rp_2d)
+            bic = gmm.bic(X_rp_2d)
+            bic_per_k[k] = round(bic, 2)
+            gmm_per_k[k] = gmm
+            if bic < best_bic:
+                best_bic = bic
                 best_k = k
-                best_labels = labels
         except Exception as e:
-            logger.debug("Agglomerative k=%d failed: %s", k, e)
+            logger.debug("GMM k=%d failed: %s", k, e)
+
+    best_labels = None
+    best_sil = -1.0
+    if best_k > 1 and best_k in gmm_per_k:
+        best_labels = gmm_per_k[best_k].predict(X_rp_2d)
+        try:
+            best_sil = silhouette_score(X_rp_2d, best_labels)
+        except Exception:
+            best_sil = 0.0
 
     diag["best_k"] = best_k
     diag["best_silhouette"] = round(float(best_sil), 4)
-    diag["silhouette_per_k_2d"] = sil_per_k
-    diag["silhouette_per_k_full"] = sil_full_per_k
+    diag["bic_per_k"] = bic_per_k
 
     logger.info(
-        "RP sub-cluster detection (2-D): silhouette per k=%s, best k=%d "
-        "(sil=%.3f), threshold=%.2f%s",
-        sil_per_k, best_k, best_sil, sil_threshold,
-        f" | full-dim silhouette: {sil_full_per_k}" if sil_full_per_k else "",
+        "RP sub-cluster detection (2-D GMM+BIC): BIC per k=%s, best k=%d "
+        "(BIC=%.1f, sil=%.3f)",
+        bic_per_k, best_k, best_bic, best_sil,
     )
 
-    if best_sil < sil_threshold or best_labels is None:
+    if best_k <= 1 or best_labels is None:
         logger.info(
-            "RP sub-cluster detection: best 2-D silhouette=%.3f (k=%d) below "
-            "threshold %.2f; RPs form a single coherent group",
-            best_sil, best_k, sil_threshold,
+            "RP sub-cluster detection: BIC favors k=1; "
+            "RPs form a single coherent group",
         )
         return X_rp, rp_gene_ids_list, diag
 
