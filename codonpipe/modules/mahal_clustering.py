@@ -74,8 +74,9 @@ _MIN_CLUSTER_SIZE = 10
 _RP_OUTLIER_ALPHA = 0.025          # Chi-squared alpha for RP outlier detection
 _MIN_RP_FOR_ROBUST = 10            # Min genes for MinCovDet; else empirical
 
-# Chi-squared cluster boundary (single method, no cascading fallbacks)
-_CLUSTER_CHI2_P = 0.95             # Captures ~95% of the reference population
+# Cluster boundaries
+_CLUSTER_CHI2_P = 0.95             # Density cluster: chi-squared captures ~95%
+_RP_EMPIRICAL_PCTL = 95            # RP cluster: 95th percentile of cleaned RP distances
 
 # RP sub-cluster detection
 _RP_SUBCLUSTER_MIN = 15
@@ -648,17 +649,22 @@ def _fit_cluster(
     rscu_gene_df: pd.DataFrame,
     anchor_gene_ids: set[str] | None = None,
     outlier_mask: np.ndarray | None = None,
+    empirical_threshold: float | None = None,
 ) -> dict:
-    """Fit a single Mahalanobis cluster with chi-squared boundary.
+    """Fit a single Mahalanobis cluster.
 
     This is the shared engine for both RP and density clusters.
+
+    When *empirical_threshold* is provided (RP cluster), it is used
+    directly as the distance boundary.  Otherwise (density cluster),
+    the chi-squared quantile at *chi2_p* is used.
 
     Returns a dict with: distances, threshold, cluster_gene_ids,
     cluster_rscu, probabilities, gene_weights, gene_core_cai,
     core_rare_per_gene, genome_rare_per_gene, n_cluster.
     """
     distances = _compute_mahalanobis_distances(X[:, :n_axes], centroid, cov_inv)
-    threshold = _chi2_threshold(n_axes, chi2_p)
+    threshold = empirical_threshold if empirical_threshold is not None else _chi2_threshold(n_axes, chi2_p)
     optimised_mask = distances <= threshold
     cluster_gene_ids = {gid for gid, opt in zip(gene_ids, optimised_mask) if opt}
     probabilities = _distance_to_membership(distances, threshold)
@@ -1194,16 +1200,35 @@ def run_mahal_clustering(
         # Two-pass outlier removal on the bootstrap-stabilised reference
         _, _, _, outlier_mask = _fit_robust_rp_reference(X_sc, n_axes)
 
+        # Empirical threshold: compute Mahalanobis distances for the
+        # (non-outlier) RP genes and take the Nth percentile.  This
+        # gives a tight boundary that wraps the actual RP distribution
+        # rather than a theoretical chi-squared quantile that inflates
+        # with dimensionality.
+        sc_indices = np.array([i for i, g in enumerate(gene_ids) if g in sc_ids])
+        rp_dists_pre = _compute_mahalanobis_distances(X[:, :n_axes], centroid, cov_inv)
+        rp_dists_sc = rp_dists_pre[sc_indices]
+        rp_dists_clean = rp_dists_sc[~outlier_mask] if len(outlier_mask) == len(rp_dists_sc) else rp_dists_sc
+        if len(rp_dists_clean) == 0:
+            rp_dists_clean = rp_dists_sc
+        emp_threshold = float(np.percentile(rp_dists_clean, _RP_EMPIRICAL_PCTL))
+        logger.info(
+            "  RP sub-cluster %d: empirical threshold=%.3f "
+            "(%dth percentile of %d cleaned RP distances)",
+            sc_idx, emp_threshold, _RP_EMPIRICAL_PCTL, len(rp_dists_clean),
+        )
+
         fit = _fit_cluster(
             X=X, gene_ids=gene_ids,
             centroid=centroid, cov=cov, cov_inv=cov_inv,
             n_axes=n_axes, chi2_p=_CLUSTER_CHI2_P,
             ffn_path=ffn_path, rscu_gene_df=rscu_gene_df,
             anchor_gene_ids=sc_ids, outlier_mask=outlier_mask,
+            empirical_threshold=emp_threshold,
         )
         fit["rp_gene_ids"] = sc_ids
-        fit["rp_indices"] = np.array([i for i, g in enumerate(gene_ids) if g in sc_ids])
-        fit["rp_dists_all"] = fit["distances"][fit["rp_indices"]]
+        fit["rp_indices"] = sc_indices
+        fit["rp_dists_all"] = fit["distances"][sc_indices]
         fit["n_rp_in_cluster"] = len(fit["cluster_gene_ids"] & sc_ids)
         fit["subcluster_index"] = sc_idx
 
