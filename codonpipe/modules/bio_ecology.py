@@ -103,7 +103,14 @@ def _parse_gff_gene_map(
             parts = line.strip().split("\t")
             if len(parts) < 9 or parts[2] not in feature_types:
                 continue
-            start, end, strand = int(parts[3]), int(parts[4]), parts[6]
+            try:
+                start, end, strand = int(parts[3]), int(parts[4]), parts[6]
+            except (ValueError, IndexError):
+                logger.debug(
+                    "Skipping malformed GFF line (non-integer coordinates): %s",
+                    line.strip()[:120],
+                )
+                continue
             attrs = parts[8]
 
             candidates = _extract_gene_ids_from_attrs(attrs)
