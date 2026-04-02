@@ -1936,31 +1936,43 @@ def plot_coa_kde_mahal(
             )
 
         # ── Cluster boundary ellipse ──────────────────────────────────
-        # Use the clustering module's centroid/covariance when available
-        # so the ellipse matches the dual-anchor plot exactly.  Fall back
-        # to fitting a 2-D covariance from cluster member coordinates.
+        # The Mahalanobis threshold is defined in n_axes dimensions
+        # (typically 8).  Projecting that 8-D ellipsoid onto Axis1/Axis2
+        # inflates the visible boundary well beyond the actual gene cloud.
+        # Instead, compute 2-D Mahalanobis distances for the RP genes and
+        # use their 90th percentile as the ellipse scale.
         cx = x[cluster_mask]
         cy = y[cluster_mask]
         if len(cx) >= 5:
             try:
                 from matplotlib.patches import Ellipse, Patch
 
-                if (rp_centroid is not None and rp_cov is not None
-                        and distance_threshold is not None):
-                    # Project the full-dimensional centroid/cov to Axis1/Axis2
+                if (rp_centroid is not None and rp_cov is not None):
                     mean_x, mean_y = rp_centroid[0], rp_centroid[1]
                     cov_2d = rp_cov[:2, :2]
-                    scale = distance_threshold
                 else:
-                    # Fallback: fit from cluster members (legacy behaviour)
                     mean_x, mean_y = cx.mean(), cy.mean()
                     cov_2d = np.cov(cx, cy)
-                    from scipy.stats import chi2 as chi2_dist
-                    scale = np.sqrt(chi2_dist.ppf(0.95, df=2))
 
                 eigvals, eigvecs = np.linalg.eigh(cov_2d)
                 if np.all(eigvals > 0):
-                    # eigh returns ascending order; largest eigval last
+                    # Compute 2-D Mahalanobis distances for RP genes
+                    # and use 90th percentile as the visual scale
+                    cov_2d_inv = np.linalg.inv(cov_2d)
+                    c2d = np.array([mean_x, mean_y])
+
+                    # Prefer RP gene IDs for the scale calculation
+                    rp_mask_local = None
+                    if rp_gene_ids:
+                        rp_mask_local = np.array([g in rp_gene_ids for g in gene_ids])
+                    if rp_mask_local is not None and rp_mask_local.sum() >= 5:
+                        anchor_xy = np.column_stack([x[rp_mask_local], y[rp_mask_local]])
+                    else:
+                        anchor_xy = np.column_stack([cx, cy])
+                    diffs = anchor_xy - c2d
+                    d2d = np.sqrt(np.einsum("ij,jk,ik->i", diffs, cov_2d_inv, diffs))
+                    scale = float(np.percentile(d2d, 90))
+
                     angle = np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1]))
                     width = 2 * scale * np.sqrt(eigvals[1])
                     height = 2 * scale * np.sqrt(eigvals[0])
@@ -1973,13 +1985,10 @@ def plot_coa_kde_mahal(
                     )
                     ax.add_patch(ellipse)
 
-                # Threshold annotation
                 thresh_label = (
                     f"Mahal. cluster boundary (n={int(cluster_mask.sum())}"
+                    f", 2-D d≤{scale:.1f})"
                 )
-                if distance_threshold is not None:
-                    thresh_label += f", d≤{distance_threshold:.1f}"
-                thresh_label += ")"
 
                 ellipse_legend = Patch(
                     facecolor="#2ecc71", alpha=0.2,
@@ -2146,39 +2155,70 @@ def plot_coa_kde_dual_anchor(
             )
 
     # Ellipses for both anchors
-    def _draw_boundary_ellipse(centroid, cov_mat, thresh, color, ls, label):
+    # The Mahalanobis threshold operates in n_axes dimensions (typically 8).
+    # Projecting that 8-D ellipsoid onto 2-D inflates the visible boundary
+    # far beyond the actual gene cloud.  Instead, compute 2-D Mahalanobis
+    # distances for the anchor genes and use their 90th percentile as the
+    # ellipse scale — this gives a boundary that hugs the genes tightly
+    # in the plotted dimensions.
+    def _draw_boundary_ellipse(centroid, cov_mat, thresh, color, ls, label,
+                               anchor_gene_ids_set=None):
         if centroid is None or cov_mat is None or thresh is None:
             return
         try:
             cov_2d = cov_mat[:2, :2]
             eigvals, eigvecs = np.linalg.eigh(cov_2d)
-            if np.all(eigvals > 0):
-                angle = np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1]))
-                width = 2 * thresh * np.sqrt(eigvals[1])
-                height = 2 * thresh * np.sqrt(eigvals[0])
-                from matplotlib.patches import Ellipse as MplEllipse
-                ell = MplEllipse(
-                    (centroid[0], centroid[1]), width, height, angle=angle,
-                    facecolor="none", edgecolor=color, linewidth=2.0,
-                    linestyle=ls, alpha=0.8, zorder=4,
-                )
-                ax.add_patch(ell)
-                legend_handles.append(
-                    Patch(facecolor="none", edgecolor=color,
-                          linewidth=1.5, linestyle=ls, label=label)
-                )
+            if not np.all(eigvals > 0):
+                return
+
+            # Compute a tight 2-D scale from anchor gene positions
+            scale = thresh  # fallback: raw threshold
+            if anchor_gene_ids_set is not None:
+                anchor_mask = np.array([g in anchor_gene_ids_set for g in gene_ids])
+                if anchor_mask.sum() >= 5:
+                    cov_2d_inv = np.linalg.inv(cov_2d)
+                    c2d = np.array([centroid[0], centroid[1]])
+                    anchor_xy = np.column_stack([x[anchor_mask], y[anchor_mask]])
+                    diffs = anchor_xy - c2d
+                    d2d = np.sqrt(np.einsum("ij,jk,ik->i", diffs, cov_2d_inv, diffs))
+                    scale = float(np.percentile(d2d, 90))
+
+            angle = np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1]))
+            width = 2 * scale * np.sqrt(eigvals[1])
+            height = 2 * scale * np.sqrt(eigvals[0])
+            from matplotlib.patches import Ellipse as MplEllipse
+            ell = MplEllipse(
+                (centroid[0], centroid[1]), width, height, angle=angle,
+                facecolor="none", edgecolor=color, linewidth=2.0,
+                linestyle=ls, alpha=0.8, zorder=4,
+            )
+            ax.add_patch(ell)
+            legend_handles.append(
+                Patch(facecolor="none", edgecolor=color,
+                      linewidth=1.5, linestyle=ls,
+                      label=f"{label} (2-D d≤{scale:.1f})")
+            )
         except Exception as e:
             logger.debug("Dual-anchor ellipse failed: %s", e)
 
+    # Build sets for anchor gene lookup
+    _rp_cluster_ids = None
+    _dens_cluster_ids = None
+    if dual_anchor_df is not None and not dual_anchor_df.empty:
+        _cats = dict(zip(dual_anchor_df["gene"].astype(str),
+                         dual_anchor_df["dual_category"].astype(str)))
+        _rp_cluster_ids = {g for g, c in _cats.items() if c in ("rp_only", "both")}
+        _dens_cluster_ids = {g for g, c in _cats.items() if c in ("dens_only", "both")}
+
     _draw_boundary_ellipse(
         rp_centroid, rp_cov, rp_threshold,
-        "#d95f02", "--",
-        f"RP boundary (d≤{rp_threshold:.1f})" if rp_threshold else "RP boundary",
+        "#d95f02", "--", "RP boundary",
+        anchor_gene_ids_set=_rp_cluster_ids or (rp_gene_ids if rp_gene_ids else None),
     )
     _draw_boundary_ellipse(
         density_centroid, density_cov, density_threshold,
-        "#7570b3", ":",
-        f"Density boundary (d≤{density_threshold:.1f})" if density_threshold else "Density boundary",
+        "#7570b3", ":", "Density boundary",
+        anchor_gene_ids_set=_dens_cluster_ids,
     )
 
     # Centroids
