@@ -1393,6 +1393,12 @@ def run_batch(
             except Exception as e:
                 logger.error("Failed: %s — %s", sid, e)
 
+    n_failed = n_samples - len(sample_outputs)
+    if n_failed:
+        logger.warning(
+            "Batch summary: %d/%d samples failed — check logs above for details",
+            n_failed, n_samples,
+        )
     if not sample_outputs:
         logger.error("No samples completed successfully")
         return {}
