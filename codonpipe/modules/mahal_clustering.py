@@ -890,13 +890,26 @@ def _plot_coa_mahalanobis(
         cov_2d = cov[:2, :2]
         eigvals, eigvecs = np.linalg.eigh(cov_2d)
         if np.all(eigvals > 0):
+            # Compute 2-D Mahalanobis distances for RP genes and use
+            # 90th percentile as the visual ellipse scale, so the
+            # boundary hugs the RP gene cloud in the plotted dimensions.
+            cov_2d_inv = np.linalg.inv(cov_2d)
+            c2d = np.array([centroid[0], centroid[1]])
+            if rp_idx:
+                rp_xy = np.column_stack([x[rp_idx], y[rp_idx]])
+                diffs = rp_xy - c2d
+                d2d = np.sqrt(np.einsum("ij,jk,ik->i", diffs, cov_2d_inv, diffs))
+                scale_2d = float(np.percentile(d2d, 90))
+            else:
+                scale_2d = threshold
             angle = np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1]))
-            width = 2 * threshold * np.sqrt(eigvals[1])
-            height = 2 * threshold * np.sqrt(eigvals[0])
+            width = 2 * scale_2d * np.sqrt(eigvals[1])
+            height = 2 * scale_2d * np.sqrt(eigvals[0])
             ellipse = mpatches.Ellipse(
                 (centroid[0], centroid[1]), width, height, angle=angle,
                 linewidth=1.5, edgecolor="#d7191c", facecolor="none",
-                linestyle="--", alpha=0.7, label=f"Threshold (d={threshold:.1f})")
+                linestyle="--", alpha=0.7,
+                label=f"RP boundary (2-D d≤{scale_2d:.1f})")
             ax.add_patch(ellipse)
     except Exception:
         pass
