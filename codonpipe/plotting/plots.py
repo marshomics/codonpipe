@@ -1839,19 +1839,23 @@ def plot_coa_kde_mahal(
     mahal_cluster_gene_ids: set[str] | None = None,
     mahal_gene_distances: "pd.Series | None" = None,
     distance_threshold: float | None = None,
+    rp_centroid: "np.ndarray | None" = None,
+    rp_cov: "np.ndarray | None" = None,
 ):
     """COA KDE density plot with Mahalanobis cluster boundary overlay.
 
     Identical to :func:`plot_coa_kde` but adds:
-    * A filled ellipse (or convex hull) showing the Mahalanobis cluster
-      boundary projected onto the Axis 1 / Axis 2 plane.
+    * A filled ellipse showing the Mahalanobis cluster boundary projected
+      onto the Axis 1 / Axis 2 plane, using the same centroid and
+      covariance matrix from the clustering module.
     * Cluster member genes coloured distinctly from background.
     * RP genes highlighted with open markers.
 
-    The cluster boundary is drawn as the 2-D covariance ellipse of the
-    in-cluster genes scaled to match the Mahalanobis distance threshold,
-    giving a visual approximation of the multi-dimensional boundary in
-    the two most informative COA dimensions.
+    When *rp_centroid* and *rp_cov* are provided the ellipse is drawn
+    from the clustering module's covariance (projected to the first two
+    axes) scaled by *distance_threshold*, giving a boundary that matches
+    the dual-anchor plot exactly.  Falls back to fitting a 2-D covariance
+    from cluster member coordinates when these are not available.
 
     Args:
         coa_coords: Gene COA coordinates (gene, Axis1, Axis2, …).
@@ -1864,6 +1868,9 @@ def plot_coa_kde_mahal(
             distances (used for colour-coding cluster members).
         distance_threshold: Mahalanobis distance threshold used to define
             the cluster (for legend annotation).
+        rp_centroid: RP cluster centroid from clustering module (n_axes,).
+        rp_cov: RP cluster covariance matrix from clustering module
+            (n_axes, n_axes).
     """
     _apply_style()
     if len(coa_coords) < 30 or "Axis1" not in coa_coords.columns:
@@ -1929,38 +1936,42 @@ def plot_coa_kde_mahal(
             )
 
         # ── Cluster boundary ellipse ──────────────────────────────────
-        # Fit a 2-D covariance to cluster members in Axis1/Axis2, then
-        # draw the ellipse at the threshold radius.
+        # Use the clustering module's centroid/covariance when available
+        # so the ellipse matches the dual-anchor plot exactly.  Fall back
+        # to fitting a 2-D covariance from cluster member coordinates.
         cx = x[cluster_mask]
         cy = y[cluster_mask]
         if len(cx) >= 5:
             try:
-                mean_x, mean_y = cx.mean(), cy.mean()
-                cov_2d = np.cov(cx, cy)
-                # Eigendecomposition for ellipse orientation + radii
+                from matplotlib.patches import Ellipse, Patch
+
+                if (rp_centroid is not None and rp_cov is not None
+                        and distance_threshold is not None):
+                    # Project the full-dimensional centroid/cov to Axis1/Axis2
+                    mean_x, mean_y = rp_centroid[0], rp_centroid[1]
+                    cov_2d = rp_cov[:2, :2]
+                    scale = distance_threshold
+                else:
+                    # Fallback: fit from cluster members (legacy behaviour)
+                    mean_x, mean_y = cx.mean(), cy.mean()
+                    cov_2d = np.cov(cx, cy)
+                    from scipy.stats import chi2 as chi2_dist
+                    scale = np.sqrt(chi2_dist.ppf(0.95, df=2))
+
                 eigvals, eigvecs = np.linalg.eigh(cov_2d)
-                # Sort descending
-                order = eigvals.argsort()[::-1]
-                eigvals = eigvals[order]
-                eigvecs = eigvecs[:, order]
+                if np.all(eigvals > 0):
+                    # eigh returns ascending order; largest eigval last
+                    angle = np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1]))
+                    width = 2 * scale * np.sqrt(eigvals[1])
+                    height = 2 * scale * np.sqrt(eigvals[0])
 
-                # Scale factor: use chi-squared 95% quantile for 2 DoF
-                # to give a ~95% coverage ellipse of cluster members
-                from scipy.stats import chi2 as chi2_dist
-                scale = np.sqrt(chi2_dist.ppf(0.95, df=2))
-
-                angle = np.degrees(np.arctan2(eigvecs[1, 0], eigvecs[0, 0]))
-                width = 2 * scale * np.sqrt(max(eigvals[0], 0))
-                height = 2 * scale * np.sqrt(max(eigvals[1], 0))
-
-                from matplotlib.patches import Ellipse
-                ellipse = Ellipse(
-                    (mean_x, mean_y), width, height, angle=angle,
-                    facecolor="#2ecc71", alpha=0.12,
-                    edgecolor="#27ae60", linewidth=2.0, linestyle="-",
-                    zorder=3,
-                )
-                ax.add_patch(ellipse)
+                    ellipse = Ellipse(
+                        (mean_x, mean_y), width, height, angle=angle,
+                        facecolor="#2ecc71", alpha=0.12,
+                        edgecolor="#27ae60", linewidth=2.0, linestyle="-",
+                        zorder=3,
+                    )
+                    ax.add_patch(ellipse)
 
                 # Threshold annotation
                 thresh_label = (
@@ -1970,8 +1981,6 @@ def plot_coa_kde_mahal(
                     thresh_label += f", d≤{distance_threshold:.1f}"
                 thresh_label += ")"
 
-                # Invisible artist for legend
-                from matplotlib.patches import Patch
                 ellipse_legend = Patch(
                     facecolor="#2ecc71", alpha=0.2,
                     edgecolor="#27ae60", linewidth=1.5,
@@ -5878,9 +5887,10 @@ def generate_single_genome_plots(
             and _coa_inertia_for_landscape is not None
             and mahal_cluster_gene_ids):
         try:
-            # Derive distance threshold from cluster members if available
-            _dist_thresh = None
-            if mahal_gene_distances is not None:
+            # Use the RP threshold from the clustering module directly;
+            # fall back to max cluster-member distance if not available.
+            _dist_thresh = rp_threshold
+            if _dist_thresh is None and mahal_gene_distances is not None:
                 _cluster_dists = {
                     g: (mahal_gene_distances[g]
                         if isinstance(mahal_gene_distances, dict)
@@ -5902,6 +5912,8 @@ def generate_single_genome_plots(
                 mahal_cluster_gene_ids=mahal_cluster_gene_ids,
                 mahal_gene_distances=mahal_gene_distances,
                 distance_threshold=_dist_thresh,
+                rp_centroid=rp_centroid,
+                rp_cov=rp_cov,
             )
             outputs["coa_kde_mahal"] = p.with_suffix(".png")
         except Exception as e:
