@@ -390,6 +390,63 @@ def _count_rare_codons_per_gene(
 
 
 # ---------------------------------------------------------------------------
+# RP dense-core selection
+# ---------------------------------------------------------------------------
+
+def _select_rp_dense_core(
+    X_rp: np.ndarray,
+    rp_gene_ids_list: list[str],
+    density_pctl: int = 50,
+) -> tuple[np.ndarray, list[str], np.ndarray]:
+    """Select the dense core of RP genes for centroid/covariance fitting.
+
+    Uses a 2-D KDE on the first two COA axes to evaluate each RP gene's
+    local density, then retains only those above the *density_pctl*-th
+    percentile.  This prevents compositionally drifted RP genes (which
+    sit near the genome center) from pulling the centroid and inflating
+    the covariance.
+
+    Returns (X_core, core_gene_ids, core_mask) where *core_mask* is a
+    boolean array over the original X_rp rows.
+    """
+    from scipy.stats import gaussian_kde
+
+    n_rp = len(X_rp)
+    if n_rp < 8:
+        # Too few for a meaningful KDE; keep all
+        return X_rp, rp_gene_ids_list, np.ones(n_rp, dtype=bool)
+
+    X_2d = X_rp[:, :2]
+    try:
+        kde = gaussian_kde(X_2d.T, bw_method="scott")
+        densities = kde(X_2d.T)
+    except Exception:
+        return X_rp, rp_gene_ids_list, np.ones(n_rp, dtype=bool)
+
+    threshold = np.percentile(densities, density_pctl)
+    core_mask = densities >= threshold
+
+    # Guarantee at least n_axes+1 core genes (needed for covariance fitting)
+    n_core = int(core_mask.sum())
+    min_core = max(5, X_rp.shape[1] + 1)
+    if n_core < min_core:
+        # Fall back to keeping the top min_core by density
+        top_idx = np.argsort(densities)[::-1][:min_core]
+        core_mask = np.zeros(n_rp, dtype=bool)
+        core_mask[top_idx] = True
+
+    X_core = X_rp[core_mask]
+    core_ids = [gid for gid, sel in zip(rp_gene_ids_list, core_mask) if sel]
+
+    logger.info(
+        "RP dense-core selection: %d/%d genes above %dth-pctl density threshold",
+        int(core_mask.sum()), n_rp, density_pctl,
+    )
+
+    return X_core, core_ids, core_mask
+
+
+# ---------------------------------------------------------------------------
 # RP sub-cluster detection
 # ---------------------------------------------------------------------------
 
@@ -1207,29 +1264,55 @@ def run_mahal_clustering(
         X_sc = sc["X"]
         sc_ids = set(sc["gene_ids"])
 
-        # Bootstrap-stabilise centroid
-        centroid, cov, cov_inv = _bootstrap_rp_centroid(X_sc, n_axes)
+        # ── Dense-core selection ──────────────────────────────────────
+        # RP genes with genome-average codon usage (near the density
+        # centroid) don't carry a translational-selection signal.
+        # Fitting centroid/covariance from *all* RP genes lets those
+        # drifted members pull the centroid rightward and inflate the
+        # covariance.  Instead, identify the dense core of RP genes
+        # via 2-D KDE and fit only from those.
+        X_core, core_ids, core_mask = _select_rp_dense_core(
+            X_sc, sc["gene_ids"], density_pctl=50,
+        )
 
-        # Two-pass outlier removal on the bootstrap-stabilised reference
-        _, _, _, outlier_mask = _fit_robust_rp_reference(X_sc, n_axes)
+        # Bootstrap-stabilise centroid using only the dense core
+        centroid, cov, cov_inv = _bootstrap_rp_centroid(X_core, n_axes)
+
+        # Two-pass outlier removal on the core genes
+        _, _, _, outlier_mask_core = _fit_robust_rp_reference(X_core, n_axes)
 
         # Empirical threshold: compute Mahalanobis distances for the
-        # (non-outlier) RP genes and take the Nth percentile.  This
-        # gives a tight boundary that wraps the actual RP distribution
-        # rather than a theoretical chi-squared quantile that inflates
-        # with dimensionality.
-        sc_indices = np.array([i for i, g in enumerate(gene_ids) if g in sc_ids])
+        # core (non-outlier) RP genes and take the Nth percentile.
+        # This gives a tight boundary centred on the densest part of
+        # the RP cloud rather than a bloated ellipse stretched by
+        # compositionally drifted genes.
+        core_ids_set = set(core_ids)
+        core_indices = np.array([i for i, g in enumerate(gene_ids) if g in core_ids_set])
         rp_dists_pre = _compute_mahalanobis_distances(X[:, :n_axes], centroid, cov_inv)
-        rp_dists_sc = rp_dists_pre[sc_indices]
-        rp_dists_clean = rp_dists_sc[~outlier_mask] if len(outlier_mask) == len(rp_dists_sc) else rp_dists_sc
+        rp_dists_core = rp_dists_pre[core_indices]
+        rp_dists_clean = (
+            rp_dists_core[~outlier_mask_core]
+            if len(outlier_mask_core) == len(rp_dists_core)
+            else rp_dists_core
+        )
         if len(rp_dists_clean) == 0:
-            rp_dists_clean = rp_dists_sc
+            rp_dists_clean = rp_dists_core
         emp_threshold = float(np.percentile(rp_dists_clean, _RP_EMPIRICAL_PCTL))
         logger.info(
             "  RP sub-cluster %d: empirical threshold=%.3f "
-            "(%dth percentile of %d cleaned RP distances)",
+            "(%dth percentile of %d core RP distances, %d/%d core genes)",
             sc_idx, emp_threshold, _RP_EMPIRICAL_PCTL, len(rp_dists_clean),
+            int(core_mask.sum()), len(X_sc),
         )
+
+        # Outlier mask for _fit_cluster should span the full sub-cluster
+        # (non-core genes are not outliers per se, but aren't used for
+        # threshold computation).  We pass the core outlier mask for
+        # diagnostic plots.
+        outlier_mask = np.zeros(len(X_sc), dtype=bool)
+        outlier_mask[core_mask] = outlier_mask_core
+
+        sc_indices = np.array([i for i, g in enumerate(gene_ids) if g in sc_ids])
 
         fit = _fit_cluster(
             X=X, gene_ids=gene_ids,
