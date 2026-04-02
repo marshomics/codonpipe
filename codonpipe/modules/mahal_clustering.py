@@ -157,26 +157,49 @@ def _fit_robust_rp_reference(
     Pass 1: MinCovDet → identify chi-squared outliers.
     Pass 2: Refit on inliers.
 
+    Falls back to empirical covariance when the sample size is too small
+    for MinCovDet to be numerically stable (< 2·n_axes + 3).
+
     Returns (centroid, cov, cov_inv, outlier_mask).
     """
+    import warnings as _warnings
+
     n_rp = len(X_rp)
 
-    if n_rp < min_rp:
-        logger.warning(
-            "Only %d reference genes; falling back to empirical covariance (< %d)",
-            n_rp, min_rp,
+    # MinCovDet needs ~2×p samples for a p-dimensional problem to be
+    # numerically stable.  Below that threshold, empirical covariance
+    # is more reliable and avoids sklearn determinant-increase warnings.
+    min_for_mcd = max(min_rp, 2 * n_axes + 3)
+
+    if n_rp < max(min_rp, n_axes + 2):
+        logger.info(
+            "Only %d reference genes (< %d); using empirical covariance",
+            n_rp, max(min_rp, n_axes + 2),
         )
         centroid = X_rp.mean(axis=0)
         cov = _empirical_cov(X_rp)
         return centroid, cov, _safe_inv(cov), np.zeros(n_rp, dtype=bool)
 
+    def _try_mcd(X_data):
+        """Attempt MinCovDet; return (location, covariance) or None."""
+        n = len(X_data)
+        if n < min_for_mcd:
+            return None
+        try:
+            sf = max(0.5, min(0.9, (n - 2) / n))
+            with _warnings.catch_warnings():
+                _warnings.filterwarnings("ignore", message="Determinant has increased")
+                mcd = MinCovDet(random_state=42, support_fraction=sf).fit(X_data)
+            return mcd.location_, mcd.covariance_
+        except Exception as e:
+            logger.debug("MinCovDet failed (%s); falling back", e)
+            return None
+
     # Pass 1
-    try:
-        support_frac = max(0.5, min(0.9, (n_rp - 2) / n_rp))
-        mcd = MinCovDet(random_state=42, support_fraction=support_frac).fit(X_rp)
-        centroid_1, cov_1 = mcd.location_, mcd.covariance_
-    except Exception as e:
-        logger.warning("MinCovDet failed (%s); using empirical covariance", e)
+    result_1 = _try_mcd(X_rp)
+    if result_1 is not None:
+        centroid_1, cov_1 = result_1
+    else:
         centroid_1 = X_rp.mean(axis=0)
         cov_1 = _empirical_cov(X_rp)
 
@@ -201,15 +224,9 @@ def _fit_robust_rp_reference(
         X_clean = X_rp
         outlier_mask = np.zeros(n_rp, dtype=bool)
 
-    if len(X_clean) >= min_rp:
-        try:
-            sf2 = max(0.5, min(0.9, (len(X_clean) - 2) / len(X_clean)))
-            mcd2 = MinCovDet(random_state=42, support_fraction=sf2).fit(X_clean)
-            centroid, cov = mcd2.location_, mcd2.covariance_
-        except Exception as e:
-            logger.warning("Pass 2 MinCovDet failed (%s); empirical fallback", e)
-            centroid = X_clean.mean(axis=0)
-            cov = _empirical_cov(X_clean)
+    result_2 = _try_mcd(X_clean)
+    if result_2 is not None:
+        centroid, cov = result_2
     else:
         centroid = X_clean.mean(axis=0)
         cov = _empirical_cov(X_clean)
