@@ -109,9 +109,11 @@ def run_expression_analysis(
     rp_ids = [l.strip() for l in rp_ids_file.read_text().splitlines() if l.strip()]
     if not rp_ids:
         logger.warning(
-            "No ribosomal protein IDs for %s; skipping expression analysis. "
+            "No ribosomal protein IDs for %s; skipping expression analysis "
+            "(MELP, CAI, Fop will be absent from output). "
             "This genome may lack ribosomal protein annotations.", sample_id,
         )
+        outputs["_skipped"] = "no_rp_ids"
         return outputs
 
     # Run each metric using the shared R script template
