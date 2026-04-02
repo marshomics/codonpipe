@@ -1,19 +1,34 @@
-"""RP-anchored Mahalanobis distance module for translational optimization classification.
+"""Two-cluster Mahalanobis module: RP-anchor and density-core.
 
-Replaces GMM-based clustering with a deterministic, RP-anchored approach:
+Identifies two clusters in COA (Correspondence Analysis) space:
 
-1. Correspondence Analysis (COA) on per-gene RSCU matrix
-2. Robust covariance estimation (MinCovDet) on RP gene coordinates
-3. Two-pass outlier removal to exclude atypical RP genes
-4. Mahalanobis distance from cleaned RP centroid to all genes
-5. Threshold at 2x median RP distance to define the optimized gene set
-6. Compute RSCU from the optimized set via concatenated codon pooling
+1. **RP cluster** — anchored to the centroid of ribosomal protein genes,
+   stabilised by bootstrap resampling.  Uses MinCovDet for robust
+   covariance and a chi-squared boundary to define a tight ellipsoidal
+   cluster.  Non-RP genes inside the boundary are included.
 
-Advantages over GMM:
-- Deterministic: no k selection, no random initialization
-- Stable cluster size: threshold is anchored to RP distribution, not BIC
-- Excludes atypical RP genes that would dilute the reference signal
-- Continuous membership scores via distance, not hard cluster labels
+2. **Density-core cluster** — anchored to the genome-wide density peak
+   (mode of a 2-D KDE on the first two COA axes), with the same
+   chi-squared boundary methodology.
+
+Both clusters use the **same** machinery:
+  - MinCovDet covariance estimation (two-pass outlier removal)
+  - Chi-squared threshold: sqrt(chi2.ppf(p, df=n_axes)), giving a
+    principled, covariance-independent boundary
+  - Distance-weighted RSCU pooling for the cluster reference
+  - Soft membership via sigmoid on Mahalanobis distance
+
+When RP genes split into distinct sub-populations (e.g. HGT, ribosome
+specialisation), the module detects multiple sub-clusters via GMM+BIC and
+runs independent fits for each.  The representative RP cluster is the one
+containing the most RP genes.
+
+Likewise, when the genome has multiple density peaks, each peak is fitted
+independently and the representative density-core cluster is the one
+containing the most genes.
+
+The four-way gene classification (both / rp_only / dens_only / neither)
+and translational selection strength assessment are preserved.
 """
 
 from __future__ import annotations
@@ -30,7 +45,6 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cosine as cosine_dist
 from scipy.stats import chi2
-from sklearn.cluster import AgglomerativeClustering
 from sklearn.covariance import MinCovDet
 from sklearn.metrics import silhouette_score
 from sklearn.mixture import GaussianMixture
@@ -50,67 +64,86 @@ logger = logging.getLogger("codonpipe")
 # Constants
 # ---------------------------------------------------------------------------
 
-_MIN_GENES_FOR_CLUSTERING = 50       # Minimum genes to attempt clustering
-_MIN_COA_AXES = 2             # Minimum COA axes required
-_MAX_COA_AXES = 8             # Maximum COA axes to use
-_CUMULATIVE_INERTIA_TARGET = 0.80  # Target cumulative inertia for axis selection
-_MIN_CLUSTER_SIZE = 10        # Warn if optimized set has fewer genes than this
+_MIN_GENES_FOR_CLUSTERING = 50
+_MIN_COA_AXES = 2
+_MAX_COA_AXES = 8
+_CUMULATIVE_INERTIA_TARGET = 0.80
+_MIN_CLUSTER_SIZE = 10
 
-# RP-anchored Mahalanobis approach
-_RP_OUTLIER_ALPHA = 0.025     # Chi-squared alpha for RP outlier detection
-_DISTANCE_MULTIPLIER = 2.0    # Default threshold = multiplier x median RP distance (fallback)
-_MIN_RP_FOR_ROBUST = 10       # Min RP genes for MinCovDet; else empirical covariance
-_ADAPTIVE_MULT_MIN = 1.2      # Floor for adaptive multiplier (relative to median RP dist)
-_ADAPTIVE_MULT_MAX = 3.0      # Ceiling for adaptive multiplier
-_ADAPTIVE_KDE_N_POINTS = 512  # Resolution for 1-D KDE on distance distribution
-_ADAPTIVE_MIN_GENES = 100     # Minimum genes to attempt adaptive threshold
+# Robust covariance fitting
+_RP_OUTLIER_ALPHA = 0.025          # Chi-squared alpha for RP outlier detection
+_MIN_RP_FOR_ROBUST = 10            # Min genes for MinCovDet; else empirical
+
+# Chi-squared cluster boundary (single method, no cascading fallbacks)
+_CLUSTER_CHI2_P = 0.95             # Captures ~95% of the reference population
 
 # RP sub-cluster detection
-_RP_SUBCLUSTER_MIN = 15       # Minimum RP genes to attempt sub-cluster detection
-_RP_SUBCLUSTER_MAX_K = 4      # Maximum sub-clusters to test
-_RP_SUBCLUSTER_SIL_THRESH = 0.25  # Silhouette score above which we accept a split
-_RP_SUBCLUSTER_MIN_FRAC = 0.12    # Sub-cluster must contain >= 12% of total RPs
+_RP_SUBCLUSTER_MIN = 15
+_RP_SUBCLUSTER_MAX_K = 4
+_RP_SUBCLUSTER_MIN_FRAC = 0.12
 
-# Density-anchor mode
-_DENSITY_KDE_BANDWIDTH = "scott"  # KDE bandwidth for density peak detection
-_DENSITY_SEED_RADIUS_PCTL = 30   # Percentile of distances for initial seed set
-# _DENSITY_MULTIPLIER = 2.5       # (deprecated: replaced by chi-squared threshold)
+# Density-peak detection
+_DENSITY_KDE_BANDWIDTH = "scott"
+_DENSITY_SEED_RADIUS_PCTL = 30
+_DENSITY_MULTI_PEAK_MIN_FRAC = 0.10  # Min fraction of genes for a peak to qualify
 
-# Translational selection strength classification
-# Thresholds are applied in order: "strong" requires ALL strong criteria,
-# "weak" if ANY weak criterion is met, otherwise "moderate".
-_TSS_COSINE_STRONG = 0.90   # RP-vs-density RSCU cosine BELOW this → strong selection
-_TSS_COSINE_WEAK = 0.97     # ABOVE this → weak selection
-_TSS_RPONLY_FRAC_STRONG = 0.05   # rp_only/(rp_only+both) ABOVE this → strong
-_TSS_RPONLY_FRAC_WEAK = 0.01     # BELOW this → weak
-_TSS_CENTROID_DIST_PCTL = 50     # Centroid distance normalised by median gene spread
+# Bootstrap
+_DEFAULT_N_BOOTSTRAPS = 200
+
+# Translational selection strength
+_TSS_COSINE_STRONG = 0.90
+_TSS_COSINE_WEAK = 0.97
+_TSS_RPONLY_FRAC_STRONG = 0.05
+_TSS_RPONLY_FRAC_WEAK = 0.01
+
+# Backward-compatible aliases (kept for cluster_stability imports)
+_DISTANCE_MULTIPLIER = 2.0
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Linear algebra helpers
+# ---------------------------------------------------------------------------
+
+def _safe_inv(mat: np.ndarray) -> np.ndarray:
+    """Invert a matrix, falling back to pseudo-inverse if singular."""
+    try:
+        return np.linalg.inv(mat)
+    except np.linalg.LinAlgError:
+        logger.warning("Singular covariance; using pseudo-inverse")
+        return np.linalg.pinv(mat)
+
+
+def _empirical_cov(X: np.ndarray) -> np.ndarray:
+    """Compute empirical covariance, safe for very small n."""
+    c = np.cov(X.T) if X.shape[0] > 1 else np.eye(X.shape[1])
+    if c.ndim == 0:
+        c = np.array([[float(c)]])
+    elif c.ndim == 1:
+        c = c.reshape(1, 1)
+    return c
+
+
+# ---------------------------------------------------------------------------
+# COA axis selection
 # ---------------------------------------------------------------------------
 
 def _select_n_axes(coa_inertia: pd.DataFrame, max_axes: int = _MAX_COA_AXES) -> int:
-    """Select number of COA axes to retain based on cumulative inertia.
-
-    Retains axes until cumulative inertia exceeds the target threshold,
-    with a minimum of 2 and a maximum of ``max_axes``.
-    """
+    """Select number of COA axes to retain based on cumulative inertia."""
     if coa_inertia.empty:
         return _MIN_COA_AXES
-
     cum_pct = coa_inertia["cum_pct"].values
-    # cum_pct is in percentage (0-100)
     target = _CUMULATIVE_INERTIA_TARGET * 100
-
     n = _MIN_COA_AXES
     for i, cp in enumerate(cum_pct):
         n = i + 1
         if cp >= target:
             break
-
     return max(_MIN_COA_AXES, min(n, max_axes, len(cum_pct)))
 
+
+# ---------------------------------------------------------------------------
+# Robust covariance fitting (shared by RP and density anchors)
+# ---------------------------------------------------------------------------
 
 def _fit_robust_rp_reference(
     X_rp: np.ndarray,
@@ -118,854 +151,106 @@ def _fit_robust_rp_reference(
     alpha: float = _RP_OUTLIER_ALPHA,
     min_rp: int = _MIN_RP_FOR_ROBUST,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Fit robust covariance on RP genes with two-pass outlier removal.
+    """Fit robust covariance with two-pass outlier removal.
 
-    Pass 1: Fit MinCovDet on all RP genes, identify outliers beyond
-            chi-squared critical value.
-    Pass 2: Refit centroid and covariance excluding outliers.
+    Pass 1: MinCovDet → identify chi-squared outliers.
+    Pass 2: Refit on inliers.
 
-    Args:
-        X_rp: (n_rp_genes, n_axes) RP gene COA coordinates.
-        n_axes: Number of COA axes (for chi-squared df).
-        alpha: Significance level for chi-squared outlier detection.
-        min_rp: Minimum RP genes to use MinCovDet; falls back to
-                empirical covariance if fewer.
-
-    Returns:
-        centroid: (n_axes,) cleaned RP centroid.
-        cov: (n_axes, n_axes) covariance matrix.
-        cov_inv: (n_axes, n_axes) inverse covariance matrix.
-        rp_outlier_mask: boolean array over RP genes, True for outliers.
+    Returns (centroid, cov, cov_inv, outlier_mask).
     """
     n_rp = len(X_rp)
 
-    def _safe_inv(mat):
-        try:
-            return np.linalg.inv(mat)
-        except np.linalg.LinAlgError:
-            logger.warning("Singular covariance; using pseudo-inverse")
-            return np.linalg.pinv(mat)
-
-    def _empirical_cov(X):
-        c = np.cov(X.T) if X.shape[0] > 1 else np.eye(X.shape[1])
-        if c.ndim == 0:
-            c = np.array([[float(c)]])
-        elif c.ndim == 1:
-            c = c.reshape(1, 1)
-        return c
-
     if n_rp < min_rp:
         logger.warning(
-            "Only %d RP genes; falling back to empirical covariance (< %d)",
+            "Only %d reference genes; falling back to empirical covariance (< %d)",
             n_rp, min_rp,
         )
         centroid = X_rp.mean(axis=0)
         cov = _empirical_cov(X_rp)
-        rp_outlier_mask = np.zeros(n_rp, dtype=bool)
-        return centroid, cov, _safe_inv(cov), rp_outlier_mask
+        return centroid, cov, _safe_inv(cov), np.zeros(n_rp, dtype=bool)
 
-    # Pass 1: Fit MinCovDet to identify outliers
+    # Pass 1
     try:
         support_frac = max(0.5, min(0.9, (n_rp - 2) / n_rp))
         mcd = MinCovDet(random_state=42, support_fraction=support_frac).fit(X_rp)
-        centroid_1 = mcd.location_
-        cov_1 = mcd.covariance_
+        centroid_1, cov_1 = mcd.location_, mcd.covariance_
     except Exception as e:
         logger.warning("MinCovDet failed (%s); using empirical covariance", e)
         centroid_1 = X_rp.mean(axis=0)
         cov_1 = _empirical_cov(X_rp)
 
     cov_1_inv = _safe_inv(cov_1)
-
-    # Mahalanobis distances for RP genes
     rp_dists = np.array([
         np.sqrt(max(0.0, (x - centroid_1) @ cov_1_inv @ (x - centroid_1)))
         for x in X_rp
     ])
 
     chi2_crit = np.sqrt(chi2.ppf(1 - alpha, df=n_axes))
-    rp_outlier_mask = rp_dists > chi2_crit
-
-    n_outliers = int(rp_outlier_mask.sum())
+    outlier_mask = rp_dists > chi2_crit
+    n_outliers = int(outlier_mask.sum())
     logger.info(
-        "Pass 1: %d/%d RP outliers (Mahalanobis > %.2f, alpha=%.3f)",
+        "Pass 1: %d/%d outliers (Mahalanobis > %.2f, alpha=%.3f)",
         n_outliers, n_rp, chi2_crit, alpha,
     )
 
-    # Pass 2: Refit excluding outliers
-    X_rp_clean = X_rp[~rp_outlier_mask]
-    if len(X_rp_clean) < max(2, n_axes + 1):
-        logger.warning(
-            "Too few non-outlier RP genes (%d); using all RP genes",
-            len(X_rp_clean),
-        )
-        X_rp_clean = X_rp
-        rp_outlier_mask = np.zeros(n_rp, dtype=bool)
+    # Pass 2
+    X_clean = X_rp[~outlier_mask]
+    if len(X_clean) < max(2, n_axes + 1):
+        logger.warning("Too few inliers (%d); using all genes", len(X_clean))
+        X_clean = X_rp
+        outlier_mask = np.zeros(n_rp, dtype=bool)
 
-    # Use MinCovDet on the clean set to anchor the centroid and
-    # covariance to the densest core of RP genes.  Empirical mean +
-    # covariance on a spread-out RP set drifts the centroid toward the
-    # genome center and inflates the ellipse, capturing most of the
-    # genome instead of the translationally optimised core.
-    if len(X_rp_clean) >= min_rp:
+    if len(X_clean) >= min_rp:
         try:
-            support_frac_2 = max(0.5, min(0.9, (len(X_rp_clean) - 2) / len(X_rp_clean)))
-            mcd2 = MinCovDet(random_state=42, support_fraction=support_frac_2).fit(X_rp_clean)
-            centroid = mcd2.location_
-            cov = mcd2.covariance_
-            logger.info(
-                "Pass 2: MinCovDet centroid from %d non-outlier RP genes "
-                "(support fraction=%.2f)",
-                len(X_rp_clean), support_frac_2,
-            )
+            sf2 = max(0.5, min(0.9, (len(X_clean) - 2) / len(X_clean)))
+            mcd2 = MinCovDet(random_state=42, support_fraction=sf2).fit(X_clean)
+            centroid, cov = mcd2.location_, mcd2.covariance_
         except Exception as e:
-            logger.warning(
-                "Pass 2 MinCovDet failed (%s); falling back to empirical",
-                e,
-            )
-            centroid = X_rp_clean.mean(axis=0)
-            cov = _empirical_cov(X_rp_clean)
+            logger.warning("Pass 2 MinCovDet failed (%s); empirical fallback", e)
+            centroid = X_clean.mean(axis=0)
+            cov = _empirical_cov(X_clean)
     else:
-        centroid = X_rp_clean.mean(axis=0)
-        cov = _empirical_cov(X_rp_clean)
-        logger.info(
-            "Pass 2: empirical centroid from %d non-outlier RP genes "
-            "(below MinCovDet minimum)",
-            len(X_rp_clean),
-        )
+        centroid = X_clean.mean(axis=0)
+        cov = _empirical_cov(X_clean)
 
-    cov_inv = _safe_inv(cov)
+    return centroid, cov, _safe_inv(cov), outlier_mask
 
-    return centroid, cov, cov_inv, rp_outlier_mask
 
-
-def _select_rp_subcluster(
-    X_rp: np.ndarray,
-    rp_gene_ids_list: list[str],
-    max_k: int = _RP_SUBCLUSTER_MAX_K,
-    sil_threshold: float = _RP_SUBCLUSTER_SIL_THRESH,
-) -> tuple[np.ndarray, list[str], dict]:
-    """Detect and select the tightest RP sub-cluster when RPs are split.
-
-    Uses agglomerative clustering (Ward linkage) to test whether the RP set
-    in COA space is better described by k=2..max_k sub-clusters than a single
-    group.  If the best silhouette score exceeds ``sil_threshold``, the
-    sub-cluster with the smallest average within-cluster distance (i.e. the
-    densest, most tightly-clustered group) is selected as the anchor for
-    Mahalanobis fitting.
-
-    When a split is detected, *all* qualifying sub-clusters are returned in
-    ``diagnostics["all_subclusters"]`` so that the caller can run independent
-    Mahalanobis pipelines on each and choose the best after bootstrapping.
-
-    Args:
-        X_rp: (n_rp, n_axes) RP gene coordinates in COA space.
-        rp_gene_ids_list: Gene IDs corresponding to rows of X_rp.
-        max_k: Maximum number of sub-clusters to evaluate.
-        sil_threshold: Minimum silhouette score to accept a split.
-
-    Returns:
-        X_rp_selected: Coordinates of the densest sub-cluster (backward
-            compatible default).
-        selected_ids: Gene IDs in the densest sub-cluster.
-        diagnostics: Dict with detection details.  When ``split_detected``
-            is True, includes ``all_subclusters``: a list of dicts, each
-            with keys ``X``, ``gene_ids``, ``label``, ``n``, ``avg_dist``.
-    """
-    n_rp = len(X_rp)
-    diag: dict = {
-        "attempted": False,
-        "split_detected": False,
-        "best_k": 1,
-        "best_silhouette": -1.0,
-        "selected_subcluster": -1,
-        "n_original": n_rp,
-        "n_selected": n_rp,
-        "subcluster_sizes": [n_rp],
-        "all_subclusters": [],
-    }
-
-    if n_rp < _RP_SUBCLUSTER_MIN:
-        logger.debug(
-            "Too few RPs (%d < %d) for sub-cluster detection; using all",
-            n_rp, _RP_SUBCLUSTER_MIN,
-        )
-        return X_rp, rp_gene_ids_list, diag
-
-    diag["attempted"] = True
-
-    # Cluster in 2-D projection (first 2 COA axes) where RP group
-    # separation is strongest.  Higher COA axes add noise that masks
-    # the gaps between sub-populations — the same reason the adaptive
-    # threshold uses a 2-D projection.
-    n_dims = X_rp.shape[1]
-    X_rp_2d = X_rp[:, :2] if n_dims >= 2 else X_rp
-
-    # Use Gaussian Mixture Models with BIC for model selection.
-    # BIC naturally penalizes overfitting — if k=1 has the lowest BIC,
-    # the RP population is unimodal and no split is needed.  If k>1
-    # wins, the RP genes form distinct sub-populations.
-    bic_per_k: dict[int, float] = {}
-    gmm_per_k: dict[int, GaussianMixture] = {}
-    best_k = 1
-    best_bic = np.inf
-
-    for k in range(1, min(max_k + 1, n_rp)):
-        try:
-            gmm = GaussianMixture(
-                n_components=k, random_state=42,
-                covariance_type="full", n_init=3,
-            )
-            gmm.fit(X_rp_2d)
-            bic = gmm.bic(X_rp_2d)
-            bic_per_k[k] = round(bic, 2)
-            gmm_per_k[k] = gmm
-            if bic < best_bic:
-                best_bic = bic
-                best_k = k
-        except Exception as e:
-            logger.debug("GMM k=%d failed: %s", k, e)
-
-    best_labels = None
-    best_sil = -1.0
-    if best_k > 1 and best_k in gmm_per_k:
-        best_labels = gmm_per_k[best_k].predict(X_rp_2d)
-        try:
-            best_sil = silhouette_score(X_rp_2d, best_labels)
-        except Exception:
-            best_sil = 0.0
-
-    diag["best_k"] = best_k
-    diag["best_silhouette"] = round(float(best_sil), 4)
-    diag["bic_per_k"] = bic_per_k
-
-    logger.info(
-        "RP sub-cluster detection (2-D GMM+BIC): BIC per k=%s, best k=%d "
-        "(BIC=%.1f, sil=%.3f)",
-        bic_per_k, best_k, best_bic, best_sil,
-    )
-
-    if best_k <= 1 or best_labels is None:
-        logger.info(
-            "RP sub-cluster detection: BIC favors k=1; "
-            "RPs form a single coherent group",
-        )
-        return X_rp, rp_gene_ids_list, diag
-
-    # Split detected — enumerate all qualifying sub-clusters
-    diag["split_detected"] = True
-    unique_labels = sorted(set(best_labels))
-    subcluster_sizes = [int((best_labels == lab).sum()) for lab in unique_labels]
-    diag["subcluster_sizes"] = subcluster_sizes
-
-    min_members = max(3, int(_RP_SUBCLUSTER_MIN_FRAC * n_rp))
-    all_subs: list[dict] = []
-
-    for lab in unique_labels:
-        mask = best_labels == lab
-        X_sub = X_rp[mask]
-        n_sub = len(X_sub)
-        if n_sub < min_members:
-            continue
-        centroid_sub = X_sub.mean(axis=0)
-        avg_dist = float(np.mean(np.linalg.norm(X_sub - centroid_sub, axis=1)))
-        score = avg_dist / np.sqrt(n_sub)
-
-        sub_ids = [gid for gid, sel in zip(rp_gene_ids_list, mask) if sel]
-        all_subs.append({
-            "X": X_sub,
-            "gene_ids": sub_ids,
-            "label": int(lab),
-            "n": n_sub,
-            "avg_dist": avg_dist,
-            "density_score": score,
-        })
-
-    diag["all_subclusters"] = all_subs
-
-    if not all_subs:
-        logger.warning("No sub-cluster had >= %d members; using all RPs", min_members)
-        return X_rp, rp_gene_ids_list, diag
-
-    # Default selection: largest sub-cluster (most RP genes).
-    # The largest RP sub-population is the canonical reference set;
-    # small compact satellites are more likely HGT or specialised
-    # ribosomes.  Density score is used only as a tiebreaker.
-    all_subs.sort(key=lambda s: (-s["n"], s["density_score"]))
-    best_sc = all_subs[0]
-    best_sub = best_sc["label"]
-
-    selected_mask = best_labels == best_sub
-    X_selected = X_rp[selected_mask]
-    selected_ids = [gid for gid, sel in zip(rp_gene_ids_list, selected_mask) if sel]
-
-    diag["selected_subcluster"] = int(best_sub)
-    diag["n_selected"] = len(selected_ids)
-
-    excluded_ids = [gid for gid, sel in zip(rp_gene_ids_list, selected_mask) if not sel]
-
-    logger.info(
-        "RP sub-cluster split detected (silhouette=%.3f, k=%d): "
-        "%d qualifying sub-clusters. Default anchor: largest "
-        "(%d RPs, avg dist=%.3f), excluded %d RPs. Sizes: %s",
-        best_sil, best_k, len(all_subs), len(selected_ids),
-        best_sc["avg_dist"], len(excluded_ids), subcluster_sizes,
-    )
-
-    return X_selected, selected_ids, diag
-
-
-def _find_density_peak_anchor(
-    X: np.ndarray,
-    gene_ids: list[str],
-    n_axes: int,
-    bandwidth: str = _DENSITY_KDE_BANDWIDTH,
-    seed_radius_pctl: int = _DENSITY_SEED_RADIUS_PCTL,
-    min_rp: int = _MIN_RP_FOR_ROBUST,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], dict]:
-    """Detect the genome density peak in COA space and fit covariance on nearby genes.
-
-    Uses a 2-D KDE on the first two COA axes to locate the mode of the
-    genome-wide gene distribution.  Genes within the *seed_radius_pctl*
-    percentile distance from that peak are used as the seed set for a
-    robust covariance fit (MinCovDet when seed is large enough, else
-    empirical).  The resulting centroid, covariance, and inverse are
-    returned for downstream Mahalanobis distance computation.
-
-    Args:
-        X: (n_genes, n_axes) COA coordinates for all genes.
-        gene_ids: Gene IDs corresponding to rows of X.
-        n_axes: Number of COA axes (used for covariance fitting).
-        bandwidth: KDE bandwidth method (passed to scipy gaussian_kde).
-        seed_radius_pctl: Percentile of distances from peak that defines
-            the seed neighbourhood.  Lower values give a tighter seed.
-        min_rp: Minimum seed genes for MinCovDet; else empirical.
-
-    Returns:
-        centroid: (n_axes,) density-peak centroid (fitted on seed genes).
-        cov: (n_axes, n_axes) covariance matrix of the seed.
-        cov_inv: (n_axes, n_axes) inverse covariance.
-        seed_gene_ids: Gene IDs in the seed set.
-        diagnostics: Dict with peak location, seed size, etc.
-    """
-    from scipy.stats import gaussian_kde
-
-    diag: dict = {
-        "density_peak_xy": None,
-        "n_seed_genes": 0,
-        "seed_radius": 0.0,
-        "bandwidth": str(bandwidth),
-    }
-
-    # --- KDE on first 2 axes to find the peak ---
-    x2d = X[:, :2].T  # (2, n_genes)
-    try:
-        kde = gaussian_kde(x2d, bw_method=bandwidth)
-    except Exception as e:
-        logger.warning("Density KDE failed: %s", e)
-        # Fallback: use the coordinate-wise median as the peak
-        peak_2d = np.median(X[:, :2], axis=0)
-        logger.info("Falling back to median as density peak: %s", peak_2d)
-        kde = None
-
-    if kde is not None:
-        # Evaluate KDE on a grid to find the global maximum
-        x_min, x_max = X[:, 0].min(), X[:, 0].max()
-        y_min, y_max = X[:, 1].min(), X[:, 1].max()
-        pad_x = (x_max - x_min) * 0.05
-        pad_y = (y_max - y_min) * 0.05
-        grid_n = 200
-        gx = np.linspace(x_min - pad_x, x_max + pad_x, grid_n)
-        gy = np.linspace(y_min - pad_y, y_max + pad_y, grid_n)
-        gxx, gyy = np.meshgrid(gx, gy)
-        grid_pts = np.vstack([gxx.ravel(), gyy.ravel()])
-        density = kde(grid_pts)
-        peak_idx = np.argmax(density)
-        peak_2d = grid_pts[:, peak_idx]
-    else:
-        peak_2d = np.median(X[:, :2], axis=0)
-
-    diag["density_peak_xy"] = [round(float(peak_2d[0]), 6),
-                                round(float(peak_2d[1]), 6)]
-
-    logger.info(
-        "Density peak located at (%.4f, %.4f) in COA Axis1-Axis2 space",
-        peak_2d[0], peak_2d[1],
-    )
-
-    # --- Build full-dimensional peak vector ---
-    # For axes beyond 2, use the coordinate-wise median of all genes
-    if n_axes > 2:
-        peak_full = np.concatenate([peak_2d, np.median(X[:, 2:n_axes], axis=0)])
-    else:
-        peak_full = peak_2d.copy()
-
-    # --- Select seed genes within the radius percentile ---
-    dists_from_peak = np.linalg.norm(X[:, :n_axes] - peak_full, axis=1)
-    radius = float(np.percentile(dists_from_peak, seed_radius_pctl))
-    seed_mask = dists_from_peak <= radius
-
-    diag["seed_radius"] = round(radius, 6)
-    diag["n_seed_genes"] = int(seed_mask.sum())
-
-    logger.info(
-        "Density seed: %d genes within %.4f of peak (%dth percentile radius)",
-        seed_mask.sum(), radius, seed_radius_pctl,
-    )
-
-    seed_gene_ids = [gid for gid, s in zip(gene_ids, seed_mask) if s]
-    X_seed = X[seed_mask][:, :n_axes]
-
-    # --- Fit covariance on seed genes ---
-    def _safe_inv(mat):
-        try:
-            return np.linalg.inv(mat)
-        except np.linalg.LinAlgError:
-            return np.linalg.pinv(mat)
-
-    def _empirical_cov(Xm):
-        c = np.cov(Xm.T) if Xm.shape[0] > 1 else np.eye(Xm.shape[1])
-        if c.ndim == 0:
-            c = np.array([[float(c)]])
-        elif c.ndim == 1:
-            c = c.reshape(1, 1)
-        return c
-
-    n_seed = len(X_seed)
-    if n_seed < min_rp:
-        logger.warning(
-            "Density seed too small (%d < %d) for MinCovDet; using empirical",
-            n_seed, min_rp,
-        )
-        centroid = X_seed.mean(axis=0)
-        cov = _empirical_cov(X_seed)
-    else:
-        try:
-            support_frac = max(0.5, min(0.9, (n_seed - 2) / n_seed))
-            mcd = MinCovDet(random_state=42, support_fraction=support_frac).fit(X_seed)
-            centroid = mcd.location_
-            cov = mcd.covariance_
-        except Exception as e:
-            logger.warning("MinCovDet on density seed failed (%s); empirical fallback", e)
-            centroid = X_seed.mean(axis=0)
-            cov = _empirical_cov(X_seed)
-
-    cov_inv = _safe_inv(cov)
-
-    logger.info(
-        "Density-anchor covariance fitted on %d seed genes (centroid shift from "
-        "raw peak: %.4f)",
-        n_seed,
-        float(np.linalg.norm(centroid[:2] - peak_2d)),
-    )
-
-    return centroid, cov, cov_inv, seed_gene_ids, diag
-
-
-def _classify_translational_selection(
-    rp_vs_density_cosine: float | None,
-    dual_anchor_categories: Counter | None,
-    rp_centroid: np.ndarray | None,
-    density_centroid: np.ndarray | None,
-    gene_spread_median: float | None,
-) -> dict:
-    """Classify the strength of translational selection signal.
-
-    Uses three independent lines of evidence from the dual-anchor comparison:
-
-    1. **RSCU cosine similarity** between the RP-cluster and density-cluster.
-       High similarity means RP codon preferences are barely distinguishable
-       from the genome average.
-
-    2. **rp_only fraction** — the proportion of RP-cluster genes that are NOT
-       in the density cluster.  These genes have been pulled away from the
-       genome average by selection.  A near-zero fraction means the RP
-       cluster sits on top of the genome peak.
-
-    3. **Centroid separation** — Euclidean distance between the RP and density
-       centroids, normalised by the median gene-to-genome-centre spread.  A
-       small ratio means the anchors overlap.
-
-    Classification:
-        "strong"   — at least 2 of the 3 strong-signal indicators are met
-        "weak"     — at least 2 of the 3 weak-signal indicators are met
-        "moderate" — everything else
-
-    Returns:
-        Dict with 'classification', 'evidence' (per-criterion results),
-        and 'caveat' (human-readable warning for weak/moderate).
-    """
-    evidence: dict[str, dict] = {}
-    strong_votes = 0
-    weak_votes = 0
-
-    # --- Criterion 1: RSCU cosine ---
-    if rp_vs_density_cosine is not None and not np.isnan(rp_vs_density_cosine):
-        if rp_vs_density_cosine < _TSS_COSINE_STRONG:
-            strong_votes += 1
-            verdict = "strong"
-        elif rp_vs_density_cosine > _TSS_COSINE_WEAK:
-            weak_votes += 1
-            verdict = "weak"
-        else:
-            verdict = "moderate"
-        evidence["rscu_cosine"] = {
-            "value": round(rp_vs_density_cosine, 4),
-            "strong_threshold": f"< {_TSS_COSINE_STRONG}",
-            "weak_threshold": f"> {_TSS_COSINE_WEAK}",
-            "verdict": verdict,
-        }
-
-    # --- Criterion 2: rp_only fraction ---
-    if dual_anchor_categories is not None:
-        n_rp_only = dual_anchor_categories.get("rp_only", 0)
-        n_both = dual_anchor_categories.get("both", 0)
-        denom = n_rp_only + n_both
-        if denom > 0:
-            frac = n_rp_only / denom
-            if frac > _TSS_RPONLY_FRAC_STRONG:
-                strong_votes += 1
-                verdict = "strong"
-            elif frac < _TSS_RPONLY_FRAC_WEAK:
-                weak_votes += 1
-                verdict = "weak"
-            else:
-                verdict = "moderate"
-            evidence["rp_only_fraction"] = {
-                "value": round(frac, 4),
-                "n_rp_only": n_rp_only,
-                "n_both": n_both,
-                "strong_threshold": f"> {_TSS_RPONLY_FRAC_STRONG}",
-                "weak_threshold": f"< {_TSS_RPONLY_FRAC_WEAK}",
-                "verdict": verdict,
-            }
-
-    # --- Criterion 3: Centroid separation ---
-    if (rp_centroid is not None and density_centroid is not None
-            and gene_spread_median is not None and gene_spread_median > 0):
-        min_len = min(len(rp_centroid), len(density_centroid))
-        raw_dist = float(np.linalg.norm(
-            rp_centroid[:min_len] - density_centroid[:min_len]
-        ))
-        normed = raw_dist / gene_spread_median
-        # Strong: centroids clearly separated (normed > 0.5)
-        # Weak: centroids nearly overlapping (normed < 0.15)
-        if normed > 0.5:
-            strong_votes += 1
-            verdict = "strong"
-        elif normed < 0.15:
-            weak_votes += 1
-            verdict = "weak"
-        else:
-            verdict = "moderate"
-        evidence["centroid_separation"] = {
-            "raw_distance": round(raw_dist, 4),
-            "normalised": round(normed, 4),
-            "strong_threshold": "> 0.5",
-            "weak_threshold": "< 0.15",
-            "verdict": verdict,
-        }
-
-    # --- Overall classification (majority vote) ---
-    if strong_votes >= 2:
-        classification = "strong"
-    elif weak_votes >= 2:
-        classification = "weak"
-    else:
-        classification = "moderate"
-
-    # Build caveat string
-    caveats = {
-        "strong": None,
-        "moderate": (
-            "Translational selection signal is moderate. RP-based expression "
-            "scores (MELP, CAI, Fop) should be interpreted with caution — the "
-            "RP codon preferences are only partially distinguishable from the "
-            "genome-wide average."
-        ),
-        "weak": (
-            "Translational selection signal is weak. RP codon preferences are "
-            "nearly indistinguishable from the genome-wide average, so "
-            "RP-based expression scores (MELP, CAI, Fop) are unreliable for "
-            "this genome. Consider using alternative expression proxies or "
-            "external transcriptomic data."
-        ),
-    }
-
-    result = {
-        "classification": classification,
-        "evidence": evidence,
-        "strong_votes": strong_votes,
-        "weak_votes": weak_votes,
-        "caveat": caveats[classification],
-    }
-
-    logger.info(
-        "Translational selection strength: %s (strong_votes=%d, weak_votes=%d)",
-        classification.upper(), strong_votes, weak_votes,
-    )
-    if result["caveat"]:
-        logger.warning("⚠ %s", result["caveat"])
-
-    return result
-
-
-def _find_adaptive_threshold(
-    distances: np.ndarray,
-    rp_distances_clean: np.ndarray,
-    median_rp_dist: float,
-    default_multiplier: float = _DISTANCE_MULTIPLIER,
-    min_mult: float = _ADAPTIVE_MULT_MIN,
-    max_mult: float = _ADAPTIVE_MULT_MAX,
-    n_kde_points: int = _ADAPTIVE_KDE_N_POINTS,
-    min_genes: int = _ADAPTIVE_MIN_GENES,
-) -> tuple[float, dict]:
-    """Find a data-driven Mahalanobis distance threshold.
-
-    Attempts two methods in order:
-
-    1. **KDE valley detection** — fits a 1-D Gaussian KDE to the full distance
-       distribution and searches for the first local minimum after the RP peak.
-       The RP peak is defined as the KDE mode in the range [0, 2 × median_rp].
-       The valley must lie between the RP peak and the next local maximum
-       (the genome-bulk peak) to be accepted.
-
-    2. **Otsu's method** — if no valley is found, binarises the distance
-       histogram to maximise between-class variance.  This is robust to
-       unimodal distributions but produces a less precise boundary.
-
-    The result is clamped to [min_mult × median_rp, max_mult × median_rp]
-    so it can't collapse to near-zero or explode on pathological inputs.
-
-    If the genome has fewer than *min_genes* genes, or the median RP distance
-    is zero, the default multiplier is returned.
-
-    Args:
-        distances: (n_genes,) Mahalanobis distances for all genes.
-        rp_distances_clean: Distances for non-outlier RP genes.
-        median_rp_dist: Median of rp_distances_clean.
-        default_multiplier: Fallback multiplier if adaptive methods fail.
-        min_mult / max_mult: Bounds on the effective multiplier.
-        n_kde_points: Number of evaluation points for the 1-D KDE.
-        min_genes: Minimum genes required to attempt adaptive threshold.
-
-    Returns:
-        threshold: The chosen distance threshold.
-        diagnostics: Dict with method used, valley/Otsu location, effective
-            multiplier, and any intermediate values.
-    """
-    from scipy.stats import gaussian_kde as gkde
-
-    diag: dict = {
-        "method": "default",
-        "threshold": default_multiplier * median_rp_dist,
-        "effective_multiplier": default_multiplier,
-        "kde_valley": None,
-        "kde_rp_peak": None,
-        "kde_bulk_peak": None,
-        "otsu_threshold": None,
-    }
-
-    floor = min_mult * median_rp_dist
-    ceiling = max_mult * median_rp_dist
-
-    if len(distances) < min_genes or median_rp_dist <= 0:
-        logger.info(
-            "Adaptive threshold: too few genes (%d) or zero median RP dist; "
-            "using default %.1f×",
-            len(distances), default_multiplier,
-        )
-        diag["threshold"] = np.clip(diag["threshold"], floor, ceiling)
-        diag["effective_multiplier"] = diag["threshold"] / median_rp_dist
-        return diag["threshold"], diag
-
-    # Evaluation range: 0 to 99th percentile (ignore extreme outliers)
-    d_max = float(np.percentile(distances, 99))
-    d_eval = np.linspace(0, d_max, n_kde_points)
-
-    # ── Method 1: KDE valley detection ───────────────────────────────
-    try:
-        kde = gkde(distances, bw_method="scott")
-        density = kde(d_eval)
-
-        # Find local extrema
-        # A local min at index i: density[i] < density[i-1] and density[i] < density[i+1]
-        local_mins = []
-        local_maxs = []
-        for i in range(1, len(density) - 1):
-            if density[i] < density[i - 1] and density[i] < density[i + 1]:
-                local_mins.append((d_eval[i], density[i]))
-            if density[i] > density[i - 1] and density[i] > density[i + 1]:
-                local_maxs.append((d_eval[i], density[i]))
-
-        # RP peak: the highest local max in [0, 2 × median_rp_dist]
-        rp_peak_limit = 2.0 * median_rp_dist
-        rp_peaks = [(d, v) for d, v in local_maxs if d <= rp_peak_limit]
-        if not rp_peaks:
-            # Fallback: global max of density in [0, rp_peak_limit]
-            mask = d_eval <= rp_peak_limit
-            if mask.any():
-                idx = np.argmax(density[mask])
-                rp_peaks = [(d_eval[mask][idx], density[mask][idx])]
-
-        if rp_peaks:
-            rp_peak_d = max(rp_peaks, key=lambda x: x[1])[0]
-            diag["kde_rp_peak"] = round(float(rp_peak_d), 4)
-
-            # Find the first valley AFTER the RP peak
-            valid_valleys = [
-                (d, v) for d, v in local_mins
-                if d > rp_peak_d and d > median_rp_dist
-            ]
-
-            if valid_valleys:
-                valley_d = valid_valleys[0][0]
-
-                # Sanity: there should be a bulk peak after the valley
-                bulk_peaks = [
-                    (d, v) for d, v in local_maxs if d > valley_d
-                ]
-                if bulk_peaks:
-                    diag["kde_bulk_peak"] = round(float(bulk_peaks[0][0]), 4)
-
-                valley_clamped = float(np.clip(valley_d, floor, ceiling))
-                diag["kde_valley"] = round(float(valley_d), 4)
-                diag["method"] = "kde_valley"
-                diag["threshold"] = valley_clamped
-                diag["effective_multiplier"] = round(
-                    valley_clamped / median_rp_dist, 4
-                )
-
-                logger.info(
-                    "Adaptive threshold (KDE valley): raw=%.3f, clamped=%.3f "
-                    "(%.2f× median RP dist). RP peak=%.3f, valley=%.3f",
-                    valley_d, valley_clamped,
-                    valley_clamped / median_rp_dist,
-                    rp_peak_d, valley_d,
-                )
-                return valley_clamped, diag
-
-        logger.debug("KDE valley detection: no valid valley found after RP peak")
-
-    except Exception as e:
-        logger.debug("KDE valley detection failed: %s", e)
-
-    # ── Method 2: Otsu's method ──────────────────────────────────────
-    try:
-        # Histogram the distances
-        n_bins = 256
-        hist_range = (0, d_max)
-        counts, bin_edges = np.histogram(distances, bins=n_bins, range=hist_range)
-        bin_centres = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-        total = counts.sum()
-        if total == 0:
-            raise ValueError("Empty histogram")
-
-        # Otsu: maximise between-class variance
-        best_t = default_multiplier * median_rp_dist
-        best_var = -1.0
-
-        cum_sum = 0.0
-        cum_count = 0
-        total_sum = float((counts * bin_centres).sum())
-
-        for i in range(n_bins):
-            cum_count += counts[i]
-            if cum_count == 0:
-                continue
-            bg_count = total - cum_count
-            if bg_count == 0:
-                break
-
-            cum_sum += counts[i] * bin_centres[i]
-            mean_bg = (total_sum - cum_sum) / bg_count
-            mean_fg = cum_sum / cum_count
-
-            var_between = cum_count * bg_count * (mean_fg - mean_bg) ** 2
-            if var_between > best_var:
-                best_var = var_between
-                best_t = bin_centres[i]
-
-        # Only accept Otsu threshold if it's above the median RP distance
-        # (otherwise it's splitting within the RP peak, which is wrong)
-        if best_t > median_rp_dist:
-            otsu_clamped = float(np.clip(best_t, floor, ceiling))
-            diag["otsu_threshold"] = round(float(best_t), 4)
-            diag["method"] = "otsu"
-            diag["threshold"] = otsu_clamped
-            diag["effective_multiplier"] = round(
-                otsu_clamped / median_rp_dist, 4
-            )
-
-            logger.info(
-                "Adaptive threshold (Otsu): raw=%.3f, clamped=%.3f "
-                "(%.2f× median RP dist)",
-                best_t, otsu_clamped, otsu_clamped / median_rp_dist,
-            )
-            return otsu_clamped, diag
-
-        logger.debug(
-            "Otsu threshold (%.3f) is below median RP distance (%.3f); "
-            "rejecting", best_t, median_rp_dist,
-        )
-
-    except Exception as e:
-        logger.debug("Otsu threshold failed: %s", e)
-
-    # ── Fallback: default multiplier ─────────────────────────────────
-    fallback = float(np.clip(default_multiplier * median_rp_dist, floor, ceiling))
-    diag["threshold"] = fallback
-    diag["effective_multiplier"] = round(fallback / median_rp_dist, 4)
-
-    logger.info(
-        "Adaptive threshold: no valley or Otsu found; using default "
-        "%.1f× = %.3f", default_multiplier, fallback,
-    )
-    return fallback, diag
-
+# ---------------------------------------------------------------------------
+# Mahalanobis distances
+# ---------------------------------------------------------------------------
 
 def _compute_mahalanobis_distances(
     X: np.ndarray,
     centroid: np.ndarray,
     cov_inv: np.ndarray,
 ) -> np.ndarray:
-    """Compute Mahalanobis distance from each gene to RP centroid.
-
-    Args:
-        X: (n_genes, n_features) COA coordinates.
-        centroid: (n_features,) RP centroid.
-        cov_inv: (n_features, n_features) inverse covariance matrix.
-
-    Returns:
-        (n_genes,) Mahalanobis distances.
-    """
+    """Mahalanobis distance from each row of X to centroid."""
     diff = X - centroid
-    # d = sqrt(diff @ cov_inv @ diff^T) per row
     left = diff @ cov_inv
-    d_sq = np.sum(left * diff, axis=1)
-    d_sq = np.maximum(d_sq, 0.0)  # numerical safety
+    d_sq = np.maximum(np.sum(left * diff, axis=1), 0.0)
     return np.sqrt(d_sq)
+
+
+def _chi2_threshold(n_axes: int, p: float = _CLUSTER_CHI2_P) -> float:
+    """Chi-squared Mahalanobis distance threshold."""
+    return float(np.sqrt(chi2.ppf(p, df=n_axes)))
 
 
 def _distance_to_membership(
     distances: np.ndarray,
     threshold: float,
 ) -> np.ndarray:
-    """Convert Mahalanobis distances to soft membership scores.
-
-    Uses sigmoid: score = 1 / (1 + exp((d - threshold) / scale))
-    where scale = threshold / 5 for a smooth but fairly sharp transition.
-
-    Returns:
-        (n_genes, 2) array: col 0 = P(non-optimized), col 1 = P(optimized).
-    """
+    """Sigmoid soft membership: (n_genes, 2) with col1 = P(in cluster)."""
     scale = max(threshold / 5.0, 1e-6)
-    z = (distances - threshold) / scale
-    z = np.clip(z, -500, 500)  # prevent overflow
+    z = np.clip((distances - threshold) / scale, -500, 500)
     score = 1.0 / (1.0 + np.exp(z))
     return np.column_stack([1.0 - score, score])
 
+
+# ---------------------------------------------------------------------------
+# Cluster RSCU computation
+# ---------------------------------------------------------------------------
 
 def _compute_cluster_rscu(
     ffn_path: Path,
@@ -973,29 +258,7 @@ def _compute_cluster_rscu(
     min_length: int = MIN_GENE_LENGTH,
     gene_weights: dict[str, float] | None = None,
 ) -> pd.Series:
-    """Compute RSCU by distance-weighted pooling of codon counts.
-
-    Each gene's raw codon counts are multiplied by its proximity weight
-    (1 − distance/threshold) before pooling, so genes closer to the RP
-    centroid contribute more to the final RSCU estimate.  Genes at the
-    centroid contribute their full codon counts; genes at the threshold
-    boundary contribute near-zero.
-
-    When *gene_weights* is None (e.g. called from external code that
-    doesn't have distances), all genes contribute equally (weight 1.0).
-
-    Args:
-        ffn_path: Path to the nucleotide CDS FASTA containing all genes.
-        cluster_gene_ids: Set of gene IDs belonging to the target cluster.
-        min_length: Minimum sequence length (nt) to include.
-        gene_weights: Dict mapping gene ID → weight in (0, 1].
-            Internally always provided by run_mahal_clustering.
-            External callers may omit for equal-weight fallback.
-
-    Returns:
-        Series indexed by RSCU column names (e.g. 'Phe-UUU') with pooled
-        RSCU values.
-    """
+    """Compute RSCU by distance-weighted pooling of codon counts."""
     total_counts: Counter = Counter()
     n_included = 0
 
@@ -1016,7 +279,7 @@ def _compute_cluster_rscu(
 
     if not total_counts:
         logger.warning(
-            "No codons pooled from cluster (%d IDs requested, %d passed length filter)",
+            "No codons pooled from cluster (%d IDs requested, %d passed filter)",
             len(cluster_gene_ids), n_included,
         )
         return pd.Series(dtype=float)
@@ -1027,50 +290,49 @@ def _compute_cluster_rscu(
         "Cluster RSCU computed by %s pooling (%d genes, %.0f effective codons)",
         mode, n_included, sum(total_counts.values()),
     )
-
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_dict]
     return pd.Series({c: rscu_dict[c] for c in rscu_cols})
 
 
+def _compute_genome_wide_rscu(ffn_path: Path, min_length: int = MIN_GENE_LENGTH) -> pd.Series:
+    """Pool codon counts across all genes and compute genome-wide RSCU."""
+    total_counts: Counter = Counter()
+    for rec in SeqIO.parse(str(ffn_path), "fasta"):
+        seq = str(rec.seq)
+        if len(seq) < min_length:
+            continue
+        total_counts += count_codons(seq)
+    if not total_counts:
+        return pd.Series(dtype=float)
+    rscu_dict = compute_rscu_from_counts(total_counts)
+    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_dict]
+    return pd.Series({c: rscu_dict[c] for c in rscu_cols})
+
+
+# ---------------------------------------------------------------------------
+# Core-CAI and rare codons
+# ---------------------------------------------------------------------------
+
 def _rscu_to_adaptation_weights(cluster_rscu: pd.Series) -> dict[str, float]:
-    """Convert core-cluster RSCU values to per-codon adaptation weights.
-
-    For each synonymous family, w_codon = RSCU_codon / max(RSCU) within
-    the family. This follows Sharp & Li (1987): the weight for the most
-    preferred codon is 1.0, and all others are scaled relative to it.
-
-    Codons belonging to amino acids not represented in the cluster RSCU
-    (or with max RSCU = 0) are omitted, so they won't contribute to CAI.
-
-    Returns:
-        Dict mapping RNA codon (e.g. 'GCU') to its adaptation weight in (0, 1].
-    """
-    # Build a mapping from RSCU column name → codon
+    """Convert core-cluster RSCU to per-codon adaptation weights (Sharp & Li 1987)."""
     weights: dict[str, float] = {}
     for family_label, codons in AA_CODON_GROUPS_RSCU.items():
-        # Find the RSCU column names for this family
         family_cols = []
         for col in RSCU_COLUMN_NAMES:
             codon = RSCU_COL_TO_CODON[col]
             if codon in codons:
                 family_cols.append((col, codon))
-
-        # Get RSCU values present in the cluster reference
         vals = {}
         for col, codon in family_cols:
             if col in cluster_rscu.index:
                 vals[codon] = cluster_rscu[col]
-
         if not vals:
             continue
         max_rscu = max(vals.values())
         if max_rscu <= 0:
             continue
         for codon, rscu_val in vals.items():
-            w = rscu_val / max_rscu
-            # Floor at a small epsilon to avoid log(0) in geometric mean
-            weights[codon] = max(w, 1e-6)
-
+            weights[codon] = max(rscu_val / max_rscu, 1e-6)
     return weights
 
 
@@ -1079,129 +341,493 @@ def _compute_core_cai(
     adaptation_weights: dict[str, float],
     min_length: int = MIN_GENE_LENGTH,
 ) -> dict[str, float]:
-    """Compute CAI of each gene relative to the core-cluster codon preferences.
-
-    CAI (Sharp & Li 1987) is the geometric mean of the per-codon adaptation
-    weights across all sense codons in a gene.  Codons not present in the
-    weight table (stops, Met, Trp, or missing families) are skipped.
-
-    Args:
-        ffn_path: Nucleotide CDS FASTA.
-        adaptation_weights: Codon → weight from _rscu_to_adaptation_weights().
-        min_length: Minimum sequence length (nt).
-
-    Returns:
-        Dict mapping gene ID → core-relative CAI (0–1 scale).
-    """
+    """CAI of each gene relative to core-cluster codon preferences."""
     from codonpipe.modules.rscu import dna_to_rna
-
     gene_cai: dict[str, float] = {}
-
     for rec in SeqIO.parse(str(ffn_path), "fasta"):
         seq = str(rec.seq)
         if len(seq) < min_length:
             continue
-
         rna = dna_to_rna(seq)
-        log_sum = 0.0
-        n = 0
+        log_sum, n = 0.0, 0
         for i in range(0, len(rna) - 2, 3):
-            codon = rna[i : i + 3]
+            codon = rna[i:i + 3]
             if codon in adaptation_weights:
                 log_sum += np.log(adaptation_weights[codon])
                 n += 1
-
         if n > 0:
             gene_cai[rec.id] = float(np.exp(log_sum / n))
-        # else: gene has no scoreable codons, omit from dict
-
     return gene_cai
 
 
-def _identify_rare_codons(
-    rscu_series: pd.Series,
-    threshold: float = 0.1,
-) -> set[str]:
-    """Return the set of RNA codons whose RSCU falls below *threshold*.
-
-    These are codons that the reference gene pool (core cluster or whole
-    genome) essentially never uses.  A codon with RSCU < 0.1 in a family
-    of 4 synonymous codons means it accounts for <2.5% of usage for that
-    amino acid.
-
-    Args:
-        rscu_series: RSCU values indexed by column names like 'Ala-GCU'.
-        threshold: RSCU below this value flags the codon as rare.
-
-    Returns:
-        Set of RNA codon triplets (e.g. {'CUA', 'AGA', ...}).
-    """
+def _identify_rare_codons(rscu_series: pd.Series, threshold: float = 0.1) -> set[str]:
+    """Codons with RSCU below threshold."""
     rare: set[str] = set()
     for col, val in rscu_series.items():
-        if pd.isna(val):
+        if pd.isna(val) or val >= threshold:
             continue
-        if val < threshold:
-            codon = RSCU_COL_TO_CODON.get(col)
-            if codon:
-                rare.add(codon)
+        codon = RSCU_COL_TO_CODON.get(col)
+        if codon:
+            rare.add(codon)
     return rare
 
 
 def _count_rare_codons_per_gene(
-    ffn_path: Path,
-    rare_codons: set[str],
-    min_length: int = MIN_GENE_LENGTH,
+    ffn_path: Path, rare_codons: set[str], min_length: int = MIN_GENE_LENGTH,
 ) -> dict[str, int]:
-    """Count how many sense-codon positions in each gene use a rare codon.
-
-    Args:
-        ffn_path: Nucleotide CDS FASTA.
-        rare_codons: Set of RNA triplets considered rare.
-        min_length: Minimum sequence length (nt).
-
-    Returns:
-        Dict mapping gene ID → count of rare-codon positions.
-    """
+    """Count rare-codon positions per gene."""
     from codonpipe.modules.rscu import dna_to_rna
-
     gene_counts: dict[str, int] = {}
     for rec in SeqIO.parse(str(ffn_path), "fasta"):
         seq = str(rec.seq)
         if len(seq) < min_length:
             continue
         rna = dna_to_rna(seq)
-        n_rare = 0
-        for i in range(0, len(rna) - 2, 3):
-            codon = rna[i : i + 3]
-            if codon in rare_codons:
-                n_rare += 1
+        n_rare = sum(1 for i in range(0, len(rna) - 2, 3) if rna[i:i + 3] in rare_codons)
         gene_counts[rec.id] = n_rare
     return gene_counts
 
 
-def _compute_genome_wide_rscu(ffn_path: Path, min_length: int = MIN_GENE_LENGTH) -> pd.Series:
-    """Pool codon counts across all genes and compute genome-wide RSCU.
+# ---------------------------------------------------------------------------
+# RP sub-cluster detection
+# ---------------------------------------------------------------------------
 
-    Args:
-        ffn_path: Nucleotide CDS FASTA.
-        min_length: Minimum sequence length (nt).
+def _detect_rp_subclusters(
+    X_rp: np.ndarray,
+    rp_gene_ids_list: list[str],
+    max_k: int = _RP_SUBCLUSTER_MAX_K,
+) -> list[dict]:
+    """Detect RP sub-populations via GMM+BIC on first 2 COA axes.
 
-    Returns:
-        Series indexed by RSCU column names with genome-wide RSCU values.
+    Returns a list of sub-cluster dicts, each with keys:
+      X, gene_ids, label, n, avg_dist
+    Sorted by n (largest first).  Returns a single-element list if
+    no split is detected.
     """
-    total_counts: Counter = Counter()
-    for rec in SeqIO.parse(str(ffn_path), "fasta"):
-        seq = str(rec.seq)
-        if len(seq) < min_length:
+    n_rp = len(X_rp)
+    if n_rp < _RP_SUBCLUSTER_MIN:
+        return [{"X": X_rp, "gene_ids": rp_gene_ids_list, "label": 0,
+                 "n": n_rp, "avg_dist": 0.0}]
+
+    X_2d = X_rp[:, :2] if X_rp.shape[1] >= 2 else X_rp
+
+    best_k, best_bic = 1, np.inf
+    gmm_best = None
+    for k in range(1, min(max_k + 1, n_rp)):
+        try:
+            gmm = GaussianMixture(n_components=k, random_state=42,
+                                  covariance_type="full", n_init=3)
+            gmm.fit(X_2d)
+            bic = gmm.bic(X_2d)
+            if bic < best_bic:
+                best_bic, best_k, gmm_best = bic, k, gmm
+        except Exception:
+            pass
+
+    if best_k <= 1 or gmm_best is None:
+        return [{"X": X_rp, "gene_ids": rp_gene_ids_list, "label": 0,
+                 "n": n_rp, "avg_dist": 0.0}]
+
+    labels = gmm_best.predict(X_2d)
+    min_members = max(3, int(_RP_SUBCLUSTER_MIN_FRAC * n_rp))
+    subclusters = []
+
+    for lab in sorted(set(labels)):
+        mask = labels == lab
+        X_sub = X_rp[mask]
+        n_sub = len(X_sub)
+        if n_sub < min_members:
             continue
-        total_counts += count_codons(seq)
+        centroid_sub = X_sub.mean(axis=0)
+        avg_dist = float(np.mean(np.linalg.norm(X_sub - centroid_sub, axis=1)))
+        sub_ids = [gid for gid, sel in zip(rp_gene_ids_list, mask) if sel]
+        subclusters.append({"X": X_sub, "gene_ids": sub_ids, "label": int(lab),
+                            "n": n_sub, "avg_dist": avg_dist})
 
-    if not total_counts:
-        return pd.Series(dtype=float)
+    if not subclusters:
+        return [{"X": X_rp, "gene_ids": rp_gene_ids_list, "label": 0,
+                 "n": n_rp, "avg_dist": 0.0}]
 
-    rscu_dict = compute_rscu_from_counts(total_counts)
-    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_dict]
-    return pd.Series({c: rscu_dict[c] for c in rscu_cols})
+    # Sort by number of RP genes (largest first)
+    subclusters.sort(key=lambda s: -s["n"])
+
+    logger.info(
+        "RP sub-cluster detection: BIC favours k=%d, %d qualifying sub-clusters "
+        "(sizes: %s)",
+        best_k, len(subclusters), [s["n"] for s in subclusters],
+    )
+    return subclusters
+
+
+# ---------------------------------------------------------------------------
+# Density-peak detection (supports multiple peaks)
+# ---------------------------------------------------------------------------
+
+def _detect_density_peaks(
+    X: np.ndarray,
+    gene_ids: list[str],
+    n_axes: int,
+    bandwidth: str = _DENSITY_KDE_BANDWIDTH,
+    seed_radius_pctl: int = _DENSITY_SEED_RADIUS_PCTL,
+) -> list[dict]:
+    """Find one or more density peaks in COA space via 2-D KDE.
+
+    Returns a list of peak dicts, each with:
+      centroid, cov, cov_inv, seed_gene_ids, peak_xy, n_seed
+    Sorted by seed size (largest first).
+    """
+    from scipy.stats import gaussian_kde
+    from scipy.ndimage import label as ndimage_label, maximum_position
+
+    # KDE on first 2 axes
+    x2d = X[:, :2].T
+    try:
+        kde = gaussian_kde(x2d, bw_method=bandwidth)
+    except Exception as e:
+        logger.warning("Density KDE failed: %s; using median as single peak", e)
+        return [_build_single_density_peak(X, gene_ids, n_axes, np.median(X[:, :2], axis=0),
+                                           seed_radius_pctl)]
+
+    # Evaluate on a grid
+    grid_n = 200
+    x_min, x_max = X[:, 0].min(), X[:, 0].max()
+    y_min, y_max = X[:, 1].min(), X[:, 1].max()
+    pad_x, pad_y = (x_max - x_min) * 0.05, (y_max - y_min) * 0.05
+    gx = np.linspace(x_min - pad_x, x_max + pad_x, grid_n)
+    gy = np.linspace(y_min - pad_y, y_max + pad_y, grid_n)
+    gxx, gyy = np.meshgrid(gx, gy)
+    grid_pts = np.vstack([gxx.ravel(), gyy.ravel()])
+    density = kde(grid_pts).reshape(grid_n, grid_n)
+
+    # Find multiple peaks: threshold at 50% of max density, label connected regions
+    threshold_density = density.max() * 0.5
+    binary = density > threshold_density
+    labeled, n_regions = ndimage_label(binary)
+
+    peaks_2d = []
+    for region_id in range(1, n_regions + 1):
+        region_mask = labeled == region_id
+        # Peak is the max-density point within this region
+        region_density = np.where(region_mask, density, 0.0)
+        peak_idx = np.unravel_index(np.argmax(region_density), density.shape)
+        peak_2d = np.array([gx[peak_idx[1]], gy[peak_idx[0]]])
+        peaks_2d.append(peak_2d)
+
+    if not peaks_2d:
+        # Fallback: single global peak
+        peak_idx = np.argmax(density)
+        peak_2d = grid_pts[:, np.argmax(density.ravel())]
+        peaks_2d = [peak_2d]
+
+    # Build a cluster for each peak
+    min_seed_genes = max(10, int(_DENSITY_MULTI_PEAK_MIN_FRAC * len(gene_ids)))
+    results = []
+    for peak_2d in peaks_2d:
+        peak_info = _build_single_density_peak(
+            X, gene_ids, n_axes, peak_2d, seed_radius_pctl,
+        )
+        if peak_info["n_seed"] >= min_seed_genes:
+            results.append(peak_info)
+
+    if not results:
+        # Fall back to the global peak
+        global_peak = grid_pts[:, np.argmax(density.ravel())]
+        results = [_build_single_density_peak(X, gene_ids, n_axes, global_peak, seed_radius_pctl)]
+
+    # Sort by seed size (most genes first)
+    results.sort(key=lambda p: -p["n_seed"])
+
+    logger.info(
+        "Density-peak detection: %d qualifying peaks (seed sizes: %s)",
+        len(results), [p["n_seed"] for p in results],
+    )
+    return results
+
+
+def _build_single_density_peak(
+    X: np.ndarray,
+    gene_ids: list[str],
+    n_axes: int,
+    peak_2d: np.ndarray,
+    seed_radius_pctl: int,
+) -> dict:
+    """Build centroid/covariance for a single density peak."""
+    # Full-dimensional peak vector
+    if n_axes > 2:
+        peak_full = np.concatenate([peak_2d, np.median(X[:, 2:n_axes], axis=0)])
+    else:
+        peak_full = peak_2d.copy()
+
+    # Seed genes within percentile radius
+    dists = np.linalg.norm(X[:, :n_axes] - peak_full, axis=1)
+    radius = float(np.percentile(dists, seed_radius_pctl))
+    seed_mask = dists <= radius
+    seed_ids = [gid for gid, s in zip(gene_ids, seed_mask) if s]
+    X_seed = X[seed_mask][:, :n_axes]
+
+    # Fit covariance on seed
+    n_seed = len(X_seed)
+    if n_seed >= _MIN_RP_FOR_ROBUST:
+        try:
+            sf = max(0.5, min(0.9, (n_seed - 2) / n_seed))
+            mcd = MinCovDet(random_state=42, support_fraction=sf).fit(X_seed)
+            centroid, cov = mcd.location_, mcd.covariance_
+        except Exception:
+            centroid, cov = X_seed.mean(axis=0), _empirical_cov(X_seed)
+    else:
+        centroid = X_seed.mean(axis=0) if n_seed > 0 else peak_full
+        cov = _empirical_cov(X_seed) if n_seed > 1 else np.eye(n_axes)
+
+    return {
+        "centroid": centroid,
+        "cov": cov,
+        "cov_inv": _safe_inv(cov),
+        "seed_gene_ids": seed_ids,
+        "peak_xy": [float(peak_2d[0]), float(peak_2d[1])],
+        "n_seed": n_seed,
+        "seed_radius": float(radius),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap RP centroid stabilisation
+# ---------------------------------------------------------------------------
+
+def _bootstrap_rp_centroid(
+    X_rp: np.ndarray,
+    n_axes: int,
+    n_bootstraps: int = _DEFAULT_N_BOOTSTRAPS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Bootstrap the RP centroid and covariance for stability.
+
+    Resamples RP genes with replacement B times, fits robust covariance
+    each time, and returns the mean centroid, mean covariance, and
+    its inverse.
+    """
+    n_rp = len(X_rp)
+    if n_rp < 3:
+        centroid = X_rp.mean(axis=0)
+        cov = _empirical_cov(X_rp)
+        return centroid, cov, _safe_inv(cov)
+
+    rng = np.random.RandomState(42)
+    centroids = []
+    covs = []
+
+    for b in range(n_bootstraps):
+        boot_idx = rng.choice(n_rp, size=n_rp, replace=True)
+        X_boot = X_rp[boot_idx]
+        c, cv, _, _ = _fit_robust_rp_reference(X_boot, n_axes)
+        centroids.append(c)
+        covs.append(cv)
+
+    mean_centroid = np.mean(centroids, axis=0)
+    mean_cov = np.mean(covs, axis=0)
+
+    logger.info(
+        "Bootstrap RP centroid: %d replicates, centroid spread (std) = %.4f",
+        n_bootstraps, float(np.std([np.linalg.norm(c - mean_centroid) for c in centroids])),
+    )
+
+    return mean_centroid, mean_cov, _safe_inv(mean_cov)
+
+
+# ---------------------------------------------------------------------------
+# Unified cluster fitting
+# ---------------------------------------------------------------------------
+
+def _fit_cluster(
+    X: np.ndarray,
+    gene_ids: list[str],
+    centroid: np.ndarray,
+    cov: np.ndarray,
+    cov_inv: np.ndarray,
+    n_axes: int,
+    chi2_p: float,
+    ffn_path: Path | None,
+    rscu_gene_df: pd.DataFrame,
+    anchor_gene_ids: set[str] | None = None,
+    outlier_mask: np.ndarray | None = None,
+) -> dict:
+    """Fit a single Mahalanobis cluster with chi-squared boundary.
+
+    This is the shared engine for both RP and density clusters.
+
+    Returns a dict with: distances, threshold, cluster_gene_ids,
+    cluster_rscu, probabilities, gene_weights, gene_core_cai,
+    core_rare_per_gene, genome_rare_per_gene, n_cluster.
+    """
+    distances = _compute_mahalanobis_distances(X[:, :n_axes], centroid, cov_inv)
+    threshold = _chi2_threshold(n_axes, chi2_p)
+    optimised_mask = distances <= threshold
+    cluster_gene_ids = {gid for gid, opt in zip(gene_ids, optimised_mask) if opt}
+    probabilities = _distance_to_membership(distances, threshold)
+
+    # Distance-weighted RSCU
+    gene_weights = {}
+    for gid, d in zip(gene_ids, distances):
+        if gid in cluster_gene_ids:
+            w = max(1.0 - d / threshold, 0.0) if threshold > 0 else 1.0
+            if w > 0:
+                gene_weights[gid] = w
+
+    cluster_rscu = pd.Series(dtype=float)
+    if ffn_path and ffn_path.exists():
+        cluster_rscu = _compute_cluster_rscu(ffn_path, cluster_gene_ids, gene_weights=gene_weights)
+    elif cluster_gene_ids:
+        rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
+        cluster_df = rscu_gene_df[rscu_gene_df["gene"].isin(cluster_gene_ids)].copy()
+        if not cluster_df.empty:
+            w_arr = cluster_df["gene"].map(gene_weights).fillna(0.0).values
+            w_sum = w_arr.sum()
+            if w_sum > 0:
+                cluster_rscu = cluster_df[rscu_cols].multiply(w_arr, axis=0).sum() / w_sum
+            else:
+                cluster_rscu = cluster_df[rscu_cols].mean()
+
+    # Core-CAI
+    gene_core_cai: dict[str, float] = {}
+    if not cluster_rscu.empty and ffn_path and ffn_path.exists():
+        adapt_w = _rscu_to_adaptation_weights(cluster_rscu)
+        if adapt_w:
+            gene_core_cai = _compute_core_cai(ffn_path, adapt_w)
+
+    # Rare codons
+    core_rare_per_gene: dict[str, int] = {}
+    genome_rare_per_gene: dict[str, int] = {}
+    if not cluster_rscu.empty and ffn_path and ffn_path.exists():
+        core_rare = _identify_rare_codons(cluster_rscu)
+        if core_rare:
+            core_rare_per_gene = _count_rare_codons_per_gene(ffn_path, core_rare)
+        genome_rscu = _compute_genome_wide_rscu(ffn_path)
+        if not genome_rscu.empty:
+            genome_rare = _identify_rare_codons(genome_rscu)
+            if genome_rare:
+                genome_rare_per_gene = _count_rare_codons_per_gene(ffn_path, genome_rare)
+
+    # Anchor-gene counts (RP genes in RP cluster, or seed genes in density cluster)
+    n_anchor_in_cluster = 0
+    if anchor_gene_ids:
+        n_anchor_in_cluster = len(cluster_gene_ids & anchor_gene_ids)
+
+    return {
+        "centroid": centroid,
+        "cov": cov,
+        "cov_inv": cov_inv,
+        "distances": distances,
+        "threshold": threshold,
+        "cluster_gene_ids": cluster_gene_ids,
+        "cluster_rscu": cluster_rscu,
+        "probabilities": probabilities,
+        "gene_weights": gene_weights,
+        "gene_core_cai": gene_core_cai,
+        "core_rare_per_gene": core_rare_per_gene,
+        "genome_rare_per_gene": genome_rare_per_gene,
+        "n_cluster": len(cluster_gene_ids),
+        "n_anchor_in_cluster": n_anchor_in_cluster,
+        "outlier_mask": outlier_mask if outlier_mask is not None else np.array([], dtype=bool),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Translational selection strength classification
+# ---------------------------------------------------------------------------
+
+def _classify_translational_selection(
+    rp_vs_density_cosine: float | None,
+    dual_anchor_categories: Counter | None,
+    rp_centroid: np.ndarray | None,
+    density_centroid: np.ndarray | None,
+    gene_spread_median: float | None,
+) -> dict:
+    """Classify translational selection strength via three criteria."""
+    evidence: dict[str, dict] = {}
+    strong_votes, weak_votes = 0, 0
+
+    # Criterion 1: RSCU cosine
+    if rp_vs_density_cosine is not None and not np.isnan(rp_vs_density_cosine):
+        if rp_vs_density_cosine < _TSS_COSINE_STRONG:
+            strong_votes += 1; verdict = "strong"
+        elif rp_vs_density_cosine > _TSS_COSINE_WEAK:
+            weak_votes += 1; verdict = "weak"
+        else:
+            verdict = "moderate"
+        evidence["rscu_cosine"] = {
+            "value": round(rp_vs_density_cosine, 4),
+            "strong_threshold": f"< {_TSS_COSINE_STRONG}",
+            "weak_threshold": f"> {_TSS_COSINE_WEAK}",
+            "verdict": verdict,
+        }
+
+    # Criterion 2: rp_only fraction
+    if dual_anchor_categories is not None:
+        n_rp_only = dual_anchor_categories.get("rp_only", 0)
+        n_both = dual_anchor_categories.get("both", 0)
+        denom = n_rp_only + n_both
+        if denom > 0:
+            frac = n_rp_only / denom
+            if frac > _TSS_RPONLY_FRAC_STRONG:
+                strong_votes += 1; verdict = "strong"
+            elif frac < _TSS_RPONLY_FRAC_WEAK:
+                weak_votes += 1; verdict = "weak"
+            else:
+                verdict = "moderate"
+            evidence["rp_only_fraction"] = {
+                "value": round(frac, 4), "n_rp_only": n_rp_only, "n_both": n_both,
+                "strong_threshold": f"> {_TSS_RPONLY_FRAC_STRONG}",
+                "weak_threshold": f"< {_TSS_RPONLY_FRAC_WEAK}",
+                "verdict": verdict,
+            }
+
+    # Criterion 3: Centroid separation
+    if (rp_centroid is not None and density_centroid is not None
+            and gene_spread_median is not None and gene_spread_median > 0):
+        min_len = min(len(rp_centroid), len(density_centroid))
+        raw_dist = float(np.linalg.norm(rp_centroid[:min_len] - density_centroid[:min_len]))
+        normed = raw_dist / gene_spread_median
+        if normed > 0.5:
+            strong_votes += 1; verdict = "strong"
+        elif normed < 0.15:
+            weak_votes += 1; verdict = "weak"
+        else:
+            verdict = "moderate"
+        evidence["centroid_separation"] = {
+            "raw_distance": round(raw_dist, 4), "normalised": round(normed, 4),
+            "strong_threshold": "> 0.5", "weak_threshold": "< 0.15", "verdict": verdict,
+        }
+
+    # Overall
+    if strong_votes >= 2:
+        classification = "strong"
+    elif weak_votes >= 2:
+        classification = "weak"
+    else:
+        classification = "moderate"
+
+    caveats = {
+        "strong": None,
+        "moderate": (
+            "Translational selection signal is moderate. RP-based expression "
+            "scores (MELP, CAI, Fop) should be interpreted with caution."
+        ),
+        "weak": (
+            "Translational selection signal is weak. RP codon preferences are "
+            "nearly indistinguishable from the genome-wide average, so "
+            "RP-based expression scores (MELP, CAI, Fop) are unreliable. "
+            "Consider alternative expression proxies or external data."
+        ),
+    }
+
+    result = {
+        "classification": classification, "evidence": evidence,
+        "strong_votes": strong_votes, "weak_votes": weak_votes,
+        "caveat": caveats[classification],
+    }
+    logger.info("Translational selection strength: %s (strong=%d, weak=%d)",
+                classification.upper(), strong_votes, weak_votes)
+    if result["caveat"]:
+        logger.warning("TSS: %s", result["caveat"])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1222,61 +848,38 @@ def _plot_coa_mahalanobis(
     sample_id: str,
     inertia_pcts: tuple[float, float] = (0.0, 0.0),
 ) -> None:
-    """COA scatter colored by RSCU weight (1 - d/threshold), with threshold ellipse.
-
-    Genes inside the threshold are colored on a blue-to-yellow gradient
-    representing their contribution weight to the pooled RSCU estimate
-    (1.0 at the centroid, 0.0 at the boundary).  Genes outside the
-    threshold are shown in pale gray.
-    """
+    """COA scatter colored by RSCU weight with threshold ellipse."""
     plt.rcParams.update(STYLE_PARAMS)
     fig, ax = plt.subplots(figsize=(8, 6))
 
     x = coa_coords["Axis1"].values
     y = coa_coords["Axis2"].values
-
-    # Compute per-gene weight: 1 - d/threshold, clipped to [0, 1]
     weights = np.clip(1.0 - distances / threshold, 0.0, 1.0) if threshold > 0 else np.ones_like(distances)
     opt_mask = distances <= threshold
 
-    # Non-optimized genes in pale gray
-    ax.scatter(
-        x[~opt_mask], y[~opt_mask],
-        c="#d0d0d0", alpha=0.25, s=8, edgecolors="none", rasterized=True,
-        label=f"Non-optimized (n={int((~opt_mask).sum())})",
-    )
-
-    # Optimized genes colored by weight
+    ax.scatter(x[~opt_mask], y[~opt_mask], c="#d0d0d0", alpha=0.25, s=8,
+               edgecolors="none", rasterized=True,
+               label=f"Non-optimized (n={int((~opt_mask).sum())})")
     norm = mcolors.Normalize(vmin=0, vmax=1)
-    sc = ax.scatter(
-        x[opt_mask], y[opt_mask],
-        c=weights[opt_mask], cmap="YlGnBu", norm=norm,
-        alpha=0.7, s=14, edgecolors="none", rasterized=True,
-    )
+    sc = ax.scatter(x[opt_mask], y[opt_mask], c=weights[opt_mask], cmap="YlGnBu",
+                    norm=norm, alpha=0.7, s=14, edgecolors="none", rasterized=True)
     cbar = fig.colorbar(sc, ax=ax, shrink=0.8)
-    cbar.set_label("RSCU weight (1 − d/threshold)", fontsize=9)
+    cbar.set_label("RSCU weight (1 - d/threshold)", fontsize=9)
 
-    # Mark RP genes
     rp_idx = [i for i, g in enumerate(gene_ids) if g in rp_gene_ids]
     if rp_idx:
-        ax.scatter(
-            x[rp_idx], y[rp_idx],
-            facecolors="none", edgecolors="black", s=40, linewidths=0.8,
-            label=f"Ribosomal proteins (n={len(rp_idx)})", zorder=5,
-        )
+        ax.scatter(x[rp_idx], y[rp_idx], facecolors="none", edgecolors="black",
+                   s=40, linewidths=0.8,
+                   label=f"Ribosomal proteins (n={len(rp_idx)})", zorder=5)
 
-    # Mark RP outliers in red
     rp_idx_arr = np.array(rp_idx)
     if rp_outlier_mask.any() and len(rp_idx_arr) == len(rp_outlier_mask):
         outlier_idx = rp_idx_arr[rp_outlier_mask]
         if len(outlier_idx) > 0:
-            ax.scatter(
-                x[outlier_idx], y[outlier_idx],
-                marker="x", color="#d7191c", s=50, linewidths=1.5,
-                label=f"RP outliers (n={len(outlier_idx)})", zorder=6,
-            )
+            ax.scatter(x[outlier_idx], y[outlier_idx], marker="x", color="#d7191c",
+                       s=50, linewidths=1.5,
+                       label=f"RP outliers (n={len(outlier_idx)})", zorder=6)
 
-    # Draw threshold ellipse on axes 1 & 2
     try:
         cov_2d = cov[:2, :2]
         eigvals, eigvecs = np.linalg.eigh(cov_2d)
@@ -1287,18 +890,13 @@ def _plot_coa_mahalanobis(
             ellipse = mpatches.Ellipse(
                 (centroid[0], centroid[1]), width, height, angle=angle,
                 linewidth=1.5, edgecolor="#d7191c", facecolor="none",
-                linestyle="--", alpha=0.7, label=f"Threshold (d={threshold:.1f})",
-            )
+                linestyle="--", alpha=0.7, label=f"Threshold (d={threshold:.1f})")
             ax.add_patch(ellipse)
-    except Exception as e:
-        logger.debug("Could not draw threshold ellipse: %s", e)
+    except Exception:
+        pass
 
-    # RP centroid
-    ax.scatter(
-        centroid[0], centroid[1], marker="*", s=200,
-        color="#d7191c", edgecolors="black", linewidths=0.5,
-        zorder=7, label="RP centroid",
-    )
+    ax.scatter(centroid[0], centroid[1], marker="*", s=200, color="#d7191c",
+               edgecolors="black", linewidths=0.5, zorder=7, label="RP centroid")
 
     pct1, pct2 = inertia_pcts
     ax.set_xlabel(f"COA Axis 1 ({pct1:.1f}% inertia)")
@@ -1318,12 +916,7 @@ def _plot_distance_histogram(
     output_path: Path,
     sample_id: str,
 ) -> None:
-    """Histogram of Mahalanobis distances with weight function overlay.
-
-    Left y-axis: gene counts (all genes in blue, RP genes in red).
-    Right y-axis: RSCU weight curve (1 − d/threshold), showing how
-    much each gene contributes to the pooled RSCU at its distance.
-    """
+    """Histogram of Mahalanobis distances with weight function overlay."""
     plt.rcParams.update(STYLE_PARAMS)
     fig, ax = plt.subplots(figsize=(7, 4.5))
 
@@ -1333,26 +926,23 @@ def _plot_distance_histogram(
     ax.hist(rp_distances, bins=bins, color="#d7191c", alpha=0.55, label="RP genes")
     ax.axvline(threshold, color="#fdae61", linewidth=2, linestyle="--",
                label=f"Threshold (d={threshold:.2f})")
-    ax.axvline(np.median(rp_distances), color="#abd9e9", linewidth=1.5,
-               linestyle=":", label=f"Median RP (d={np.median(rp_distances):.2f})")
+    ax.axvline(np.median(rp_distances), color="#abd9e9", linewidth=1.5, linestyle=":",
+               label=f"Median RP (d={np.median(rp_distances):.2f})")
 
     n_opt = (distances <= threshold).sum()
     ax.set_xlabel("Mahalanobis distance from RP centroid")
     ax.set_ylabel("Number of genes")
 
-    # Weight function on secondary y-axis
     ax2 = ax.twinx()
     d_line = np.linspace(0, x_max, 300)
     w_line = np.clip(1.0 - d_line / threshold, 0.0, 1.0) if threshold > 0 else np.ones_like(d_line)
     ax2.plot(d_line, w_line, color="#2ca02c", linewidth=2, alpha=0.85, label="RSCU weight")
     ax2.fill_between(d_line, 0, w_line, color="#2ca02c", alpha=0.08)
-    ax2.set_ylabel("RSCU weight (1 − d/threshold)", color="#2ca02c", fontsize=9)
+    ax2.set_ylabel("RSCU weight (1 - d/threshold)", color="#2ca02c", fontsize=9)
     ax2.tick_params(axis="y", labelcolor="#2ca02c")
     ax2.set_ylim(-0.05, 1.1)
 
     ax.set_title(f"{sample_id}: distance distribution ({n_opt} genes in optimized set)")
-
-    # Combined legend
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax.legend(lines1 + lines2, labels1 + labels2, fontsize=7.5, framealpha=0.7, loc="upper right")
@@ -1375,49 +965,30 @@ def _plot_rp_outlier_detection(
     """Scatter of RP genes in COA space with outliers highlighted."""
     plt.rcParams.update(STYLE_PARAMS)
     fig, ax = plt.subplots(figsize=(6, 5))
-
     x = coa_coords["Axis1"].values
     y = coa_coords["Axis2"].values
-
-    # All genes, pale background
     ax.scatter(x, y, c="#cccccc", alpha=0.15, s=6, edgecolors="none", rasterized=True)
 
-    # RP genes
     rp_idx = np.array([i for i, g in enumerate(gene_ids) if g in rp_gene_ids])
     if len(rp_idx) == 0:
-        plt.close(fig)
-        return
+        plt.close(fig); return
 
     if len(rp_idx) == len(rp_outlier_mask):
         non_outlier_rp = rp_idx[~rp_outlier_mask]
         outlier_rp = rp_idx[rp_outlier_mask]
     else:
-        logger.warning(
-            "RP index / outlier mask shape mismatch (%d vs %d); "
-            "using all RP genes with no outlier removal",
-            len(rp_idx), len(rp_outlier_mask),
-        )
         non_outlier_rp = rp_idx
         outlier_rp = np.array([])
 
-    ax.scatter(
-        x[non_outlier_rp], y[non_outlier_rp],
-        c="#2c7bb6", s=30, alpha=0.8, edgecolors="black", linewidths=0.5,
-        label=f"RP non-outlier (n={len(non_outlier_rp)})",
-    )
+    ax.scatter(x[non_outlier_rp], y[non_outlier_rp], c="#2c7bb6", s=30, alpha=0.8,
+               edgecolors="black", linewidths=0.5,
+               label=f"RP non-outlier (n={len(non_outlier_rp)})")
     if len(outlier_rp) > 0:
-        ax.scatter(
-            x[outlier_rp], y[outlier_rp],
-            marker="x", c="#d7191c", s=60, linewidths=1.5,
-            label=f"RP outlier (n={len(outlier_rp)})", zorder=5,
-        )
+        ax.scatter(x[outlier_rp], y[outlier_rp], marker="x", c="#d7191c", s=60,
+                   linewidths=1.5, label=f"RP outlier (n={len(outlier_rp)})", zorder=5)
 
-    ax.set_xlabel("COA Axis 1")
-    ax.set_ylabel("COA Axis 2")
-    ax.set_title(
-        f"{sample_id}: RP outlier detection "
-        f"(chi2 crit={chi2_crit:.2f}, alpha={_RP_OUTLIER_ALPHA})"
-    )
+    ax.set_xlabel("COA Axis 1"); ax.set_ylabel("COA Axis 2")
+    ax.set_title(f"{sample_id}: RP outlier detection (chi2 crit={chi2_crit:.2f})")
     ax.legend(fontsize=8, framealpha=0.7)
 
     for fmt in FORMATS:
@@ -1440,98 +1011,58 @@ def _plot_dual_anchor_coa(
     sample_id: str,
     inertia_pcts: tuple[float, float] = (0.0, 0.0),
 ) -> None:
-    """COA scatter colored by dual-anchor category with both threshold ellipses.
-
-    Four categories are rendered in distinct colours:
-      both      — teal
-      rp_only   — coral red
-      dens_only — steel blue
-      neither   — light grey
-    """
+    """COA scatter colored by dual-anchor category with both threshold ellipses."""
     plt.rcParams.update(STYLE_PARAMS)
     fig, ax = plt.subplots(figsize=(9, 7))
-
     x = coa_coords["Axis1"].values
     y = coa_coords["Axis2"].values
 
-    cat_colors = {
-        "both": "#1b9e77",
-        "rp_only": "#d95f02",
-        "dens_only": "#7570b3",
-        "neither": "#d0d0d0",
-    }
-    cat_labels = {
-        "both": "Both clusters",
-        "rp_only": "RP-cluster only",
-        "dens_only": "Density-cluster only",
-        "neither": "Neither",
-    }
-    cat_alphas = {
-        "both": 0.7, "rp_only": 0.7, "dens_only": 0.7, "neither": 0.35,
-    }
-    cat_sizes = {
-        "both": 14, "rp_only": 14, "dens_only": 14, "neither": 8,
-    }
+    cat_colors = {"both": "#1b9e77", "rp_only": "#d95f02",
+                  "dens_only": "#7570b3", "neither": "#d0d0d0"}
+    cat_labels = {"both": "Both clusters", "rp_only": "RP-cluster only",
+                  "dens_only": "Density-cluster only", "neither": "Neither"}
+    cat_alphas = {"both": 0.7, "rp_only": 0.7, "dens_only": 0.7, "neither": 0.35}
+    cat_sizes = {"both": 14, "rp_only": 14, "dens_only": 14, "neither": 8}
 
-    # Plot by category, "neither" first so it's behind
     for cat in ["neither", "dens_only", "rp_only", "both"]:
         mask = np.array([c == cat for c in categories])
         n = int(mask.sum())
         if n == 0:
             continue
-        ax.scatter(
-            x[mask], y[mask],
-            c=cat_colors[cat], alpha=cat_alphas[cat], s=cat_sizes[cat],
-            edgecolors="none", rasterized=True,
-            label=f"{cat_labels[cat]} (n={n})",
-        )
+        ax.scatter(x[mask], y[mask], c=cat_colors[cat], alpha=cat_alphas[cat],
+                   s=cat_sizes[cat], edgecolors="none", rasterized=True,
+                   label=f"{cat_labels[cat]} (n={n})")
 
-    # RP markers
     rp_idx = [i for i, g in enumerate(gene_ids) if g in rp_gene_ids]
     if rp_idx:
-        ax.scatter(
-            x[rp_idx], y[rp_idx],
-            facecolors="none", edgecolors="black", s=40, linewidths=0.8,
-            label=f"Ribosomal proteins (n={len(rp_idx)})", zorder=5,
-        )
+        ax.scatter(x[rp_idx], y[rp_idx], facecolors="none", edgecolors="black",
+                   s=40, linewidths=0.8,
+                   label=f"Ribosomal proteins (n={len(rp_idx)})", zorder=5)
 
-    # Draw ellipses for both anchors
-    def _draw_ellipse(centroid_2d, cov_2d, thresh, color, label, ls):
+    def _draw_ellipse(c2d, cv2d, thresh, color, label, ls):
         try:
-            eigvals, eigvecs = np.linalg.eigh(cov_2d)
+            eigvals, eigvecs = np.linalg.eigh(cv2d)
             if np.all(eigvals > 0):
                 angle = np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1]))
-                width = 2 * thresh * np.sqrt(eigvals[1])
-                height = 2 * thresh * np.sqrt(eigvals[0])
-                ell = mpatches.Ellipse(
-                    (centroid_2d[0], centroid_2d[1]), width, height, angle=angle,
-                    linewidth=1.8, edgecolor=color, facecolor="none",
-                    linestyle=ls, alpha=0.8, label=label,
-                )
+                w = 2 * thresh * np.sqrt(eigvals[1])
+                h = 2 * thresh * np.sqrt(eigvals[0])
+                ell = mpatches.Ellipse((c2d[0], c2d[1]), w, h, angle=angle,
+                                       linewidth=1.8, edgecolor=color, facecolor="none",
+                                       linestyle=ls, alpha=0.8, label=label)
                 ax.add_patch(ell)
-        except Exception as e:
-            logger.debug("Could not draw %s ellipse: %s", label, e)
+        except Exception:
+            pass
 
-    _draw_ellipse(
-        rp_centroid[:2], rp_cov[:2, :2], rp_threshold,
-        "#d95f02", f"RP threshold (d={rp_threshold:.1f})", "--",
-    )
-    _draw_ellipse(
-        density_centroid[:2], density_cov[:2, :2], density_threshold,
-        "#7570b3", f"Density threshold (d={density_threshold:.1f})", ":",
-    )
+    _draw_ellipse(rp_centroid[:2], rp_cov[:2, :2], rp_threshold,
+                  "#d95f02", f"RP threshold (d={rp_threshold:.1f})", "--")
+    _draw_ellipse(density_centroid[:2], density_cov[:2, :2], density_threshold,
+                  "#7570b3", f"Density threshold (d={density_threshold:.1f})", ":")
 
-    # Centroids
-    ax.scatter(
-        rp_centroid[0], rp_centroid[1], marker="*", s=200,
-        color="#d95f02", edgecolors="black", linewidths=0.5,
-        zorder=7, label="RP centroid",
-    )
-    ax.scatter(
-        density_centroid[0], density_centroid[1], marker="D", s=80,
-        color="#7570b3", edgecolors="black", linewidths=0.5,
-        zorder=7, label="Density centroid",
-    )
+    ax.scatter(rp_centroid[0], rp_centroid[1], marker="*", s=200, color="#d95f02",
+               edgecolors="black", linewidths=0.5, zorder=7, label="RP centroid")
+    ax.scatter(density_centroid[0], density_centroid[1], marker="D", s=80,
+               color="#7570b3", edgecolors="black", linewidths=0.5, zorder=7,
+               label="Density centroid")
 
     pct1, pct2 = inertia_pcts
     ax.set_xlabel(f"COA Axis 1 ({pct1:.1f}% inertia)")
@@ -1542,217 +1073,6 @@ def _plot_dual_anchor_coa(
     for fmt in FORMATS:
         fig.savefig(output_path.with_suffix(f".{fmt}"), format=fmt, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Per-subcluster Mahalanobis fitting (Steps 4–8)
-# ---------------------------------------------------------------------------
-
-def _fit_subcluster_pipeline(
-    X: np.ndarray,
-    gene_ids: list[str],
-    X_rp_sub: np.ndarray,
-    rp_ids_sub: list[str],
-    n_axes: int,
-    distance_multiplier: float,
-    ffn_path: "Path | None",
-    rscu_gene_df: pd.DataFrame,
-    rp_rscu_df: "pd.DataFrame | None",
-    chi2_ceiling_p: float | None = None,
-) -> dict | None:
-    """Run Steps 4–8 of the Mahalanobis pipeline for a single RP sub-cluster.
-
-    This is the core fitting logic extracted so that it can be called once
-    per RP sub-cluster when multiple sub-populations exist.
-
-    Returns a dict with: centroid, cov, cov_inv, rp_outlier_mask,
-    rp_indices, rp_gene_ids, distances, threshold, threshold_diag,
-    cluster_gene_ids, cluster_rscu, probabilities, median_rp_dist,
-    rp_dists_all, gene_core_cai, core_rare_per_gene, genome_rare_per_gene,
-    rp_cosine_sim.  Returns None if fitting fails.
-    """
-    rp_gene_ids_set = set(rp_ids_sub)
-    rp_indices = np.array([i for i, g in enumerate(gene_ids) if g in rp_gene_ids_set])
-
-    if len(rp_indices) < 3:
-        return None
-
-    # Step 4: Fit robust RP reference
-    centroid, cov, cov_inv, rp_outlier_mask = _fit_robust_rp_reference(
-        X_rp_sub, n_axes,
-        alpha=_RP_OUTLIER_ALPHA,
-        min_rp=_MIN_RP_FOR_ROBUST,
-    )
-
-    # Step 5: Compute Mahalanobis distances for all genes
-    distances = _compute_mahalanobis_distances(X, centroid, cov_inv)
-    rp_dists_all = distances[rp_indices]
-    rp_dists_clean = rp_dists_all[~rp_outlier_mask]
-    if len(rp_dists_clean) == 0:
-        rp_dists_clean = rp_dists_all
-    median_rp_dist = float(np.median(rp_dists_clean))
-
-    # Step 5b: Adaptive threshold via 2-D projection
-    if n_axes >= 2:
-        centroid_2d = centroid[:2]
-        cov_2d = cov[:2, :2]
-        try:
-            cov_2d_inv = np.linalg.inv(cov_2d)
-        except np.linalg.LinAlgError:
-            cov_2d_inv = np.linalg.pinv(cov_2d)
-
-        distances_2d = _compute_mahalanobis_distances(
-            X[:, :2], centroid_2d, cov_2d_inv,
-        )
-        rp_dists_2d_all = distances_2d[rp_indices]
-        rp_dists_2d_clean = rp_dists_2d_all[~rp_outlier_mask]
-        if len(rp_dists_2d_clean) == 0:
-            rp_dists_2d_clean = rp_dists_2d_all
-        median_rp_2d = float(np.median(rp_dists_2d_clean))
-
-        # When running in sub-cluster mode (chi2_ceiling_p is set), use a
-        # chi-squared ceiling instead of KDE/Otsu adaptive threshold.
-        # Rationale: the adaptive threshold scales with covariance, so a
-        # tighter sub-cluster covariance inflates ALL distances proportionally
-        # and the KDE valley shifts up by the same factor — capturing the
-        # same gene set.  The chi-squared quantile is covariance-independent
-        # and gives a principled boundary: d² ~ chi²(df=2) under multivariate
-        # normality, so sqrt(chi2.ppf(p, 2)) captures p% of the reference
-        # population regardless of scale.
-        if chi2_ceiling_p is not None:
-            chi2_ceil = float(np.sqrt(chi2.ppf(chi2_ceiling_p, df=2)))
-            threshold_2d = chi2_ceil
-            threshold_diag = {
-                "method": "chi2_subcluster",
-                "chi2_ceiling_p": chi2_ceiling_p,
-                "chi2_ceiling_2d": round(chi2_ceil, 4),
-                "median_rp_2d": round(median_rp_2d, 4),
-                "projection": "2d",
-            }
-            logger.info(
-                "Sub-cluster chi² ceiling: 2D threshold=%.3f "
-                "(p=%.3f, df=2, median_rp_2d=%.3f)",
-                chi2_ceil, chi2_ceiling_p, median_rp_2d,
-            )
-        else:
-            threshold_2d, threshold_diag = _find_adaptive_threshold(
-                distances_2d, rp_dists_2d_clean, median_rp_2d,
-                default_multiplier=distance_multiplier,
-            )
-        threshold_diag["projection"] = "2d"
-
-        genes_inside_2d = distances_2d <= threshold_2d
-        if genes_inside_2d.any():
-            full_dists_inside = distances[genes_inside_2d]
-            threshold = float(np.percentile(full_dists_inside, 95))
-            threshold_diag["threshold_2d"] = round(threshold_2d, 4)
-            threshold_diag["n_genes_inside_2d"] = int(genes_inside_2d.sum())
-            threshold_diag["threshold"] = round(threshold, 4)
-            threshold_diag["effective_multiplier"] = round(
-                threshold / median_rp_dist, 4
-            )
-        else:
-            threshold = distance_multiplier * median_rp_dist
-            threshold_diag["threshold"] = round(threshold, 4)
-    else:
-        threshold, threshold_diag = _find_adaptive_threshold(
-            distances, rp_dists_clean, median_rp_dist,
-            default_multiplier=distance_multiplier,
-        )
-        threshold_diag["projection"] = "full"
-
-    # Step 6: Define optimized gene set
-    optimized_mask = distances <= threshold
-    cluster_gene_ids = {
-        gid for gid, opt in zip(gene_ids, optimized_mask) if opt
-    }
-
-    # Soft membership via sigmoid on distance
-    probabilities = _distance_to_membership(distances, threshold)
-
-    # Step 7: Distance-weighted RSCU
-    gene_weights = {}
-    for gid, d in zip(gene_ids, distances):
-        if gid in cluster_gene_ids:
-            w = max(1.0 - d / threshold, 0.0) if threshold > 0 else 1.0
-            if w > 0:
-                gene_weights[gid] = w
-
-    if ffn_path and ffn_path.exists():
-        cluster_rscu = _compute_cluster_rscu(
-            ffn_path, cluster_gene_ids, gene_weights=gene_weights,
-        )
-    else:
-        rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
-        cluster_df = rscu_gene_df[rscu_gene_df["gene"].isin(cluster_gene_ids)].copy()
-        if not cluster_df.empty:
-            w_arr = cluster_df["gene"].map(gene_weights).fillna(0.0).values
-            w_sum = w_arr.sum()
-            if w_sum > 0:
-                cluster_rscu = (cluster_df[rscu_cols].multiply(w_arr, axis=0).sum() / w_sum)
-            else:
-                cluster_rscu = cluster_df[rscu_cols].mean()
-        else:
-            cluster_rscu = pd.Series(dtype=float)
-
-    # Step 7b: Core-relative CAI
-    gene_core_cai: dict[str, float] = {}
-    if not cluster_rscu.empty and ffn_path and ffn_path.exists():
-        adapt_weights = _rscu_to_adaptation_weights(cluster_rscu)
-        if adapt_weights:
-            gene_core_cai = _compute_core_cai(ffn_path, adapt_weights)
-
-    # Step 7c: Rare codon counts
-    _rare_codon_threshold = 0.1
-    core_rare_per_gene: dict[str, int] = {}
-    genome_rare_per_gene: dict[str, int] = {}
-    if not cluster_rscu.empty and ffn_path and ffn_path.exists():
-        core_rare_codons = _identify_rare_codons(cluster_rscu, threshold=_rare_codon_threshold)
-        if core_rare_codons:
-            core_rare_per_gene = _count_rare_codons_per_gene(ffn_path, core_rare_codons)
-        genome_rscu = _compute_genome_wide_rscu(ffn_path)
-        if not genome_rscu.empty:
-            genome_rare_codons = _identify_rare_codons(genome_rscu, threshold=_rare_codon_threshold)
-            if genome_rare_codons:
-                genome_rare_per_gene = _count_rare_codons_per_gene(ffn_path, genome_rare_codons)
-
-    # Step 8: Cosine similarity QC
-    rp_cosine_sim = np.nan
-    if rp_rscu_df is not None and not rp_rscu_df.empty:
-        rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rp_rscu_df.columns and c in cluster_rscu.index]
-        if rscu_cols:
-            rp_only_rscu = rp_rscu_df[rscu_cols].mean()
-            rp_cosine_sim = 1.0 - cosine_dist(
-                cluster_rscu[rscu_cols].fillna(0).values,
-                rp_only_rscu.fillna(0).values,
-            )
-
-    n_rp_in_cluster = len(cluster_gene_ids & rp_gene_ids_set)
-
-    return {
-        "centroid": centroid,
-        "cov": cov,
-        "cov_inv": cov_inv,
-        "rp_outlier_mask": rp_outlier_mask,
-        "rp_indices": rp_indices,
-        "rp_gene_ids": rp_gene_ids_set,
-        "distances": distances,
-        "threshold": threshold,
-        "threshold_diag": threshold_diag,
-        "median_rp_dist": median_rp_dist,
-        "rp_dists_all": rp_dists_all,
-        "cluster_gene_ids": cluster_gene_ids,
-        "cluster_rscu": cluster_rscu,
-        "probabilities": probabilities,
-        "gene_weights": gene_weights,
-        "gene_core_cai": gene_core_cai,
-        "core_rare_per_gene": core_rare_per_gene,
-        "genome_rare_per_gene": genome_rare_per_gene,
-        "rp_cosine_sim": rp_cosine_sim,
-        "n_rp_in_cluster": n_rp_in_cluster,
-        "n_cluster": len(cluster_gene_ids),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -1771,254 +1091,142 @@ def run_mahal_clustering(
     max_k: int = 8,
     distance_multiplier: float = _DISTANCE_MULTIPLIER,
 ) -> dict:
-    """RP-anchored Mahalanobis distance clustering for translational optimization.
+    """Two-cluster Mahalanobis analysis: RP-anchor + density-core.
 
-    Replaces GMM-based clustering. Uses the known RP genes as an anchor to
-    define a Mahalanobis distance threshold in COA space, then classifies
-    all genes within that threshold as translationally optimized.
+    Identifies:
+      1. An RP cluster: tight cluster around bootstrap-stabilised RP centroid
+      2. A density-core cluster: tight cluster around the genome density peak
 
-    Steps:
-        1. Compute COA on per-gene RSCU (reuses advanced_analyses.compute_coa_on_rscu)
-        2. Select top COA axes by cumulative inertia
-        3. Fit robust covariance on RP genes (MinCovDet + two-pass outlier removal)
-        4. Compute Mahalanobis distance from cleaned RP centroid to all genes
-        5. Set threshold at *distance_multiplier* × median RP Mahalanobis distance
-        6. Define optimized gene set as all genes within threshold
-        7. Compute mean RSCU from optimized set via concatenated pooling
-        8. Export gene IDs and diagnostic plots
+    Both use chi-squared boundaries for principled, covariance-independent
+    thresholds.  When multiple RP sub-populations or density peaks exist,
+    the representative cluster is selected by count (most RPs / most genes).
 
-    Args:
-        rscu_gene_df: Per-gene RSCU table (from compute_rscu_per_gene).
-        output_dir: Base output directory for this sample.
-        sample_id: Sample identifier.
-        ffn_path: Path to nucleotide CDS FASTA (for concatenated RSCU pooling).
-        rp_ids_file: Path to text file with ribosomal protein gene IDs.
-        rp_rscu_df: Per-gene RSCU for ribosomal proteins (optional, for
-            validation only).
-        expr_df: Optional expression table (passed to COA for tier annotation).
-        min_k: Unused (kept for signature compatibility).
-        max_k: Unused (kept for signature compatibility).
-        distance_multiplier: Threshold = multiplier × median RP Mahalanobis
-            distance.  Default 2.0.  Lower values (e.g. 1.5) produce a
-            tighter cluster retaining only the most strongly optimised genes;
-            higher values (e.g. 3.0) are more permissive.
-
-    Returns:
-        Dict with:
-            - 'mahal_cluster_gene_ids': set[str] — gene IDs in the optimized set
-            - 'mahal_cluster_rscu': pd.Series — pooled RSCU of optimized set
-            - 'mahal_labels': np.ndarray — binary labels (1=optimized, 0=not)
-            - 'mahal_probabilities': np.ndarray — (n_genes, 2) membership scores
-            - 'mahal_rp_cluster': int — always 1 (the optimized label)
-            - 'mahal_best_k': int — always 2 (optimized vs non-optimized)
-            - 'mahal_bic_scores': list[float] — empty (no BIC)
-            - 'mahal_n_axes': int — number of COA axes used
-            - 'mahal_coa_coords': pd.DataFrame — gene coordinates in COA space
-            - 'mahal_rp_cosine_sim': float — cosine similarity between
-                  optimized-set RSCU and RP-only RSCU
-            - File paths for diagnostics and exports
+    API and return dict are backward-compatible with the previous implementation.
     """
     mahal_dir = output_dir / "mahal_clustering"
     mahal_dir.mkdir(parents=True, exist_ok=True)
     results: dict = {}
 
-    # ── Load RP gene IDs ──────────────────────────────────────────────
+    # ── Load RP gene IDs ─────────────────────────────────────────────
     rp_gene_ids: set[str] = set()
     if rp_ids_file and rp_ids_file.exists():
         rp_gene_ids = {
-            line.strip()
-            for line in rp_ids_file.read_text().splitlines()
+            line.strip() for line in rp_ids_file.read_text().splitlines()
             if line.strip()
         }
     if not rp_gene_ids:
-        logger.warning(
-            "No ribosomal protein IDs available for %s; "
-            "RP-anchored clustering cannot proceed. Skipping.",
-            sample_id,
-        )
+        logger.warning("No RP IDs for %s; clustering cannot proceed.", sample_id)
         return results
 
-    # ── Validate gene count ───────────────────────────────────────────
+    # ── Validate ─────────────────────────────────────────────────────
     n_genes = len(rscu_gene_df)
     if n_genes < _MIN_GENES_FOR_CLUSTERING:
-        logger.warning(
-            "Too few genes for clustering (%d < %d) in %s. Skipping.",
-            n_genes, _MIN_GENES_FOR_CLUSTERING, sample_id,
-        )
+        logger.warning("Too few genes (%d < %d) in %s. Skipping.",
+                        n_genes, _MIN_GENES_FOR_CLUSTERING, sample_id)
         return results
 
-    # ── Step 1: COA ───────────────────────────────────────────────────
-    logger.info("RP-anchored clustering: computing COA on %d genes for %s", n_genes, sample_id)
+    # ── COA ──────────────────────────────────────────────────────────
+    logger.info("Clustering: computing COA on %d genes for %s", n_genes, sample_id)
     coa_results = compute_coa_on_rscu(rscu_gene_df, expr_df=expr_df)
-
     if not coa_results or "coa_coords" not in coa_results:
-        logger.warning("COA failed for %s; skipping clustering", sample_id)
+        logger.warning("COA failed for %s; skipping", sample_id)
         return results
 
     coa_coords = coa_results["coa_coords"]
     coa_inertia = coa_results.get("coa_inertia", pd.DataFrame())
 
-    # ── Step 2: Select axes ───────────────────────────────────────────
+    # ── Axis selection ───────────────────────────────────────────────
     n_axes = _select_n_axes(coa_inertia, _MAX_COA_AXES)
     axis_cols = [f"Axis{i+1}" for i in range(n_axes) if f"Axis{i+1}" in coa_coords.columns]
     n_axes = len(axis_cols)
-
     if n_axes < _MIN_COA_AXES:
-        logger.warning("Insufficient COA axes (%d) for clustering in %s", n_axes, sample_id)
+        logger.warning("Insufficient COA axes (%d) for %s", n_axes, sample_id)
         return results
 
     gene_ids = coa_coords["gene"].astype(str).tolist()
     X = coa_coords[axis_cols].values
-
-    # Remove rows with NaN
     valid_mask = ~np.isnan(X).any(axis=1)
     if valid_mask.sum() < _MIN_GENES_FOR_CLUSTERING:
-        logger.warning("Too few valid genes after NaN removal (%d) in %s", valid_mask.sum(), sample_id)
+        logger.warning("Too few valid genes after NaN removal in %s", sample_id)
         return results
     X = X[valid_mask]
     gene_ids = [g for g, v in zip(gene_ids, valid_mask) if v]
 
-    logger.info(
-        "Using %d COA axes (%.1f%% cumulative inertia) for %d genes",
-        n_axes,
-        coa_inertia["cum_pct"].iloc[n_axes - 1] if len(coa_inertia) >= n_axes else 0,
-        len(gene_ids),
-    )
+    logger.info("Using %d COA axes (%.1f%% cumulative inertia) for %d genes",
+                n_axes,
+                coa_inertia["cum_pct"].iloc[n_axes - 1] if len(coa_inertia) >= n_axes else 0,
+                len(gene_ids))
     results["mahal_n_axes"] = n_axes
 
-    # ── Step 3: Extract RP gene coordinates ───────────────────────────
+    # ── Extract RP genes in COA space ────────────────────────────────
     rp_indices = np.array([i for i, g in enumerate(gene_ids) if g in rp_gene_ids])
     n_rp_found = len(rp_indices)
-
     if n_rp_found < 3:
-        logger.warning(
-            "Only %d RP genes found in COA space for %s; need >= 3. Skipping.",
-            n_rp_found, sample_id,
-        )
+        logger.warning("Only %d RP genes in COA space for %s; need >= 3.", n_rp_found, sample_id)
         return results
 
     X_rp = X[rp_indices]
     rp_ids_list = [gene_ids[i] for i in rp_indices]
-    logger.info(
-        "Found %d/%d RP genes in COA space for %s",
-        n_rp_found, len(rp_gene_ids), sample_id,
-    )
+    logger.info("Found %d/%d RP genes in COA space", n_rp_found, len(rp_gene_ids))
 
-    # ── Step 3b: RP sub-cluster detection ────────────────────────────
-    # When RPs are split into distinct sub-populations in COA space
-    # (e.g. due to HGT, ribosome specialisation, or compositional
-    # heterogeneity), the centroid of *all* RPs falls in empty space
-    # between the groups, inflating the covariance and producing a
-    # meaningless cluster.  Detect this and select the densest,
-    # most tightly-clustered RP sub-group as the anchor.
-    X_rp, rp_ids_list, subcluster_diag = _select_rp_subcluster(
-        X_rp, rp_ids_list,
-    )
-    results["rp_subcluster_diagnostics"] = subcluster_diag
+    # ══════════════════════════════════════════════════════════════════
+    # CLUSTER 1: RP CLUSTER
+    # ══════════════════════════════════════════════════════════════════
 
-    # Update RP indices and gene_ids to match the (possibly reduced) set
-    rp_gene_ids_active = set(rp_ids_list)
-    rp_indices = np.array([i for i, g in enumerate(gene_ids) if g in rp_gene_ids_active])
-    rp_gene_ids = rp_gene_ids_active  # keep downstream plots/masks consistent
+    # Detect RP sub-populations
+    rp_subclusters = _detect_rp_subclusters(X_rp, rp_ids_list)
+    results["rp_subcluster_diagnostics"] = {
+        "split_detected": len(rp_subclusters) > 1,
+        "n_subclusters": len(rp_subclusters),
+        "subcluster_sizes": [sc["n"] for sc in rp_subclusters],
+        "all_subclusters": rp_subclusters,
+    }
 
-    if len(rp_indices) < 3:
-        logger.warning(
-            "After sub-cluster selection, only %d RP genes remain for %s; "
-            "need >= 3. Skipping.", len(rp_indices), sample_id,
-        )
-        return results
+    # Fit each RP sub-cluster independently
+    rp_fits = []
+    for sc_idx, sc in enumerate(rp_subclusters):
+        X_sc = sc["X"]
+        sc_ids = set(sc["gene_ids"])
 
-    # ── Step 3c: Multi-anchor RP pipeline when sub-clusters detected ──
-    # When the RP population splits into multiple sub-clusters, run the
-    # full Mahalanobis pipeline (Steps 4–8) independently for each.  The
-    # pipeline later bootstraps each sub-cluster and selects the one
-    # whose stability core contains the most RP genes.  The default
-    # (densest) sub-cluster is used as primary for backward compatibility
-    # if bootstrapping is not enabled.
-    all_subclusters = subcluster_diag.get("all_subclusters", [])
-    if len(all_subclusters) > 1:
-        logger.info(
-            "Multi-anchor RP mode: running independent Mahalanobis pipeline "
-            "for %d RP sub-clusters",
-            len(all_subclusters),
-        )
-        subcluster_results = []
-        for sc_idx, sc in enumerate(all_subclusters):
-            sc_fit = _fit_subcluster_pipeline(
-                X=X, gene_ids=gene_ids,
-                X_rp_sub=sc["X"], rp_ids_sub=sc["gene_ids"],
-                n_axes=n_axes,
-                distance_multiplier=distance_multiplier,
-                ffn_path=ffn_path,
-                rscu_gene_df=rscu_gene_df,
-                rp_rscu_df=rp_rscu_df,
-                chi2_ceiling_p=0.95,
-            )
-            if sc_fit is not None:
-                sc_fit["subcluster_index"] = sc_idx
-                sc_fit["subcluster_label"] = sc["label"]
-                subcluster_results.append(sc_fit)
-                logger.info(
-                    "  Sub-cluster %d (label=%d): %d RPs, threshold=%.2f, "
-                    "cluster=%d genes (%d RPs in cluster)",
-                    sc_idx, sc["label"], sc["n"],
-                    sc_fit["threshold"], sc_fit["n_cluster"],
-                    sc_fit["n_rp_in_cluster"],
-                )
-            else:
-                logger.warning(
-                    "  Sub-cluster %d (label=%d): fitting failed", sc_idx, sc["label"],
-                )
+        # Bootstrap-stabilise centroid
+        centroid, cov, cov_inv = _bootstrap_rp_centroid(X_sc, n_axes)
 
-        results["rp_subclusters"] = subcluster_results
-        if not subcluster_results:
-            logger.warning("All sub-cluster pipelines failed for %s", sample_id)
-            return results
+        # Two-pass outlier removal on the bootstrap-stabilised reference
+        _, _, _, outlier_mask = _fit_robust_rp_reference(X_sc, n_axes)
 
-        # Default primary: largest sub-cluster (most RP genes), matching
-        # _select_rp_subcluster's selection criterion.
-        # The pipeline may override this after bootstrapping.
-        primary = max(subcluster_results, key=lambda s: len(s["rp_gene_ids"]))
-
-    else:
-        # Single sub-cluster (or no split detected) — run pipeline once.
-        # When a split WAS detected but only one sub-cluster qualified,
-        # apply the chi-squared ceiling to constrain the threshold to the
-        # selected sub-population rather than letting the adaptive threshold
-        # scale with the tighter covariance.
-        _split_detected = subcluster_diag.get("split_detected", False)
-        _chi2_p = 0.95 if _split_detected else None
-        if _split_detected:
-            logger.info(
-                "Split detected with 1 qualifying sub-cluster; applying "
-                "chi² ceiling (p=0.95) to constrain threshold",
-            )
-        primary = _fit_subcluster_pipeline(
+        fit = _fit_cluster(
             X=X, gene_ids=gene_ids,
-            X_rp_sub=X_rp, rp_ids_sub=rp_ids_list,
-            n_axes=n_axes,
-            distance_multiplier=distance_multiplier,
-            ffn_path=ffn_path,
-            rscu_gene_df=rscu_gene_df,
-            rp_rscu_df=rp_rscu_df,
-            chi2_ceiling_p=_chi2_p,
+            centroid=centroid, cov=cov, cov_inv=cov_inv,
+            n_axes=n_axes, chi2_p=_CLUSTER_CHI2_P,
+            ffn_path=ffn_path, rscu_gene_df=rscu_gene_df,
+            anchor_gene_ids=sc_ids, outlier_mask=outlier_mask,
         )
-        if primary is None:
-            logger.warning("Mahalanobis pipeline fitting failed for %s", sample_id)
-            return results
-        results["rp_subclusters"] = []
+        fit["rp_gene_ids"] = sc_ids
+        fit["rp_indices"] = np.array([i for i, g in enumerate(gene_ids) if g in sc_ids])
+        fit["rp_dists_all"] = fit["distances"][fit["rp_indices"]]
+        fit["n_rp_in_cluster"] = len(fit["cluster_gene_ids"] & sc_ids)
+        fit["subcluster_index"] = sc_idx
 
-    # ── Unpack primary sub-cluster results into top-level keys ────────
+        rp_fits.append(fit)
+        logger.info(
+            "  RP sub-cluster %d: %d RPs, cluster=%d genes (%d RPs in cluster)",
+            sc_idx, sc["n"], fit["n_cluster"], fit["n_rp_in_cluster"],
+        )
+
+    results["rp_subclusters"] = rp_fits
+
+    # Select representative: most RP genes in cluster
+    primary = max(rp_fits, key=lambda f: f["n_rp_in_cluster"])
+
+    # Unpack primary RP cluster
     centroid = primary["centroid"]
     cov = primary["cov"]
     cov_inv = primary["cov_inv"]
-    rp_outlier_mask = primary["rp_outlier_mask"]
+    rp_outlier_mask = primary["outlier_mask"]
     rp_indices = primary["rp_indices"]
     rp_gene_ids = primary["rp_gene_ids"]
     distances = primary["distances"]
     threshold = primary["threshold"]
-    threshold_diag = primary["threshold_diag"]
-    median_rp_dist = primary["median_rp_dist"]
     rp_dists_all = primary["rp_dists_all"]
     cluster_gene_ids = primary["cluster_gene_ids"]
     cluster_rscu = primary["cluster_rscu"]
@@ -2027,42 +1235,54 @@ def run_mahal_clustering(
     gene_core_cai = primary["gene_core_cai"]
     core_rare_per_gene = primary["core_rare_per_gene"]
     genome_rare_per_gene = primary["genome_rare_per_gene"]
-    rp_cosine_sim = primary["rp_cosine_sim"]
-
     n_cluster = primary["n_cluster"]
     n_rp_in_cluster = primary["n_rp_in_cluster"]
 
+    median_rp_dist = float(np.median(rp_dists_all[~rp_outlier_mask])) if rp_outlier_mask.any() and len(rp_dists_all) == len(rp_outlier_mask) else float(np.median(rp_dists_all))
+
+    # Backward-compatible threshold diagnostics
+    threshold_diag = {
+        "method": "chi2",
+        "chi2_p": _CLUSTER_CHI2_P,
+        "chi2_df": n_axes,
+        "threshold": round(threshold, 4),
+        "effective_multiplier": round(threshold / median_rp_dist, 4) if median_rp_dist > 0 else 0.0,
+        "projection": "full",
+    }
     results["threshold_diagnostics"] = threshold_diag
 
-    logger.info(
-        "Mahalanobis threshold: %.2f (method=%s, effective multiplier=%.2f×, "
-        "median RP dist=%.2f)",
-        threshold, threshold_diag["method"],
-        threshold_diag.get("effective_multiplier", 0.0), median_rp_dist,
-    )
+    # RP-vs-cluster cosine similarity
+    rp_cosine_sim = np.nan
+    if rp_rscu_df is not None and not rp_rscu_df.empty:
+        rscu_cols = [c for c in RSCU_COLUMN_NAMES
+                     if c in rp_rscu_df.columns and c in cluster_rscu.index]
+        if rscu_cols:
+            rp_only_rscu = rp_rscu_df[rscu_cols].mean()
+            rp_cosine_sim = 1.0 - cosine_dist(
+                cluster_rscu[rscu_cols].fillna(0).values,
+                rp_only_rscu.fillna(0).values,
+            )
 
     logger.info(
-        "Optimized set: %d total genes, %d are RPs, %d are non-RP co-selected genes",
+        "RP cluster: threshold=%.2f (chi2, p=%.2f, df=%d), "
+        "%d genes (%d RPs + %d non-RP)",
+        threshold, _CLUSTER_CHI2_P, n_axes,
         n_cluster, n_rp_in_cluster, n_cluster - n_rp_in_cluster,
     )
 
     if n_cluster < _MIN_CLUSTER_SIZE:
-        logger.warning(
-            "Optimized set is small (%d genes); expression scoring may be unreliable",
-            n_cluster,
-        )
+        logger.warning("RP cluster is small (%d genes); expression scoring may be unreliable", n_cluster)
 
-    # Store RP-anchor geometry for downstream plotting
+    # Store RP-anchor geometry
     results["rp_centroid"] = centroid
     results["rp_cov"] = cov
     results["rp_threshold"] = threshold
-    results["rp_gene_ids"] = rp_gene_ids  # sub-cluster-filtered set
+    results["rp_gene_ids"] = rp_gene_ids
 
     results["mahal_cluster_gene_ids"] = cluster_gene_ids
-    results["mahal_rp_cluster"] = 1  # optimized = label 1
-
-    optimized_mask = distances <= threshold
-    labels = optimized_mask.astype(int)
+    results["mahal_rp_cluster"] = 1
+    optimised_mask = distances <= threshold
+    labels = optimised_mask.astype(int)
     results["mahal_labels"] = labels
     results["mahal_best_k"] = 2
     results["mahal_bic_scores"] = []
@@ -2071,9 +1291,7 @@ def run_mahal_clustering(
     results["gene_core_cai"] = gene_core_cai
     results["mahal_rp_cosine_sim"] = rp_cosine_sim
 
-    # ── Step 9: Save outputs ──────────────────────────────────────────
-
-    # Gene-level assignments
+    # ── Save RP cluster outputs ──────────────────────────────────────
     cluster_df = pd.DataFrame({
         "gene": gene_ids,
         "mahalanobis_distance": distances,
@@ -2088,18 +1306,16 @@ def run_mahal_clustering(
     cluster_df.to_csv(cluster_path, sep="\t", index=False)
     results["mahal_clusters_path"] = cluster_path
 
-    # Optimized-set RSCU reference
     rscu_path = mahal_dir / f"{sample_id}_mahal_cluster_rscu.tsv"
     cluster_rscu.to_frame("RSCU").to_csv(rscu_path, sep="\t")
     results["mahal_cluster_rscu_path"] = rscu_path
 
-    # Gene IDs (one per line, for expression.py)
     ids_path = mahal_dir / f"{sample_id}_mahal_cluster_ids.txt"
     ids_path.write_text("\n".join(sorted(cluster_gene_ids)) + "\n")
     results["mahal_cluster_ids_path"] = ids_path
 
     # Summary stats
-    mean_weight = float(np.mean([w for w in gene_weights.values()]))
+    mean_weight = float(np.mean(list(gene_weights.values()))) if gene_weights else 0.0
     summary = {
         "sample_id": sample_id,
         "n_genes": len(gene_ids),
@@ -2110,15 +1326,15 @@ def run_mahal_clustering(
         "rp_genes_in_cluster": n_rp_in_cluster,
         "non_rp_in_cluster": n_cluster - n_rp_in_cluster,
         "total_rp_genes": len(rp_gene_ids),
-        "rp_outliers_removed": int(rp_outlier_mask.sum()),
+        "rp_outliers_removed": int(rp_outlier_mask.sum()) if len(rp_outlier_mask) > 0 else 0,
         "mahalanobis_threshold": round(threshold, 4),
-        "threshold_method": threshold_diag["method"],
-        "threshold_projection": threshold_diag.get("projection", "full"),
+        "threshold_method": "chi2",
+        "threshold_projection": "full",
         "threshold_effective_multiplier": threshold_diag["effective_multiplier"],
-        "threshold_kde_valley": threshold_diag.get("kde_valley"),
-        "threshold_2d": threshold_diag.get("threshold_2d"),
-        "threshold_n_genes_inside_2d": threshold_diag.get("n_genes_inside_2d"),
-        "threshold_otsu": threshold_diag.get("otsu_threshold"),
+        "threshold_kde_valley": None,
+        "threshold_2d": None,
+        "threshold_n_genes_inside_2d": None,
+        "threshold_otsu": None,
         "median_rp_distance": round(median_rp_dist, 4),
         "rscu_pooling": "distance-weighted",
         "mean_rscu_weight": round(mean_weight, 4),
@@ -2129,7 +1345,7 @@ def run_mahal_clustering(
     summary_df.to_csv(summary_path, sep="\t", index=False)
     results["mahal_summary_path"] = summary_path
 
-    # COA coordinates with assignments and weights
+    # COA coords with assignments
     rscu_weights = np.clip(1.0 - distances / threshold, 0.0, 1.0) if threshold > 0 else np.ones_like(distances)
     coa_with_assignments = coa_coords.copy()
     assign_merge = pd.DataFrame({
@@ -2143,112 +1359,97 @@ def run_mahal_clustering(
     results["mahal_coa_inertia"] = coa_inertia
     results["mahal_gene_distances"] = pd.Series(distances, index=gene_ids, name="mahalanobis_distance")
 
-    # ── Step 10: Diagnostic plots ─────────────────────────────────────
+    # ── RP cluster diagnostic plots ──────────────────────────────────
     try:
         inertia_pcts_2 = (0.0, 0.0)
         if len(coa_inertia) >= 2:
-            inertia_pcts_2 = (
-                float(coa_inertia["pct_inertia"].iloc[0]),
-                float(coa_inertia["pct_inertia"].iloc[1]),
-            )
+            inertia_pcts_2 = (float(coa_inertia["pct_inertia"].iloc[0]),
+                              float(coa_inertia["pct_inertia"].iloc[1]))
 
         coa_filtered = coa_coords[coa_coords["gene"].isin(gene_ids)].reset_index(drop=True)
 
-        # COA scatter colored by Mahalanobis distance
         _plot_coa_mahalanobis(
             coa_filtered, distances, gene_ids, rp_gene_ids,
-            rp_indices, rp_outlier_mask,
-            threshold, centroid, cov,
-            mahal_dir / f"{sample_id}_mahal_coa_mahalanobis",
-            sample_id,
+            rp_indices, rp_outlier_mask, threshold, centroid, cov,
+            mahal_dir / f"{sample_id}_mahal_coa_mahalanobis", sample_id,
             inertia_pcts=inertia_pcts_2,
         )
         results["mahal_coa_plot"] = mahal_dir / f"{sample_id}_mahal_coa_mahalanobis.png"
 
-        # Distance histogram
         _plot_distance_histogram(
             distances, rp_dists_all, threshold,
-            mahal_dir / f"{sample_id}_mahal_distance_histogram",
-            sample_id,
+            mahal_dir / f"{sample_id}_mahal_distance_histogram", sample_id,
         )
         results["mahal_separation_plot"] = mahal_dir / f"{sample_id}_mahal_distance_histogram.png"
 
-        # RP outlier detection plot
         chi2_crit = np.sqrt(chi2.ppf(1 - _RP_OUTLIER_ALPHA, df=n_axes))
         _plot_rp_outlier_detection(
             coa_filtered, rp_gene_ids, gene_ids, rp_outlier_mask,
             rp_indices, chi2_crit,
-            mahal_dir / f"{sample_id}_mahal_rp_outliers",
-            sample_id,
+            mahal_dir / f"{sample_id}_mahal_rp_outliers", sample_id,
         )
         results["mahal_rp_outlier_plot"] = mahal_dir / f"{sample_id}_mahal_rp_outliers.png"
-
     except Exception as e:
-        logger.warning("Diagnostic plot generation failed: %s", e, exc_info=True)
+        logger.warning("RP diagnostic plots failed: %s", e, exc_info=True)
 
-    # ── Step 11: Density-anchor mode ────────────────────────────────────
-    # A second Mahalanobis clustering anchored to the genome-wide density
-    # peak in COA space.  This captures the "compositional baseline" — the
-    # codon preferences of the average gene — in contrast to the RP-anchor
-    # which captures translational selection.
-    #
-    # Comparing the two clusters yields four gene categories:
-    #   both     — genes in both clusters (core genome, near average AND near RP)
-    #   rp_only  — in RP-cluster but not density-cluster (translationally
-    #              selected away from the genome average)
-    #   dens_only — in density-cluster but not RP-cluster (typical genome
-    #               composition, not translationally optimised)
-    #   neither  — outside both clusters (HGT/outlier candidates)
+    # ══════════════════════════════════════════════════════════════════
+    # CLUSTER 2: DENSITY-CORE CLUSTER
+    # ══════════════════════════════════════════════════════════════════
 
     try:
-        density_centroid, density_cov, density_cov_inv, density_seed_ids, density_diag = (
-            _find_density_peak_anchor(
-                X, gene_ids, n_axes,
-                bandwidth=_DENSITY_KDE_BANDWIDTH,
-                seed_radius_pctl=_DENSITY_SEED_RADIUS_PCTL,
+        density_peaks = _detect_density_peaks(X, gene_ids, n_axes)
+
+        # Fit each density peak
+        density_fits = []
+        for dp_idx, dp in enumerate(density_peaks):
+            dp_fit = _fit_cluster(
+                X=X, gene_ids=gene_ids,
+                centroid=dp["centroid"], cov=dp["cov"], cov_inv=dp["cov_inv"],
+                n_axes=n_axes, chi2_p=_CLUSTER_CHI2_P,
+                ffn_path=ffn_path, rscu_gene_df=rscu_gene_df,
+                anchor_gene_ids=set(dp["seed_gene_ids"]),
             )
-        )
-        results["density_anchor_diagnostics"] = density_diag
+            dp_fit["peak_xy"] = dp["peak_xy"]
+            dp_fit["n_seed"] = dp["n_seed"]
+            dp_fit["seed_radius"] = dp["seed_radius"]
+            dp_fit["seed_gene_ids"] = dp["seed_gene_ids"]
+            density_fits.append(dp_fit)
+            logger.info(
+                "  Density peak %d: seed=%d, cluster=%d genes",
+                dp_idx, dp["n_seed"], dp_fit["n_cluster"],
+            )
 
-        # Compute density-based Mahalanobis distances
-        density_distances = _compute_mahalanobis_distances(
-            X[:, :n_axes], density_centroid, density_cov_inv,
-        )
+        # Select representative: most genes in cluster
+        density_primary = max(density_fits, key=lambda f: f["n_cluster"])
 
-        # Chi-squared threshold for the density cluster.
-        #
-        # The density anchor represents the genome's compositional centre.
-        # Unlike the RP anchor (two populations: RP-like vs bulk), the
-        # density distance distribution is unimodal with an outlier tail.
-        # A chi-squared critical value is the natural boundary: genes
-        # whose Mahalanobis distance exceeds the critical value for
-        # n_axes degrees of freedom are statistical outliers.
-        _DENSITY_CHI2_ALPHA = 0.95
-        density_chi2_crit = float(np.sqrt(chi2.ppf(_DENSITY_CHI2_ALPHA, df=n_axes)))
-        density_threshold = density_chi2_crit
+        density_centroid = density_primary["centroid"]
+        density_cov = density_primary["cov"]
+        density_cov_inv = density_primary["cov_inv"]
+        density_distances = density_primary["distances"]
+        density_threshold = density_primary["threshold"]
+        density_cluster_gene_ids = density_primary["cluster_gene_ids"]
+        density_probabilities = density_primary["probabilities"]
 
-        density_thresh_diag: dict = {
-            "method": "chi2",
-            "chi2_alpha": _DENSITY_CHI2_ALPHA,
-            "chi2_df": n_axes,
-            "chi2_critical_value": round(density_chi2_crit, 4),
+        results["density_anchor_diagnostics"] = {
+            "density_peak_xy": density_primary["peak_xy"],
+            "n_seed_genes": density_primary["n_seed"],
+            "seed_radius": density_primary["seed_radius"],
+            "bandwidth": str(_DENSITY_KDE_BANDWIDTH),
+            "n_peaks_detected": len(density_fits),
+            "peak_cluster_sizes": [f["n_cluster"] for f in density_fits],
         }
 
-        logger.info(
-            "Density-anchor threshold: chi2(df=%d, alpha=%.2f) = %.3f",
-            n_axes, _DENSITY_CHI2_ALPHA, density_threshold,
-        )
+        density_thresh_diag = {
+            "method": "chi2",
+            "chi2_alpha": _CLUSTER_CHI2_P,
+            "chi2_df": n_axes,
+            "chi2_critical_value": round(density_threshold, 4),
+        }
         results["density_threshold_diagnostics"] = density_thresh_diag
 
-        density_optimized_mask = density_distances <= density_threshold
-        density_cluster_gene_ids = {
-            gid for gid, opt in zip(gene_ids, density_optimized_mask) if opt
-        }
+        logger.info("Density-core cluster: threshold=%.3f (chi2, p=%.2f, df=%d), %d genes",
+                     density_threshold, _CLUSTER_CHI2_P, n_axes, len(density_cluster_gene_ids))
 
-        # Soft membership for density cluster
-        density_probabilities = _distance_to_membership(density_distances, density_threshold)
-
-        # Store density-anchor results
         results["density_cluster_gene_ids"] = density_cluster_gene_ids
         results["density_distances"] = density_distances
         results["density_threshold"] = density_threshold
@@ -2256,8 +1457,8 @@ def run_mahal_clustering(
         results["density_cov"] = density_cov
         results["density_probabilities"] = density_probabilities
 
-        # ── Step 12: Dual-anchor comparison ──────────────────────────────
-        rp_set = cluster_gene_ids        # from Step 6
+        # ── Dual-anchor comparison ───────────────────────────────────
+        rp_set = cluster_gene_ids
         dens_set = density_cluster_gene_ids
 
         categories = []
@@ -2285,35 +1486,42 @@ def run_mahal_clustering(
             "is_ribosomal_protein": [gid in rp_gene_ids for gid in gene_ids],
         })
 
-        # Category counts
         cat_counts = Counter(categories)
-        logger.info(
-            "Dual-anchor categories for %s: both=%d, rp_only=%d, "
-            "dens_only=%d, neither=%d",
-            sample_id,
-            cat_counts.get("both", 0),
-            cat_counts.get("rp_only", 0),
-            cat_counts.get("dens_only", 0),
-            cat_counts.get("neither", 0),
-        )
+        logger.info("Dual-anchor: both=%d, rp_only=%d, dens_only=%d, neither=%d",
+                     cat_counts.get("both", 0), cat_counts.get("rp_only", 0),
+                     cat_counts.get("dens_only", 0), cat_counts.get("neither", 0))
 
-        # Save dual-anchor table
         dual_path = mahal_dir / f"{sample_id}_dual_anchor_comparison.tsv"
         dual_df.to_csv(dual_path, sep="\t", index=False)
         results["dual_anchor_path"] = dual_path
         results["dual_anchor_df"] = dual_df
         results["dual_anchor_categories"] = cat_counts
 
-        # Median Mahalanobis distance among density seed genes
-        _seed_mask = np.array([gid in density_seed_ids for gid in gene_ids])
-        density_median = float(np.median(density_distances[_seed_mask])) if _seed_mask.any() else 0.0
+        # Density cluster RSCU and cosine with RP cluster
+        density_cluster_rscu = density_primary["cluster_rscu"]
+        if not density_cluster_rscu.empty:
+            density_rscu_path = mahal_dir / f"{sample_id}_density_cluster_rscu.tsv"
+            density_cluster_rscu.to_frame("RSCU").to_csv(density_rscu_path, sep="\t")
+            results["density_cluster_rscu"] = density_cluster_rscu
+            results["density_cluster_rscu_path"] = density_rscu_path
 
-        # Summary stats for the density anchor
+            shared_cols = [c for c in cluster_rscu.index if c in density_cluster_rscu.index]
+            if shared_cols and not cluster_rscu.empty:
+                anchor_cosine = 1.0 - cosine_dist(
+                    cluster_rscu[shared_cols].fillna(0).values,
+                    density_cluster_rscu[shared_cols].fillna(0).values,
+                )
+                results["rp_vs_density_rscu_cosine"] = float(anchor_cosine)
+                logger.info("RP-vs-density RSCU cosine: %.4f", anchor_cosine)
+
+        # Density summary
+        _seed_mask = np.array([gid in density_primary["seed_gene_ids"] for gid in gene_ids])
+        density_median = float(np.median(density_distances[_seed_mask])) if _seed_mask.any() else 0.0
         density_summary = {
-            "density_peak_axis1": density_diag["density_peak_xy"][0] if density_diag["density_peak_xy"] else None,
-            "density_peak_axis2": density_diag["density_peak_xy"][1] if density_diag["density_peak_xy"] else None,
-            "density_seed_genes": density_diag["n_seed_genes"],
-            "density_seed_radius": density_diag["seed_radius"],
+            "density_peak_axis1": density_primary["peak_xy"][0],
+            "density_peak_axis2": density_primary["peak_xy"][1],
+            "density_seed_genes": density_primary["n_seed"],
+            "density_seed_radius": density_primary["seed_radius"],
             "density_threshold": round(density_threshold, 4),
             "density_median_seed_dist": round(density_median, 4),
             "density_cluster_size": len(density_cluster_gene_ids),
@@ -2322,53 +1530,16 @@ def run_mahal_clustering(
             "n_dens_only": cat_counts.get("dens_only", 0),
             "n_neither": cat_counts.get("neither", 0),
             "rp_centroid_to_density_centroid": round(
-                float(np.linalg.norm(centroid[:min(len(centroid), len(density_centroid))]
-                                     - density_centroid[:min(len(centroid), len(density_centroid))])),
-                4,
-            ),
+                float(np.linalg.norm(
+                    centroid[:min(len(centroid), len(density_centroid))]
+                    - density_centroid[:min(len(centroid), len(density_centroid))]
+                )), 4),
         }
-        density_summary_df = pd.DataFrame([density_summary])
-        density_summary_path = mahal_dir / f"{sample_id}_density_anchor_summary.tsv"
-        density_summary_df.to_csv(density_summary_path, sep="\t", index=False)
-        results["density_summary_path"] = density_summary_path
+        pd.DataFrame([density_summary]).to_csv(
+            mahal_dir / f"{sample_id}_density_anchor_summary.tsv", sep="\t", index=False)
+        results["density_summary_path"] = mahal_dir / f"{sample_id}_density_anchor_summary.tsv"
 
-        # ── Step 13: Density-anchor RSCU ─────────────────────────────────
-        # Compute RSCU for the density cluster using the same distance-
-        # weighted pooling approach, but with density distances/threshold.
-        if ffn_path and ffn_path.exists() and density_cluster_gene_ids:
-            density_gene_weights = {}
-            for gid, d in zip(gene_ids, density_distances):
-                if gid in density_cluster_gene_ids:
-                    w = max(1.0 - d / density_threshold, 0.0) if density_threshold > 0 else 1.0
-                    if w > 0:
-                        density_gene_weights[gid] = w
-
-            density_cluster_rscu = _compute_cluster_rscu(
-                ffn_path, density_cluster_gene_ids, gene_weights=density_gene_weights,
-            )
-            if not density_cluster_rscu.empty:
-                density_rscu_path = mahal_dir / f"{sample_id}_density_cluster_rscu.tsv"
-                density_cluster_rscu.to_frame("RSCU").to_csv(density_rscu_path, sep="\t")
-                results["density_cluster_rscu"] = density_cluster_rscu
-                results["density_cluster_rscu_path"] = density_rscu_path
-
-                # Cosine similarity between RP-cluster and density-cluster RSCU
-                shared_cols = [c for c in cluster_rscu.index if c in density_cluster_rscu.index]
-                if shared_cols and not cluster_rscu.empty:
-                    anchor_cosine = 1.0 - cosine_dist(
-                        cluster_rscu[shared_cols].fillna(0).values,
-                        density_cluster_rscu[shared_cols].fillna(0).values,
-                    )
-                    results["rp_vs_density_rscu_cosine"] = float(anchor_cosine)
-                    logger.info(
-                        "RP-cluster vs density-cluster RSCU cosine similarity: %.4f "
-                        "(high = RP preferences match genome average; "
-                        "low = strong translational selection signal)",
-                        anchor_cosine,
-                    )
-
-        # ── Step 14: Classify translational selection strength ────────────
-        # Compute median gene spread for centroid distance normalisation
+        # ── Translational selection strength ─────────────────────────
         _gene_centre = X[:, :n_axes].mean(axis=0)
         _gene_dists = np.linalg.norm(X[:, :n_axes] - _gene_centre, axis=1)
         _gene_spread_median = float(np.median(_gene_dists))
@@ -2382,24 +1553,20 @@ def run_mahal_clustering(
         )
         results["translational_selection_strength"] = tss
 
-        # Append to the Mahalanobis summary TSV
-        summary_path = mahal_dir / f"{sample_id}_mahal_summary.tsv"
+        # Append TSS to summary
         if summary_path.exists():
             try:
                 s_df = pd.read_csv(summary_path, sep="\t")
                 s_df["translational_selection"] = tss["classification"]
                 s_df["tss_caveat"] = tss["caveat"] if tss["caveat"] else ""
                 s_df.to_csv(summary_path, sep="\t", index=False)
-            except Exception as e:
-                logger.debug("Could not append TSS to summary: %s", e)
+            except Exception:
+                pass
 
-        # Write dedicated TSS diagnostics file
         tss_path = mahal_dir / f"{sample_id}_translational_selection_strength.tsv"
         tss_flat = {
-            "sample_id": sample_id,
-            "classification": tss["classification"],
-            "strong_votes": tss["strong_votes"],
-            "weak_votes": tss["weak_votes"],
+            "sample_id": sample_id, "classification": tss["classification"],
+            "strong_votes": tss["strong_votes"], "weak_votes": tss["weak_votes"],
             "caveat": tss["caveat"] if tss["caveat"] else "",
         }
         for criterion, info in tss["evidence"].items():
@@ -2408,18 +1575,14 @@ def run_mahal_clustering(
         pd.DataFrame([tss_flat]).to_csv(tss_path, sep="\t", index=False)
         results["tss_path"] = tss_path
 
-        # ── Step 15: Dual-anchor diagnostic plot ─────────────────────────
+        # ── Dual-anchor plot ─────────────────────────────────────────
         try:
             _plot_dual_anchor_coa(
                 coa_coords=coa_coords[coa_coords["gene"].isin(gene_ids)].reset_index(drop=True),
-                gene_ids=gene_ids,
-                categories=categories,
-                rp_centroid=centroid,
-                density_centroid=density_centroid,
-                rp_cov=cov,
-                density_cov=density_cov,
-                rp_threshold=threshold,
-                density_threshold=density_threshold,
+                gene_ids=gene_ids, categories=categories,
+                rp_centroid=centroid, density_centroid=density_centroid,
+                rp_cov=cov, density_cov=density_cov,
+                rp_threshold=threshold, density_threshold=density_threshold,
                 rp_gene_ids=rp_gene_ids,
                 output_path=mahal_dir / f"{sample_id}_dual_anchor_coa",
                 sample_id=sample_id,
@@ -2431,18 +1594,14 @@ def run_mahal_clustering(
             )
             results["dual_anchor_plot"] = mahal_dir / f"{sample_id}_dual_anchor_coa.png"
         except Exception as e:
-            logger.warning("Dual-anchor COA plot failed: %s", e, exc_info=True)
+            logger.warning("Dual-anchor plot failed: %s", e, exc_info=True)
 
     except Exception as e:
-        logger.warning(
-            "Density-anchor mode failed for %s: %s", sample_id, e,
-            exc_info=True,
-        )
+        logger.warning("Density-core cluster failed for %s: %s", sample_id, e, exc_info=True)
 
     logger.info(
-        "RP-anchored clustering complete for %s: "
-        "threshold=%.2f, optimized set=%d genes (%d RPs + %d non-RP)",
-        sample_id, threshold, n_cluster, n_rp_in_cluster, n_cluster - n_rp_in_cluster,
+        "Clustering complete for %s: RP cluster=%d genes (%d RPs + %d non-RP), threshold=%.2f",
+        sample_id, n_cluster, n_rp_in_cluster, n_cluster - n_rp_in_cluster, threshold,
     )
 
     return results
