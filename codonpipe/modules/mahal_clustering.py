@@ -69,7 +69,7 @@ _ADAPTIVE_MIN_GENES = 100     # Minimum genes to attempt adaptive threshold
 _RP_SUBCLUSTER_MIN = 15       # Minimum RP genes to attempt sub-cluster detection
 _RP_SUBCLUSTER_MAX_K = 4      # Maximum sub-clusters to test
 _RP_SUBCLUSTER_SIL_THRESH = 0.25  # Silhouette score above which we accept a split
-_RP_SUBCLUSTER_MIN_FRAC = 0.20    # Sub-cluster must contain >= 20% of total RPs
+_RP_SUBCLUSTER_MIN_FRAC = 0.12    # Sub-cluster must contain >= 12% of total RPs
 
 # Density-anchor mode
 _DENSITY_KDE_BANDWIDTH = "scott"  # KDE bandwidth for density peak detection
@@ -1986,7 +1986,18 @@ def run_mahal_clustering(
                 break
 
     else:
-        # Single sub-cluster (or no split detected) — run pipeline once
+        # Single sub-cluster (or no split detected) — run pipeline once.
+        # When a split WAS detected but only one sub-cluster qualified,
+        # apply the chi-squared ceiling to constrain the threshold to the
+        # selected sub-population rather than letting the adaptive threshold
+        # scale with the tighter covariance.
+        _split_detected = subcluster_diag.get("split_detected", False)
+        _chi2_p = 0.95 if _split_detected else None
+        if _split_detected:
+            logger.info(
+                "Split detected with 1 qualifying sub-cluster; applying "
+                "chi² ceiling (p=0.95) to constrain threshold",
+            )
         primary = _fit_subcluster_pipeline(
             X=X, gene_ids=gene_ids,
             X_rp_sub=X_rp, rp_ids_sub=rp_ids_list,
@@ -1995,6 +2006,7 @@ def run_mahal_clustering(
             ffn_path=ffn_path,
             rscu_gene_df=rscu_gene_df,
             rp_rscu_df=rp_rscu_df,
+            chi2_ceiling_p=_chi2_p,
         )
         if primary is None:
             logger.warning("Mahalanobis pipeline fitting failed for %s", sample_id)
