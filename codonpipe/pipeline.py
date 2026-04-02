@@ -484,7 +484,18 @@ def run_single_genome(
     # ── Step 9s: Bootstrap stability analysis (optional) ───────────────────────
     stability_results = {}
     _rp_subclusters = mahal_results.get("rp_subclusters", [])
-    _multi_anchor = run_stability and len(_rp_subclusters) > 1
+    _multi_anchor = len(_rp_subclusters) > 1
+
+    # Auto-enable stability when RP sub-clusters are detected.
+    # The chi-squared ceiling in mahal_clustering produces a tighter initial
+    # cluster, but bootstrapping is still needed to select the best
+    # sub-cluster anchor when multiple exist.
+    if _multi_anchor and not run_stability:
+        logger.info(
+            "Auto-enabling stability analysis: %d RP sub-clusters detected",
+            len(_rp_subclusters),
+        )
+        run_stability = True
 
     if run_stability and not skip_mahal and rscu_gene_df is not None:
         logger.info("[Step 9s/12] Running bootstrap cluster stability analysis")
@@ -1216,7 +1227,7 @@ def run_single_genome(
             mahal_coa_coords=mahal_results.get("mahal_coa_coords"),
             coa_inertia=mahal_results.get("mahal_coa_inertia"),
             stability_results=stability_results if stability_results else None,
-            rp_gene_ids=_load_rp_ids(rp_ids_file) if rp_ids_file else None,
+            rp_gene_ids=mahal_results.get("rp_gene_ids") or (_load_rp_ids(rp_ids_file) if rp_ids_file else None),
             mahal_gene_distances=mahal_results.get("mahal_gene_distances"),
             dual_anchor_df=mahal_results.get("dual_anchor_df"),
             rp_centroid=mahal_results.get("rp_centroid"),
