@@ -360,9 +360,6 @@ def _select_rp_subcluster(
 
     min_members = max(3, int(_RP_SUBCLUSTER_MIN_FRAC * n_rp))
     all_subs: list[dict] = []
-    best_sub = -1
-    best_score = np.inf
-    best_density = np.inf
 
     for lab in unique_labels:
         mask = best_labels == lab
@@ -384,18 +381,20 @@ def _select_rp_subcluster(
             "density_score": score,
         })
 
-        if score < best_score:
-            best_score = score
-            best_density = avg_dist
-            best_sub = lab
-
     diag["all_subclusters"] = all_subs
 
-    if best_sub < 0 or not all_subs:
+    if not all_subs:
         logger.warning("No sub-cluster had >= %d members; using all RPs", min_members)
         return X_rp, rp_gene_ids_list, diag
 
-    # Default selection: densest sub-cluster (backward compatible)
+    # Default selection: largest sub-cluster (most RP genes).
+    # The largest RP sub-population is the canonical reference set;
+    # small compact satellites are more likely HGT or specialised
+    # ribosomes.  Density score is used only as a tiebreaker.
+    all_subs.sort(key=lambda s: (-s["n"], s["density_score"]))
+    best_sc = all_subs[0]
+    best_sub = best_sc["label"]
+
     selected_mask = best_labels == best_sub
     X_selected = X_rp[selected_mask]
     selected_ids = [gid for gid, sel in zip(rp_gene_ids_list, selected_mask) if sel]
@@ -407,10 +406,10 @@ def _select_rp_subcluster(
 
     logger.info(
         "RP sub-cluster split detected (silhouette=%.3f, k=%d): "
-        "%d qualifying sub-clusters. Default anchor: densest "
+        "%d qualifying sub-clusters. Default anchor: largest "
         "(%d RPs, avg dist=%.3f), excluded %d RPs. Sizes: %s",
         best_sil, best_k, len(all_subs), len(selected_ids),
-        best_density, len(excluded_ids), subcluster_sizes,
+        best_sc["avg_dist"], len(excluded_ids), subcluster_sizes,
     )
 
     return X_selected, selected_ids, diag
@@ -1976,14 +1975,10 @@ def run_mahal_clustering(
             logger.warning("All sub-cluster pipelines failed for %s", sample_id)
             return results
 
-        # Default primary: densest sub-cluster (backward compatible —
-        # same as the one selected by _select_rp_subcluster).
+        # Default primary: largest sub-cluster (most RP genes), matching
+        # _select_rp_subcluster's selection criterion.
         # The pipeline may override this after bootstrapping.
-        primary = subcluster_results[0]
-        for sc_fit in subcluster_results:
-            if set(sc_fit["rp_gene_ids"]) == rp_gene_ids:
-                primary = sc_fit
-                break
+        primary = max(subcluster_results, key=lambda s: len(s["rp_gene_ids"]))
 
     else:
         # Single sub-cluster (or no split detected) — run pipeline once.
