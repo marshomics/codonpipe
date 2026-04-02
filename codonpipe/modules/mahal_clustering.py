@@ -1560,6 +1560,7 @@ def _fit_subcluster_pipeline(
     ffn_path: "Path | None",
     rscu_gene_df: pd.DataFrame,
     rp_rscu_df: "pd.DataFrame | None",
+    chi2_ceiling_p: float | None = None,
 ) -> dict | None:
     """Run Steps 4–8 of the Mahalanobis pipeline for a single RP sub-cluster.
 
@@ -1611,10 +1612,35 @@ def _fit_subcluster_pipeline(
             rp_dists_2d_clean = rp_dists_2d_all
         median_rp_2d = float(np.median(rp_dists_2d_clean))
 
-        threshold_2d, threshold_diag = _find_adaptive_threshold(
-            distances_2d, rp_dists_2d_clean, median_rp_2d,
-            default_multiplier=distance_multiplier,
-        )
+        # When running in sub-cluster mode (chi2_ceiling_p is set), use a
+        # chi-squared ceiling instead of KDE/Otsu adaptive threshold.
+        # Rationale: the adaptive threshold scales with covariance, so a
+        # tighter sub-cluster covariance inflates ALL distances proportionally
+        # and the KDE valley shifts up by the same factor — capturing the
+        # same gene set.  The chi-squared quantile is covariance-independent
+        # and gives a principled boundary: d² ~ chi²(df=2) under multivariate
+        # normality, so sqrt(chi2.ppf(p, 2)) captures p% of the reference
+        # population regardless of scale.
+        if chi2_ceiling_p is not None:
+            chi2_ceil = float(np.sqrt(chi2.ppf(chi2_ceiling_p, df=2)))
+            threshold_2d = chi2_ceil
+            threshold_diag = {
+                "method": "chi2_subcluster",
+                "chi2_ceiling_p": chi2_ceiling_p,
+                "chi2_ceiling_2d": round(chi2_ceil, 4),
+                "median_rp_2d": round(median_rp_2d, 4),
+                "projection": "2d",
+            }
+            logger.info(
+                "Sub-cluster chi² ceiling: 2D threshold=%.3f "
+                "(p=%.3f, df=2, median_rp_2d=%.3f)",
+                chi2_ceil, chi2_ceiling_p, median_rp_2d,
+            )
+        else:
+            threshold_2d, threshold_diag = _find_adaptive_threshold(
+                distances_2d, rp_dists_2d_clean, median_rp_2d,
+                default_multiplier=distance_multiplier,
+            )
         threshold_diag["projection"] = "2d"
 
         genes_inside_2d = distances_2d <= threshold_2d
@@ -1927,6 +1953,7 @@ def run_mahal_clustering(
                 ffn_path=ffn_path,
                 rscu_gene_df=rscu_gene_df,
                 rp_rscu_df=rp_rscu_df,
+                chi2_ceiling_p=0.95,
             )
             if sc_fit is not None:
                 sc_fit["subcluster_index"] = sc_idx
@@ -2022,6 +2049,7 @@ def run_mahal_clustering(
     results["rp_centroid"] = centroid
     results["rp_cov"] = cov
     results["rp_threshold"] = threshold
+    results["rp_gene_ids"] = rp_gene_ids  # sub-cluster-filtered set
 
     results["mahal_cluster_gene_ids"] = cluster_gene_ids
     results["mahal_rp_cluster"] = 1  # optimized = label 1
