@@ -482,20 +482,10 @@ def run_single_genome(
         logger.info("[Step 9/12] Skipping Mahalanobis clustering (--skip-mahal)")
 
     # ── Step 9s: Bootstrap stability analysis (optional) ───────────────────────
+    # The main clustering module now performs bootstrap centroid stabilisation
+    # and sub-cluster selection internally.  The stability analysis here
+    # validates robustness and provides a refined core gene set.
     stability_results = {}
-    _rp_subclusters = mahal_results.get("rp_subclusters", [])
-    _multi_anchor = len(_rp_subclusters) > 1
-
-    # Auto-enable stability when RP sub-clusters are detected.
-    # The chi-squared ceiling in mahal_clustering produces a tighter initial
-    # cluster, but bootstrapping is still needed to select the best
-    # sub-cluster anchor when multiple exist.
-    if _multi_anchor and not run_stability:
-        logger.info(
-            "Auto-enabling stability analysis: %d RP sub-clusters detected",
-            len(_rp_subclusters),
-        )
-        run_stability = True
 
     if run_stability and not skip_mahal and rscu_gene_df is not None:
         logger.info("[Step 9s/12] Running bootstrap cluster stability analysis")
@@ -507,178 +497,22 @@ def run_single_genome(
                 except Exception:
                     pass
 
-            if _multi_anchor:
-                # ── Multi-anchor mode: bootstrap each RP sub-cluster ───
-                logger.info(
-                    "Multi-anchor stability: bootstrapping %d RP sub-clusters independently",
-                    len(_rp_subclusters),
-                )
-                _sub_stab_results = []
-                for _sc_idx, _sc in enumerate(_rp_subclusters):
-                    _sc_rp_ids = _sc["rp_gene_ids"]
-                    logger.info(
-                        "  Sub-cluster %d: %d RP genes",
-                        _sc_idx, len(_sc_rp_ids),
-                    )
-                    _sc_stab = run_stability_analysis(
-                        rscu_gene_df=rscu_gene_df,
-                        output_dir=output_dir,
-                        sample_id=sample_id,
-                        ffn_path=ffn_path,
-                        rp_ids_file=rp_ids_file,
-                        rp_rscu_df=rp_rscu_df_stab,
-                        expr_df=expr_df,
-                        n_bootstraps=stability_bootstraps,
-                        multiplier_grid=stability_multipliers,
-                        core_threshold=stability_core_threshold,
-                        rp_gene_ids_override=_sc_rp_ids,
-                        output_subdir=f"cluster_stability_sub{_sc_idx}",
-                    )
-                    _sc_core = _sc_stab.get("core_gene_ids", set())
-                    _sc_rp_in_core = len(_sc_core & _sc_rp_ids) if _sc_core else 0
-                    _sc_stab["_subcluster_index"] = _sc_idx
-                    _sc_stab["_rp_gene_ids"] = _sc_rp_ids
-                    _sc_stab["_rp_in_core"] = _sc_rp_in_core
-                    _sub_stab_results.append(_sc_stab)
-                    logger.info(
-                        "  Sub-cluster %d: core=%d genes, %d RPs in core, "
-                        "recommended multiplier=%.2f",
-                        _sc_idx, len(_sc_core), _sc_rp_in_core,
-                        _sc_stab.get("recommended_multiplier", 0.0),
-                    )
+            stability_results = run_stability_analysis(
+                rscu_gene_df=rscu_gene_df,
+                output_dir=output_dir,
+                sample_id=sample_id,
+                ffn_path=ffn_path,
+                rp_ids_file=rp_ids_file,
+                rp_rscu_df=rp_rscu_df_stab,
+                expr_df=expr_df,
+                n_bootstraps=stability_bootstraps,
+                multiplier_grid=stability_multipliers,
+                core_threshold=stability_core_threshold,
+            )
 
-                # Pick the sub-cluster whose stability core has the most RPs
-                _sub_stab_results.sort(key=lambda s: s["_rp_in_core"], reverse=True)
-                _best_sc_stab = _sub_stab_results[0]
-                _best_sc_idx = _best_sc_stab["_subcluster_index"]
-                _best_sc_rp_ids = _best_sc_stab["_rp_gene_ids"]
-
-                logger.info(
-                    "Multi-anchor winner: sub-cluster %d (%d RPs in core). "
-                    "Re-running Mahalanobis with this sub-cluster as anchor.",
-                    _best_sc_idx, _best_sc_stab["_rp_in_core"],
-                )
-
-                # Use the winning sub-cluster's stability results
-                stability_results = _best_sc_stab
-                for key, val in stability_results.items():
-                    if isinstance(val, Path):
-                        all_outputs[f"stability_{key}"] = val
-
-                # Re-run Mahalanobis clustering with the winning sub-cluster's
-                # recommended multiplier. The sub-cluster detection will fire
-                # again inside run_mahal_clustering, but since the same RP IDs
-                # are present, it will produce the same split and use the same
-                # default (densest) sub-cluster. However, we need to override
-                # which sub-cluster is primary. We do this by writing a
-                # temporary RP IDs file containing only the winning sub-cluster.
-                rec_mult = stability_results.get("recommended_multiplier", mahal_distance_multiplier)
-
-                # Write temporary RP IDs file for the winning sub-cluster
-                _sc_rp_ids_path = output_dir / "mahal_clustering" / f"{sample_id}_winning_subcluster_rp_ids.txt"
-                _sc_rp_ids_path.parent.mkdir(parents=True, exist_ok=True)
-                _sc_rp_ids_path.write_text("\n".join(sorted(_best_sc_rp_ids)) + "\n")
-
-                rp_rscu_df_rerun = None
-                if rp_ffn and rp_ffn.exists():
-                    try:
-                        rp_rscu_df_rerun = compute_rscu_per_gene(rp_ffn)
-                    except Exception:
-                        pass
-
-                mahal_out = run_mahal_clustering(
-                    rscu_gene_df=rscu_gene_df,
-                    output_dir=output_dir,
-                    sample_id=sample_id,
-                    ffn_path=ffn_path,
-                    rp_ids_file=_sc_rp_ids_path,
-                    rp_rscu_df=rp_rscu_df_rerun,
-                    expr_df=expr_df,
-                    min_k=mahal_min_k,
-                    max_k=mahal_max_k,
-                    distance_multiplier=rec_mult,
-                )
-                mahal_results.update(mahal_out)
-                for key, val in mahal_out.items():
-                    if isinstance(val, Path):
-                        all_outputs[f"mahal_{key}"] = val
-                mahal_cluster_gene_ids = mahal_results.get("mahal_cluster_gene_ids")
-                mahal_cluster_rscu = mahal_results.get("mahal_cluster_rscu")
-
-                if mahal_cluster_gene_ids and expr_df is not None and not expr_df.empty:
-                    try:
-                        expr_df[COL_IN_MAHAL_CLUSTER] = expr_df[COL_GENE].isin(mahal_cluster_gene_ids)
-                    except Exception:
-                        pass
-
-                # Store per-subcluster stability results for diagnostics
-                mahal_results["multi_anchor_stability"] = _sub_stab_results
-
-            else:
-                # ── Single-anchor mode (original path) ─────────────────
-                stability_results = run_stability_analysis(
-                    rscu_gene_df=rscu_gene_df,
-                    output_dir=output_dir,
-                    sample_id=sample_id,
-                    ffn_path=ffn_path,
-                    rp_ids_file=rp_ids_file,
-                    rp_rscu_df=rp_rscu_df_stab,
-                    expr_df=expr_df,
-                    n_bootstraps=stability_bootstraps,
-                    multiplier_grid=stability_multipliers,
-                    core_threshold=stability_core_threshold,
-                )
-
-                for key, val in stability_results.items():
-                    if isinstance(val, Path):
-                        all_outputs[f"stability_{key}"] = val
-
-                # If auto-select is enabled and we got a recommendation,
-                # re-run Mahalanobis clustering at the recommended multiplier.
-                rec_mult = stability_results.get("recommended_multiplier")
-                if (
-                    auto_select_multiplier
-                    and rec_mult is not None
-                    and abs(rec_mult - mahal_distance_multiplier) > _MULTIPLIER_TOL
-                ):
-                    logger.info(
-                        "Auto-selecting recommended multiplier %.2f (was %.2f); "
-                        "re-running Mahalanobis clustering",
-                        rec_mult, mahal_distance_multiplier,
-                    )
-                    mahal_distance_multiplier = rec_mult
-
-                    rp_rscu_df_rerun = None
-                    if rp_ffn and rp_ffn.exists():
-                        try:
-                            rp_rscu_df_rerun = compute_rscu_per_gene(rp_ffn)
-                        except Exception:
-                            pass
-
-                    mahal_out = run_mahal_clustering(
-                        rscu_gene_df=rscu_gene_df,
-                        output_dir=output_dir,
-                        sample_id=sample_id,
-                        ffn_path=ffn_path,
-                        rp_ids_file=rp_ids_file,
-                        rp_rscu_df=rp_rscu_df_rerun,
-                        expr_df=expr_df,
-                        min_k=mahal_min_k,
-                        max_k=mahal_max_k,
-                        distance_multiplier=rec_mult,
-                    )
-                    mahal_results.update(mahal_out)
-                    for key, val in mahal_out.items():
-                        if isinstance(val, Path):
-                            all_outputs[f"mahal_{key}"] = val
-                    mahal_cluster_gene_ids = mahal_results.get("mahal_cluster_gene_ids")
-                    mahal_cluster_rscu = mahal_results.get("mahal_cluster_rscu")
-
-                    if mahal_cluster_gene_ids and expr_df is not None and not expr_df.empty:
-                        try:
-                            expr_df[COL_IN_MAHAL_CLUSTER] = expr_df[COL_GENE].isin(mahal_cluster_gene_ids)
-                        except Exception:
-                            pass
+            for key, val in stability_results.items():
+                if isinstance(val, Path):
+                    all_outputs[f"stability_{key}"] = val
 
         except Exception as e:
             logger.warning("Stability analysis failed: %s. Continuing.", e, exc_info=True)
