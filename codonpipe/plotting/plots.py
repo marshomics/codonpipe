@@ -1845,17 +1845,10 @@ def plot_coa_kde_mahal(
     """COA KDE density plot with Mahalanobis cluster boundary overlay.
 
     Identical to :func:`plot_coa_kde` but adds:
-    * A filled ellipse showing the Mahalanobis cluster boundary projected
-      onto the Axis 1 / Axis 2 plane, using the same centroid and
-      covariance matrix from the clustering module.
-    * Cluster member genes coloured distinctly from background.
+    * A smoothed convex hull around the classified cluster members,
+      showing exactly which genes are included.
+    * Cluster member genes coloured by Mahalanobis distance.
     * RP genes highlighted with open markers.
-
-    When *rp_centroid* and *rp_cov* are provided the ellipse is drawn
-    from the clustering module's covariance (projected to the first two
-    axes) scaled by *distance_threshold*, giving a boundary that matches
-    the dual-anchor plot exactly.  Falls back to fitting a 2-D covariance
-    from cluster member coordinates when these are not available.
 
     Args:
         coa_coords: Gene COA coordinates (gene, Axis1, Axis2, …).
@@ -1866,11 +1859,9 @@ def plot_coa_kde_mahal(
         mahal_cluster_gene_ids: Gene IDs inside the Mahalanobis cluster.
         mahal_gene_distances: Series indexed by gene ID with Mahalanobis
             distances (used for colour-coding cluster members).
-        distance_threshold: Mahalanobis distance threshold used to define
-            the cluster (for legend annotation).
-        rp_centroid: RP cluster centroid from clustering module (n_axes,).
-        rp_cov: RP cluster covariance matrix from clustering module
-            (n_axes, n_axes).
+        distance_threshold: Kept for backward compatibility (unused).
+        rp_centroid: Kept for backward compatibility (unused).
+        rp_cov: Kept for backward compatibility (unused).
     """
     _apply_style()
     if len(coa_coords) < 30 or "Axis1" not in coa_coords.columns:
@@ -1935,68 +1926,44 @@ def plot_coa_kde_mahal(
                 label=f"Mahal. cluster (n={int(cluster_mask.sum())})",
             )
 
-        # ── Cluster boundary ellipse ──────────────────────────────────
-        # The Mahalanobis threshold is defined in n_axes dimensions
-        # (typically 8).  Projecting that 8-D ellipsoid onto Axis1/Axis2
-        # inflates the visible boundary well beyond the actual gene cloud.
-        # Instead, compute 2-D Mahalanobis distances for the RP genes and
-        # use their 90th percentile as the ellipse scale.
+        # ── Cluster boundary — convex hull of classified members ─────
+        # Classification operates in n_axes dimensions (typically 8).
+        # Any 2-D ellipse approximation will include non-members and
+        # exclude members.  The convex hull of the actual classified
+        # genes shows exactly what's in the cluster.
         cx = x[cluster_mask]
         cy = y[cluster_mask]
-        if len(cx) >= 5:
+        n_cluster = int(cluster_mask.sum())
+        if len(cx) >= 3:
             try:
-                from matplotlib.patches import Ellipse, Patch
+                from matplotlib.patches import Patch
+                from scipy.spatial import ConvexHull
+                from scipy.interpolate import splprep, splev
 
-                if (rp_centroid is not None and rp_cov is not None):
-                    mean_x, mean_y = rp_centroid[0], rp_centroid[1]
-                    cov_2d = rp_cov[:2, :2]
+                pts = np.column_stack([cx, cy])
+                hull = ConvexHull(pts)
+                hull_pts = pts[hull.vertices]
+                hull_pts = np.vstack([hull_pts, hull_pts[0]])
+
+                if len(hull.vertices) >= 4:
+                    tck, _ = splprep([hull_pts[:, 0], hull_pts[:, 1]],
+                                     s=0, per=True, k=3)
+                    t_smooth = np.linspace(0, 1, 200)
+                    sx, sy = splev(t_smooth, tck)
                 else:
-                    mean_x, mean_y = cx.mean(), cy.mean()
-                    cov_2d = np.cov(cx, cy)
+                    sx, sy = hull_pts[:, 0], hull_pts[:, 1]
 
-                eigvals, eigvecs = np.linalg.eigh(cov_2d)
-                if np.all(eigvals > 0):
-                    # Compute 2-D Mahalanobis distances for RP genes
-                    # and use 90th percentile as the visual scale
-                    cov_2d_inv = np.linalg.inv(cov_2d)
-                    c2d = np.array([mean_x, mean_y])
-
-                    # Prefer RP gene IDs for the scale calculation
-                    rp_mask_local = None
-                    if rp_gene_ids:
-                        rp_mask_local = np.array([g in rp_gene_ids for g in gene_ids])
-                    if rp_mask_local is not None and rp_mask_local.sum() >= 5:
-                        anchor_xy = np.column_stack([x[rp_mask_local], y[rp_mask_local]])
-                    else:
-                        anchor_xy = np.column_stack([cx, cy])
-                    diffs = anchor_xy - c2d
-                    d2d = np.sqrt(np.einsum("ij,jk,ik->i", diffs, cov_2d_inv, diffs))
-                    scale = float(np.percentile(d2d, 90))
-
-                    angle = np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1]))
-                    width = 2 * scale * np.sqrt(eigvals[1])
-                    height = 2 * scale * np.sqrt(eigvals[0])
-
-                    ellipse = Ellipse(
-                        (mean_x, mean_y), width, height, angle=angle,
-                        facecolor="#2ecc71", alpha=0.12,
-                        edgecolor="#27ae60", linewidth=2.0, linestyle="-",
-                        zorder=3,
-                    )
-                    ax.add_patch(ellipse)
-
-                thresh_label = (
-                    f"Mahal. cluster boundary (n={int(cluster_mask.sum())}"
-                    f", 2-D d≤{scale:.1f})"
-                )
+                ax.plot(sx, sy, color="#27ae60", linewidth=2.0,
+                        linestyle="-", alpha=0.8, zorder=3)
+                ax.fill(sx, sy, color="#2ecc71", alpha=0.08, zorder=1)
 
                 ellipse_legend = Patch(
-                    facecolor="#2ecc71", alpha=0.2,
+                    facecolor="#2ecc71", alpha=0.15,
                     edgecolor="#27ae60", linewidth=1.5,
-                    label=thresh_label,
+                    label=f"Mahal. cluster (n={n_cluster})",
                 )
             except Exception as e:
-                logger.debug("Cluster ellipse failed: %s", e)
+                logger.debug("Cluster hull failed: %s", e)
                 ellipse_legend = None
         else:
             ellipse_legend = None
@@ -2154,54 +2121,49 @@ def plot_coa_kde_dual_anchor(
                            label=f"Ribosomal proteins (n={int(rp_mask.sum())})")
             )
 
-    # Ellipses for both anchors
-    # The Mahalanobis threshold operates in n_axes dimensions (typically 8).
-    # Projecting that 8-D ellipsoid onto 2-D inflates the visible boundary
-    # far beyond the actual gene cloud.  Instead, compute 2-D Mahalanobis
-    # distances for the anchor genes and use their 90th percentile as the
-    # ellipse scale — this gives a boundary that hugs the genes tightly
-    # in the plotted dimensions.
-    def _draw_boundary_ellipse(centroid, cov_mat, thresh, color, ls, label,
-                               anchor_gene_ids_set=None):
-        if centroid is None or cov_mat is None or thresh is None:
+    # Cluster boundaries — convex hulls of classified members
+    # Classification operates in n_axes dimensions (typically 8), so
+    # any 2-D ellipse approximation will inevitably include genes that
+    # aren't in the cluster and exclude genes that are.  Drawing the
+    # convex hull of the actual classified members avoids the mismatch:
+    # what you see is exactly what's classified.
+    from scipy.spatial import ConvexHull
+
+    def _draw_cluster_hull(member_ids_set, color, ls, label):
+        """Draw a smoothed convex hull around classified cluster members."""
+        if not member_ids_set:
+            return
+        mask = np.array([g in member_ids_set for g in gene_ids])
+        n_members = int(mask.sum())
+        if n_members < 3:
             return
         try:
-            cov_2d = cov_mat[:2, :2]
-            eigvals, eigvecs = np.linalg.eigh(cov_2d)
-            if not np.all(eigvals > 0):
-                return
-
-            # Compute a tight 2-D scale from anchor gene positions
-            scale = thresh  # fallback: raw threshold
-            if anchor_gene_ids_set is not None:
-                anchor_mask = np.array([g in anchor_gene_ids_set for g in gene_ids])
-                if anchor_mask.sum() >= 5:
-                    cov_2d_inv = np.linalg.inv(cov_2d)
-                    c2d = np.array([centroid[0], centroid[1]])
-                    anchor_xy = np.column_stack([x[anchor_mask], y[anchor_mask]])
-                    diffs = anchor_xy - c2d
-                    d2d = np.sqrt(np.einsum("ij,jk,ik->i", diffs, cov_2d_inv, diffs))
-                    scale = float(np.percentile(d2d, 90))
-
-            angle = np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1]))
-            width = 2 * scale * np.sqrt(eigvals[1])
-            height = 2 * scale * np.sqrt(eigvals[0])
-            from matplotlib.patches import Ellipse as MplEllipse
-            ell = MplEllipse(
-                (centroid[0], centroid[1]), width, height, angle=angle,
-                facecolor="none", edgecolor=color, linewidth=2.0,
-                linestyle=ls, alpha=0.8, zorder=4,
-            )
-            ax.add_patch(ell)
+            pts = np.column_stack([x[mask], y[mask]])
+            hull = ConvexHull(pts)
+            hull_pts = pts[hull.vertices]
+            # Close the polygon
+            hull_pts = np.vstack([hull_pts, hull_pts[0]])
+            # Smooth with light interpolation for a cleaner boundary
+            from scipy.interpolate import splprep, splev
+            if len(hull.vertices) >= 4:
+                tck, _ = splprep([hull_pts[:, 0], hull_pts[:, 1]],
+                                 s=0, per=True, k=3)
+                t_smooth = np.linspace(0, 1, 200)
+                sx, sy = splev(t_smooth, tck)
+            else:
+                sx, sy = hull_pts[:, 0], hull_pts[:, 1]
+            ax.plot(sx, sy, color=color, linewidth=2.0, linestyle=ls,
+                    alpha=0.8, zorder=4)
+            ax.fill(sx, sy, color=color, alpha=0.05, zorder=1)
             legend_handles.append(
-                Patch(facecolor="none", edgecolor=color,
+                Patch(facecolor=color, alpha=0.15, edgecolor=color,
                       linewidth=1.5, linestyle=ls,
-                      label=f"{label} (2-D d≤{scale:.1f})")
+                      label=f"{label} (n={n_members})")
             )
         except Exception as e:
-            logger.debug("Dual-anchor ellipse failed: %s", e)
+            logger.debug("Cluster hull failed: %s", e)
 
-    # Build sets for anchor gene lookup
+    # Build sets for cluster membership
     _rp_cluster_ids = None
     _dens_cluster_ids = None
     if dual_anchor_df is not None and not dual_anchor_df.empty:
@@ -2210,15 +2172,11 @@ def plot_coa_kde_dual_anchor(
         _rp_cluster_ids = {g for g, c in _cats.items() if c in ("rp_only", "both")}
         _dens_cluster_ids = {g for g, c in _cats.items() if c in ("dens_only", "both")}
 
-    _draw_boundary_ellipse(
-        rp_centroid, rp_cov, rp_threshold,
-        "#d95f02", "--", "RP boundary",
-        anchor_gene_ids_set=_rp_cluster_ids or (rp_gene_ids if rp_gene_ids else None),
+    _draw_cluster_hull(
+        _rp_cluster_ids, "#d95f02", "--", "RP cluster",
     )
-    _draw_boundary_ellipse(
-        density_centroid, density_cov, density_threshold,
-        "#7570b3", ":", "Density boundary",
-        anchor_gene_ids_set=_dens_cluster_ids,
+    _draw_cluster_hull(
+        _dens_cluster_ids, "#7570b3", ":", "Density cluster",
     )
 
     # Centroids
