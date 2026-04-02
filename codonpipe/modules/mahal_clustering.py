@@ -76,7 +76,7 @@ _MIN_RP_FOR_ROBUST = 10            # Min genes for MinCovDet; else empirical
 
 # Cluster boundaries
 _CLUSTER_CHI2_P = 0.95             # Density cluster: chi-squared captures ~95%
-_RP_EMPIRICAL_PCTL = 95            # RP cluster: 95th percentile of cleaned RP distances
+_RP_EMPIRICAL_PCTL = 90            # RP cluster: 90th percentile of cleaned RP distances
 
 # RP sub-cluster detection
 _RP_SUBCLUSTER_MIN = 15
