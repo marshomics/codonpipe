@@ -960,33 +960,27 @@ def _plot_coa_mahalanobis(
                        s=50, linewidths=1.5,
                        label=f"RP outliers (n={len(outlier_idx)})", zorder=6)
 
-    try:
-        cov_2d = cov[:2, :2]
-        eigvals, eigvecs = np.linalg.eigh(cov_2d)
-        if np.all(eigvals > 0):
-            # Compute 2-D Mahalanobis distances for RP genes and use
-            # 90th percentile as the visual ellipse scale, so the
-            # boundary hugs the RP gene cloud in the plotted dimensions.
-            cov_2d_inv = np.linalg.inv(cov_2d)
-            c2d = np.array([centroid[0], centroid[1]])
-            if rp_idx:
-                rp_xy = np.column_stack([x[rp_idx], y[rp_idx]])
-                diffs = rp_xy - c2d
-                d2d = np.sqrt(np.einsum("ij,jk,ik->i", diffs, cov_2d_inv, diffs))
-                scale_2d = float(np.percentile(d2d, 90))
+    # Draw convex hull of classified (optimised) genes
+    n_opt = int(opt_mask.sum())
+    if n_opt >= 3:
+        try:
+            from scipy.spatial import ConvexHull
+            from scipy.interpolate import splprep, splev
+            pts = np.column_stack([x[opt_mask], y[opt_mask]])
+            hull = ConvexHull(pts)
+            hull_pts = pts[hull.vertices]
+            hull_pts = np.vstack([hull_pts, hull_pts[0]])
+            if len(hull.vertices) >= 4:
+                tck, _ = splprep([hull_pts[:, 0], hull_pts[:, 1]],
+                                 s=0, per=True, k=3)
+                t_smooth = np.linspace(0, 1, 200)
+                sx, sy = splev(t_smooth, tck)
             else:
-                scale_2d = threshold
-            angle = np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1]))
-            width = 2 * scale_2d * np.sqrt(eigvals[1])
-            height = 2 * scale_2d * np.sqrt(eigvals[0])
-            ellipse = mpatches.Ellipse(
-                (centroid[0], centroid[1]), width, height, angle=angle,
-                linewidth=1.5, edgecolor="#d7191c", facecolor="none",
-                linestyle="--", alpha=0.7,
-                label=f"RP boundary (2-D d≤{scale_2d:.1f})")
-            ax.add_patch(ellipse)
-    except Exception:
-        pass
+                sx, sy = hull_pts[:, 0], hull_pts[:, 1]
+            ax.plot(sx, sy, color="#d7191c", linewidth=1.5, linestyle="--",
+                    alpha=0.7, zorder=4, label=f"Cluster boundary (n={n_opt})")
+        except Exception:
+            pass
 
     ax.scatter(centroid[0], centroid[1], marker="*", s=200, color="#d7191c",
                edgecolors="black", linewidths=0.5, zorder=7, label="RP centroid")
