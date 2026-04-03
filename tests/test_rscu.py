@@ -10,8 +10,8 @@ from codonpipe.modules.rscu import (
     count_codons,
     _calculate_enc,
     _calculate_gc3,
-    _codon_to_col_name,
 )
+from codonpipe.utils.codon_tables import codon_to_col_name as _codon_to_col_name
 
 
 class TestCountCodons:
@@ -63,10 +63,11 @@ class TestComputeRSCU:
             assert abs(rscu[codon_col] - 1.0) < 0.01
 
     def test_zero_amino_acid(self):
-        """If an amino acid has zero total counts, RSCU should be 0."""
+        """If an amino acid has zero total counts, RSCU should be NaN (unobserved)."""
         counts = Counter()  # empty
         rscu = compute_rscu_from_counts(counts)
-        assert rscu["Phe-UUU"] == 0.0
+        import math
+        assert math.isnan(rscu["Phe-UUU"])
 
 
 class TestCodonToColName:
@@ -101,19 +102,75 @@ class TestGC3:
         assert abs(_calculate_gc3("AAGAAT") - 0.5) < 0.01
 
 
+class TestComputeRSCUSplitFamilies:
+    """Verify that split families (Ser4/Ser2, Leu4/Leu2, Arg4/Arg2) are computed independently."""
+
+    def test_serine_split_independence(self):
+        """Ser4 (UCN) and Ser2 (AGY) RSCU should be computed from their own subfamily totals."""
+        # All Ser4 usage in UCU, zero in UCC/UCA/UCG → Ser4-UCU RSCU = 4.0
+        # All Ser2 usage in AGU, zero in AGC → Ser2-AGU RSCU = 2.0
+        counts = Counter({
+            "UCU": 100, "UCC": 0, "UCA": 0, "UCG": 0,
+            "AGU": 50, "AGC": 0,
+        })
+        rscu = compute_rscu_from_counts(counts)
+        assert abs(rscu["Ser4-UCU"] - 4.0) < 0.01
+        assert abs(rscu["Ser4-UCC"] - 0.0) < 0.01
+        assert abs(rscu["Ser2-AGU"] - 2.0) < 0.01
+        assert abs(rscu["Ser2-AGC"] - 0.0) < 0.01
+
+    def test_serine_equal_usage(self):
+        """Equal usage within each subfamily → RSCU = 1.0 for all."""
+        counts = Counter({
+            "UCU": 25, "UCC": 25, "UCA": 25, "UCG": 25,
+            "AGU": 50, "AGC": 50,
+        })
+        rscu = compute_rscu_from_counts(counts)
+        for col in ["Ser4-UCU", "Ser4-UCC", "Ser4-UCA", "Ser4-UCG"]:
+            assert abs(rscu[col] - 1.0) < 0.01
+        for col in ["Ser2-AGU", "Ser2-AGC"]:
+            assert abs(rscu[col] - 1.0) < 0.01
+
+    def test_leucine_split_independence(self):
+        """Leu4 and Leu2 computed from their own subfamily totals."""
+        counts = Counter({
+            "CUU": 100, "CUC": 100, "CUA": 0, "CUG": 0,  # Leu4
+            "UUA": 80, "UUG": 20,  # Leu2
+        })
+        rscu = compute_rscu_from_counts(counts)
+        # Leu4: CUU and CUC each have 100/200 * 4 = 2.0
+        assert abs(rscu["Leu4-CUU"] - 2.0) < 0.01
+        assert abs(rscu["Leu4-CUA"] - 0.0) < 0.01
+        # Leu2: UUA has 80/100 * 2 = 1.6
+        assert abs(rscu["Leu2-UUA"] - 1.6) < 0.01
+        assert abs(rscu["Leu2-UUG"] - 0.4) < 0.01
+
+    def test_arginine_split_independence(self):
+        """Arg4 and Arg2 computed from their own subfamily totals."""
+        counts = Counter({
+            "CGU": 25, "CGC": 25, "CGA": 25, "CGG": 25,  # Arg4
+            "AGA": 100, "AGG": 0,  # Arg2
+        })
+        rscu = compute_rscu_from_counts(counts)
+        for col in ["Arg4-CGU", "Arg4-CGC", "Arg4-CGA", "Arg4-CGG"]:
+            assert abs(rscu[col] - 1.0) < 0.01
+        assert abs(rscu["Arg2-AGA"] - 2.0) < 0.01
+        assert abs(rscu["Arg2-AGG"] - 0.0) < 0.01
+
+
 class TestENC:
     def test_extreme_bias_low_enc(self):
         """Extreme bias should give low ENC (close to 20)."""
-        # Use only one codon per amino acid
-        counts = Counter({
-            "UUU": 100, "UUC": 0,  # Phe
-            "UUA": 100, "UUG": 0, "CUU": 0, "CUC": 0, "CUA": 0, "CUG": 0,  # Leu
-            "AUU": 100, "AUC": 0, "AUA": 0,  # Ile
-            "GUU": 100, "GUC": 0, "GUA": 0, "GUG": 0,  # Val
-        })
-        enc = _calculate_enc(counts)
-        # With extreme bias, ENC should be relatively low
-        assert enc < 40
+        counts = Counter()
+        from codonpipe.utils.codon_tables import AA_CODON_GROUPS
+        # Use only the first codon per amino acid, 100 counts each
+        for aa, codons in AA_CODON_GROUPS.items():
+            counts[codons[0]] = 100
+            for c in codons[1:]:
+                counts[c] = 0
+        enc, had_f_zero = _calculate_enc(counts)
+        assert enc < 30, f"Extreme bias should give ENC < 30, got {enc}"
+        assert enc >= 20, f"ENC cannot be below 20, got {enc}"
 
     def test_no_bias_high_enc(self):
         """Equal codon usage should give high ENC (close to 61)."""
@@ -122,5 +179,26 @@ class TestENC:
         for aa, codons in AA_CODON_GROUPS.items():
             for codon in codons:
                 counts[codon] = 100
-        enc = _calculate_enc(counts)
-        assert enc > 50
+        enc, had_f_zero = _calculate_enc(counts)
+        assert enc > 58, f"No bias should give ENC > 58, got {enc}"
+        assert enc <= 61, f"ENC cannot exceed 61, got {enc}"
+
+    def test_empty_counts_gives_no_bias(self):
+        """Empty codon counts (no data) should assume no bias → ENC near 61."""
+        counts = Counter()
+        enc, had_f_zero = _calculate_enc(counts)
+        # With no observed amino acids, fallback assumes no bias: F=1/k
+        # This should give ENC = 2 + 9*2 + 1*3 + 5*4 + 3*6 = 2+18+3+20+18 = 61
+        assert abs(enc - 61.0) < 0.01, f"Empty counts should give ENC=61, got {enc}"
+
+    def test_enc_bounded(self):
+        """ENC should always be in [20, 61]."""
+        from codonpipe.utils.codon_tables import AA_CODON_GROUPS
+        rng = np.random.RandomState(123)
+        for _ in range(20):
+            counts = Counter()
+            for aa, codons in AA_CODON_GROUPS.items():
+                for codon in codons:
+                    counts[codon] = rng.randint(0, 200)
+            enc, had_f_zero = _calculate_enc(counts)
+            assert 20 <= enc <= 61, f"ENC {enc} outside valid range [20, 61]"
