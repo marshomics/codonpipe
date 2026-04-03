@@ -2354,6 +2354,7 @@ def plot_coa_kde_dual_anchor_3d(
     ax.set_zlabel(f"Axis 3 ({pct3:.1f}%)")
     ax.set_title(f"{sample_id}: 3-D dual-anchor COA ({len(gene_ids)} genes)", fontsize=11)
     ax.legend(fontsize=6, loc="upper left", framealpha=0.7)
+    ax.set_box_aspect([1, 1, 1])
     ax.view_init(elev=25, azim=-60)
 
     _save_fig(fig, output_path)
@@ -2523,6 +2524,7 @@ def plot_coa_kde_dual_anchor_3d_interactive(
             xaxis_title=ax_labels[0],
             yaxis_title=ax_labels[1],
             zaxis_title=ax_labels[2],
+            aspectmode="cube",
         ),
         width=950, height=750,
         legend=dict(font=dict(size=10)),
@@ -2935,10 +2937,10 @@ def plot_s_value_scatter(
     sample_id: str = "",
     metric: str = "CAI",
 ):
-    """Scatter plot of S-value vs expression metric (e.g. CAI).
+    """Scatter plot of RSCU distance vs expression metric (e.g. CAI).
 
     Args:
-        s_val_df: DataFrame with gene, S_value.
+        s_val_df: DataFrame with gene, RSCU_distance (or legacy S_value).
         expr_df: Expression table with gene and score columns.
         output_path: Base path for saving.
         sample_id: Sample name for title.
@@ -2948,31 +2950,35 @@ def plot_s_value_scatter(
     if s_val_df.empty or expr_df is None or metric not in expr_df.columns:
         return
 
+    # Support both new and legacy column names
+    dist_col = "RSCU_distance" if "RSCU_distance" in s_val_df.columns else "S_value"
+    ref_col = "RSCU_distance_reference" if "RSCU_distance_reference" in s_val_df.columns else "S_reference"
+
     merged = s_val_df.merge(expr_df[["gene", metric]], on="gene", how="inner")
     if len(merged) < 10:
         return
 
     fig, ax = plt.subplots(figsize=(7, 6))
-    ax.scatter(merged[metric], merged["S_value"], s=6, alpha=0.35, c="steelblue", edgecolors="none")
+    ax.scatter(merged[metric], merged[dist_col], s=6, alpha=0.35, c="steelblue", edgecolors="none")
 
     # Regression line
-    valid = merged.dropna(subset=[metric, "S_value"])
+    valid = merged.dropna(subset=[metric, dist_col])
     if len(valid) > 10 and valid[metric].nunique() > 1:
-        slope, intercept, r, p_val, _ = stats.linregress(valid[metric], valid["S_value"])
+        slope, intercept, r, p_val, _ = stats.linregress(valid[metric], valid[dist_col])
         x_line = np.linspace(valid[metric].min(), valid[metric].max(), 100)
         ax.plot(x_line, slope * x_line + intercept, "r-", linewidth=1,
                 label=f"r = {r:.3f}, p = {p_val:.2e}")
         ax.legend(fontsize=8)
 
-    # Determine S-value reference from the DataFrame if available
+    # Determine RSCU distance reference from the DataFrame if available
     _s_ref_map = {"mahal_cluster": "Mahalanobis cluster", "ace": "ACE consensus", "rp": "ribosomal proteins"}
-    _s_ref_raw = merged["S_reference"].iloc[0] if "S_reference" in merged.columns else "rp"
+    _s_ref_raw = merged[ref_col].iloc[0] if ref_col in merged.columns else "rp"
     _s_ref_label = _s_ref_map.get(_s_ref_raw, _s_ref_raw)
 
     ax.set_xlabel(f"{metric} Score")
-    ax.set_ylabel(f"S-value (RSCU distance to {_s_ref_label})")
+    ax.set_ylabel(f"RSCU distance to {_s_ref_label}")
     if sample_id:
-        ax.set_title(f"S-value vs {metric} — {sample_id}")
+        ax.set_title(f"RSCU distance vs {metric} — {sample_id}")
 
     _save_fig(fig, output_path)
 
