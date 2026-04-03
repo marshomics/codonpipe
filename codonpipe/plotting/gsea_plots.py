@@ -92,11 +92,15 @@ def plot_gsea_bar(
         sig["display_val"] = sig["nes"]
         xlabel = "Normalized Enrichment Score (NES)"
 
-    # Sort by absolute value, take top N
-    sig = sig.reindex(sig["display_val"].abs().sort_values(ascending=False).index)
-    sig = sig.head(max_sets)
+    # Split into enriched (positive) and depleted (negative), sort each by
+    # magnitude, then concatenate: enriched block on top, depleted below.
+    enriched = sig[sig["display_val"] > 0].sort_values("display_val", ascending=False)
+    depleted = sig[sig["display_val"] <= 0].sort_values("display_val", ascending=True)
+    # Take top N across both blocks, preserving the split ordering
+    sig = pd.concat([enriched, depleted]).head(max_sets)
 
-    # Reverse for horizontal bar (top of plot = highest)
+    # Reverse for horizontal bar (matplotlib draws bottom-up, so last row
+    # appears at the top — reverse puts enriched at top of figure)
     sig = sig.iloc[::-1]
 
     colors = [_ENRICHED_COLOR if v > 0 else _DEPLETED_COLOR for v in sig["display_val"]]
@@ -276,14 +280,20 @@ def plot_gsea_condition_comparison(
         logger.info("GSEA condition comparison: no significant gene sets")
         return None
 
-    sig = sig.head(max_sets)
-
     # Identify condition columns (mean_nes_*)
     cond_cols = [c for c in sig.columns if c.startswith("mean_nes_")]
     conditions = [c.replace("mean_nes_", "") for c in cond_cols]
 
     if len(conditions) < 2:
         return None
+
+    # Split enriched / depleted by average NES across conditions, sort each
+    # block by magnitude, then concatenate: enriched on top, depleted below.
+    sig["_avg_nes"] = sig[cond_cols].mean(axis=1)
+    enriched = sig[sig["_avg_nes"] > 0].sort_values("_avg_nes", ascending=False)
+    depleted = sig[sig["_avg_nes"] <= 0].sort_values("_avg_nes", ascending=True)
+    sig = pd.concat([enriched, depleted]).head(max_sets)
+    sig = sig.drop(columns=["_avg_nes"])
 
     cond_palette = _condition_colors(conditions)
 
@@ -295,7 +305,7 @@ def plot_gsea_condition_comparison(
     bar_height = 0.8 / n_cond
     y_base = np.arange(n_sets)
 
-    # Reverse order for top-down reading
+    # Reverse for horizontal bar (matplotlib draws bottom-up)
     sig = sig.iloc[::-1].reset_index(drop=True)
 
     for j, (cond, col) in enumerate(zip(conditions, cond_cols)):
