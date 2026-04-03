@@ -10,10 +10,10 @@ Gene set sources
 * **KEGG Pathways** — broader metabolic maps (already in pipeline)
 * **COG categories** — coarse functional classification (always available)
 
-The primary ranking metric is core-relative CAI divergence (1 − core_CAI),
-where core_CAI is computed against the distance-weighted RSCU of the
-Mahalanobis core cluster.  Falls back to raw Mahalanobis distance when
-core_CAI is unavailable.  Higher values = more divergent codon usage.
+The primary ranking metric is **rare_codon_burden** — a length-normalised,
+rarity-weighted score derived from the RP Mahalanobis cluster's adaptation
+weights.  Falls back to core_CU_divergence (1 − core_CAI), then to raw
+Mahalanobis distance.  Higher values = more divergent codon usage.
 """
 
 from __future__ import annotations
@@ -543,16 +543,19 @@ def run_gsea_analysis(
         logger.warning("GSEA: mahal_clusters.tsv missing expected columns; skipping")
         return results
 
-    # Determine ranking metric.  Prefer core_CAI (1 − CAI gives a
-    # divergence score where high = poorly adapted to core cluster).
-    # Fall back to Mahalanobis distance when core_CAI is unavailable.
-    if "core_CAI" in clusters.columns and clusters["core_CAI"].notna().any():
+    # Determine ranking metric.  Prefer rare_codon_burden (length-normalised,
+    # rarity-weighted score from RP cluster adaptation weights).  Fall back to
+    # core_CU_divergence (1 − core_CAI), then raw Mahalanobis distance.
+    if "rare_codon_burden" in clusters.columns and clusters["rare_codon_burden"].notna().any():
+        _metric_col = "rare_codon_burden"
+        logger.info("GSEA ranking metric: rare_codon_burden")
+    elif "core_CAI" in clusters.columns and clusters["core_CAI"].notna().any():
         clusters["core_CU_divergence"] = 1.0 - clusters["core_CAI"]
         _metric_col = "core_CU_divergence"
-        logger.info("GSEA ranking metric: core_CU_divergence (1 − core_CAI)")
+        logger.info("GSEA ranking metric: core_CU_divergence (rare_codon_burden unavailable)")
     else:
         _metric_col = "mahalanobis_distance"
-        logger.info("GSEA ranking metric: mahalanobis_distance (core_CAI unavailable)")
+        logger.info("GSEA ranking metric: mahalanobis_distance (rare_codon_burden & core_CAI unavailable)")
 
     # Sort descending: most divergent genes first
     ranked = clusters.sort_values(_metric_col, ascending=False).reset_index(drop=True)
