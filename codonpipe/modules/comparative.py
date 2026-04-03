@@ -304,12 +304,13 @@ def _read_s_value(paths: dict, row: dict) -> None:
     if p and Path(p).exists():
         try:
             df = pd.read_csv(p, sep="\t")
-            s_col = next((c for c in ("S", "s_value", "S_value") if c in df.columns), None)
+            # Accept both old ("S_value") and new ("RSCU_distance") column names
+            s_col = next((c for c in ("RSCU_distance", "S", "s_value", "S_value") if c in df.columns), None)
             if s_col:
                 row["mean_S_value"] = df[s_col].mean()
                 row["median_S_value"] = df[s_col].median()
         except Exception as e:
-            logger.debug("Failed to read S-value: %s", e)
+            logger.debug("Failed to read RSCU distance: %s", e)
 
 
 def _read_translational_selection(paths: dict, row: dict) -> None:
@@ -592,7 +593,7 @@ def within_condition_rscu_dispersion(
             rows.append({
                 "condition": cond,
                 "codon": col,
-                "amino_acid": col.split("-")[0],
+                "amino_acid": col.split("-")[0] if "-" in col else col,
                 "mean_rscu": round(mu, 4),
                 "sd_rscu": round(sd, 4),
                 "cv": round(sd / mu, 4) if mu != 0 else np.nan,
@@ -690,6 +691,7 @@ def between_condition_tests(
     result = pd.DataFrame(rows)
 
     # BH FDR correction (within each test type)
+    result["corrected_p"] = np.nan
     for test_type in result["test"].unique():
         mask = result["test"] == test_type
         pvals = result.loc[mask, "p_value"].values
@@ -804,7 +806,7 @@ def between_condition_rscu_tests(
 
             rows.append({
                 "codon": codon,
-                "amino_acid": codon.split("-")[0],
+                "amino_acid": codon.split("-")[0] if "-" in codon else codon,
                 "group1": g1,
                 "group2": g2,
                 "mean_g1": round(mean1, 4),
@@ -821,6 +823,7 @@ def between_condition_rscu_tests(
     result = pd.DataFrame(rows)
 
     # BH FDR per comparison pair
+    result["corrected_p"] = np.nan
     for (g1, g2), grp in result.groupby(["group1", "group2"]):
         idx = grp.index
         result.loc[idx, "corrected_p"] = benjamini_hochberg(grp["p_value"].values)
@@ -933,7 +936,7 @@ def _cliffs_delta(x: np.ndarray, y: np.ndarray) -> float:
     """Cliff's delta non-parametric effect size."""
     nx, ny = len(x), len(y)
     if nx == 0 or ny == 0:
-        return 0.0
+        return np.nan
     more = 0
     less = 0
     for xi in x:
@@ -1037,6 +1040,7 @@ def between_condition_expression_class_rscu(
 
     result = pd.DataFrame(rows)
     # BH FDR per comparison pair
+    result["p_adjusted"] = np.nan
     for (g1, g2), grp in result.groupby(["group1", "group2"]):
         idx = grp.index
         result.loc[idx, "p_adjusted"] = benjamini_hochberg(grp["p_value"].values)
