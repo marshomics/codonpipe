@@ -2203,6 +2203,345 @@ def plot_coa_kde_dual_anchor(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 3-D dual-anchor COA plots (static + interactive)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _dual_anchor_3d_data(
+    coa_coords: pd.DataFrame,
+    dual_anchor_df: pd.DataFrame,
+    rp_gene_ids: set[str] | None,
+    axes: list[str],
+) -> dict:
+    """Extract common data for 3-D dual-anchor plots.
+
+    Returns a dict with gene_ids, xyz arrays, category arrays, rp_mask,
+    inertia labels, and category colour/label maps.
+    """
+    gene_ids = coa_coords["gene"].astype(str).values
+    coords = {a: coa_coords[a].values for a in axes}
+
+    cat_map = dict(zip(dual_anchor_df["gene"].astype(str),
+                       dual_anchor_df["dual_category"].astype(str)))
+    gene_cats = np.array([cat_map.get(g, "neither") for g in gene_ids])
+
+    rp_mask = (
+        np.array([g in rp_gene_ids for g in gene_ids])
+        if rp_gene_ids else np.zeros(len(gene_ids), dtype=bool)
+    )
+
+    cat_colors = {
+        "both": "#1b9e77", "rp_only": "#d95f02",
+        "dens_only": "#7570b3", "neither": "#d0d0d0",
+    }
+    cat_labels = {
+        "both": "Both clusters", "rp_only": "RP-cluster only",
+        "dens_only": "Density-cluster only", "neither": "Neither",
+    }
+    cat_alphas = {"both": 0.7, "rp_only": 0.7, "dens_only": 0.7, "neither": 0.15}
+    cat_sizes = {"both": 14, "rp_only": 14, "dens_only": 14, "neither": 5}
+
+    return {
+        "gene_ids": gene_ids, "coords": coords, "gene_cats": gene_cats,
+        "rp_mask": rp_mask, "cat_colors": cat_colors, "cat_labels": cat_labels,
+        "cat_alphas": cat_alphas, "cat_sizes": cat_sizes,
+    }
+
+
+def plot_coa_kde_dual_anchor_3d(
+    coa_coords: pd.DataFrame,
+    coa_inertia: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+    rp_gene_ids: set[str] | None = None,
+    dual_anchor_df: pd.DataFrame | None = None,
+    rp_centroid: "np.ndarray | None" = None,
+    density_centroid: "np.ndarray | None" = None,
+):
+    """Static 3-D dual-anchor scatter (Axes 1-3) saved as PNG.
+
+    Uses matplotlib's mplot3d projection.  Convex hulls are drawn around
+    RP-cluster and density-cluster members in 3-D.
+    """
+    _apply_style()
+    if dual_anchor_df is None or dual_anchor_df.empty:
+        return
+    axes_needed = ["Axis1", "Axis2", "Axis3"]
+    if not all(a in coa_coords.columns for a in axes_needed):
+        logger.info("SKIPPED: 3-D dual-anchor plot (need Axis1-3)")
+        return
+    if len(coa_coords) < 30:
+        return
+
+    data = _dual_anchor_3d_data(coa_coords, dual_anchor_df, rp_gene_ids, axes_needed)
+    coords = data["coords"]
+    xx, yy, zz = coords["Axis1"], coords["Axis2"], coords["Axis3"]
+    gene_cats = data["gene_cats"]
+    gene_ids = data["gene_ids"]
+
+    _a1 = coa_inertia.loc[coa_inertia["axis"] == 1, "pct_inertia"].values
+    _a2 = coa_inertia.loc[coa_inertia["axis"] == 2, "pct_inertia"].values
+    _a3 = coa_inertia.loc[coa_inertia["axis"] == 3, "pct_inertia"].values
+    pct1 = _a1[0] if len(_a1) else 0
+    pct2 = _a2[0] if len(_a2) else 0
+    pct3 = _a3[0] if len(_a3) else 0
+
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    from scipy.spatial import ConvexHull
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Plot by category
+    for cat in ["neither", "dens_only", "rp_only", "both"]:
+        mask = gene_cats == cat
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        ax.scatter(
+            xx[mask], yy[mask], zz[mask],
+            c=data["cat_colors"][cat], alpha=data["cat_alphas"][cat],
+            s=data["cat_sizes"][cat], edgecolors="none",
+            label=f"{data['cat_labels'][cat]} (n={n})", depthshade=True,
+        )
+
+    # RP markers
+    if data["rp_mask"].any():
+        rm = data["rp_mask"]
+        ax.scatter(
+            xx[rm], yy[rm], zz[rm],
+            facecolors="none", edgecolors="black", s=35, linewidths=0.7,
+            label=f"Ribosomal proteins (n={int(rm.sum())})", depthshade=False,
+        )
+
+    # Convex hulls for each cluster
+    cat_map = dict(zip(dual_anchor_df["gene"].astype(str),
+                       dual_anchor_df["dual_category"].astype(str)))
+
+    def _draw_hull_3d(member_ids, color, alpha_face=0.06, label_prefix=""):
+        member_mask = np.array([g in member_ids for g in gene_ids])
+        n_m = int(member_mask.sum())
+        if n_m < 4:
+            return
+        try:
+            pts = np.column_stack([xx[member_mask], yy[member_mask], zz[member_mask]])
+            hull = ConvexHull(pts)
+            faces = []
+            for simplex in hull.simplices:
+                triangle = pts[simplex]
+                faces.append(triangle)
+            poly = Poly3DCollection(faces, alpha=alpha_face, facecolor=color,
+                                    edgecolor=color, linewidth=0.3)
+            ax.add_collection3d(poly)
+        except Exception as e:
+            logger.debug("3-D hull failed: %s", e)
+
+    rp_ids = {g for g, c in cat_map.items() if c in ("rp_only", "both")}
+    dens_ids = {g for g, c in cat_map.items() if c in ("dens_only", "both")}
+    _draw_hull_3d(rp_ids, "#d95f02", 0.06)
+    _draw_hull_3d(dens_ids, "#7570b3", 0.04)
+
+    # Centroids
+    if rp_centroid is not None and len(rp_centroid) >= 3:
+        ax.scatter(*rp_centroid[:3], marker="*", s=200, color="#d95f02",
+                   edgecolors="black", linewidths=0.5, zorder=10)
+    if density_centroid is not None and len(density_centroid) >= 3:
+        ax.scatter(*density_centroid[:3], marker="D", s=80, color="#7570b3",
+                   edgecolors="black", linewidths=0.5, zorder=10)
+
+    ax.set_xlabel(f"Axis 1 ({pct1:.1f}%)")
+    ax.set_ylabel(f"Axis 2 ({pct2:.1f}%)")
+    ax.set_zlabel(f"Axis 3 ({pct3:.1f}%)")
+    ax.set_title(f"{sample_id}: 3-D dual-anchor COA ({len(gene_ids)} genes)", fontsize=11)
+    ax.legend(fontsize=6, loc="upper left", framealpha=0.7)
+    ax.view_init(elev=25, azim=-60)
+
+    _save_fig(fig, output_path)
+
+
+def plot_coa_kde_dual_anchor_3d_interactive(
+    coa_coords: pd.DataFrame,
+    coa_inertia: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+    rp_gene_ids: set[str] | None = None,
+    dual_anchor_df: pd.DataFrame | None = None,
+    rp_centroid: "np.ndarray | None" = None,
+    density_centroid: "np.ndarray | None" = None,
+    n_coa_axes: int = 3,
+):
+    """Interactive 3-D dual-anchor scatter saved as HTML.
+
+    When *n_coa_axes* is 3, plots Axis1/Axis2/Axis3 directly.
+    When *n_coa_axes* > 3 (e.g. 8), applies PCA on Axis1..AxisN to
+    reduce to 3 components for visualization, preserving maximum variance
+    across all classification-relevant dimensions.
+
+    Uses plotly for mouse-driven rotation, zoom, and hover tooltips.
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        logger.warning("SKIPPED: interactive 3-D plot (plotly not installed)")
+        return
+
+    if dual_anchor_df is None or dual_anchor_df.empty:
+        return
+
+    # Determine which axes to use
+    all_axes = [f"Axis{i+1}" for i in range(n_coa_axes)
+                if f"Axis{i+1}" in coa_coords.columns]
+    if len(all_axes) < 3:
+        logger.info("SKIPPED: interactive 3-D plot (need >= 3 axes, have %d)", len(all_axes))
+        return
+
+    gene_ids = coa_coords["gene"].astype(str).values
+    X_axes = coa_coords[all_axes].values
+
+    if len(all_axes) > 3:
+        # PCA to 3 components
+        from sklearn.decomposition import PCA
+        pca = PCA(n_components=3, random_state=42)
+        X_3d = pca.fit_transform(X_axes)
+        var_explained = pca.explained_variance_ratio_ * 100
+        ax_labels = [
+            f"PC1 ({var_explained[0]:.1f}% of Axes 1-{len(all_axes)})",
+            f"PC2 ({var_explained[1]:.1f}%)",
+            f"PC3 ({var_explained[2]:.1f}%)",
+        ]
+        title_suffix = f"{len(all_axes)}-D→3-D PCA projection"
+        # Project centroids through the same PCA
+        rp_c3 = pca.transform(rp_centroid[:len(all_axes)].reshape(1, -1))[0] if (
+            rp_centroid is not None and len(rp_centroid) >= len(all_axes)) else None
+        dens_c3 = pca.transform(density_centroid[:len(all_axes)].reshape(1, -1))[0] if (
+            density_centroid is not None and len(density_centroid) >= len(all_axes)) else None
+    else:
+        X_3d = X_axes[:, :3]
+        _inertia = {}
+        for i in range(1, 4):
+            row = coa_inertia.loc[coa_inertia["axis"] == i, "pct_inertia"].values
+            _inertia[i] = row[0] if len(row) else 0
+        ax_labels = [
+            f"Axis 1 ({_inertia[1]:.1f}% inertia)",
+            f"Axis 2 ({_inertia[2]:.1f}% inertia)",
+            f"Axis 3 ({_inertia[3]:.1f}% inertia)",
+        ]
+        title_suffix = "Axes 1-3"
+        rp_c3 = rp_centroid[:3] if rp_centroid is not None and len(rp_centroid) >= 3 else None
+        dens_c3 = density_centroid[:3] if density_centroid is not None and len(density_centroid) >= 3 else None
+
+    cat_map = dict(zip(dual_anchor_df["gene"].astype(str),
+                       dual_anchor_df["dual_category"].astype(str)))
+    gene_cats = np.array([cat_map.get(g, "neither") for g in gene_ids])
+
+    rp_set = rp_gene_ids or set()
+    is_rp = np.array([g in rp_set for g in gene_ids])
+
+    cat_colors = {
+        "both": "#1b9e77", "rp_only": "#d95f02",
+        "dens_only": "#7570b3", "neither": "#d0d0d0",
+    }
+    cat_labels = {
+        "both": "Both clusters", "rp_only": "RP-cluster only",
+        "dens_only": "Density-cluster only", "neither": "Neither",
+    }
+
+    fig = go.Figure()
+
+    # Scatter by category
+    for cat in ["neither", "dens_only", "rp_only", "both"]:
+        mask = gene_cats == cat
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        hover = [f"{gid} ({'RP' if rp else ''})" for gid, rp in zip(gene_ids[mask], is_rp[mask])]
+        fig.add_trace(go.Scatter3d(
+            x=X_3d[mask, 0], y=X_3d[mask, 1], z=X_3d[mask, 2],
+            mode="markers",
+            marker=dict(
+                size=3 if cat == "neither" else 4,
+                color=cat_colors[cat],
+                opacity=0.15 if cat == "neither" else 0.7,
+            ),
+            name=f"{cat_labels[cat]} (n={n})",
+            text=hover, hoverinfo="text",
+        ))
+
+    # RP overlay
+    if is_rp.any():
+        fig.add_trace(go.Scatter3d(
+            x=X_3d[is_rp, 0], y=X_3d[is_rp, 1], z=X_3d[is_rp, 2],
+            mode="markers",
+            marker=dict(size=5, color="rgba(0,0,0,0)",
+                        line=dict(color="black", width=1.5)),
+            name=f"Ribosomal proteins (n={int(is_rp.sum())})",
+            text=[g for g in gene_ids[is_rp]], hoverinfo="text",
+        ))
+
+    # Cluster hulls as Mesh3d
+    def _add_hull_mesh(member_ids, color, name):
+        m = np.array([g in member_ids for g in gene_ids])
+        if m.sum() < 4:
+            return
+        try:
+            from scipy.spatial import ConvexHull
+            pts = X_3d[m]
+            hull = ConvexHull(pts)
+            fig.add_trace(go.Mesh3d(
+                x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
+                i=hull.simplices[:, 0], j=hull.simplices[:, 1], k=hull.simplices[:, 2],
+                color=color, opacity=0.08, name=name,
+                hoverinfo="skip",
+            ))
+        except Exception:
+            pass
+
+    rp_ids = {g for g, c in cat_map.items() if c in ("rp_only", "both")}
+    dens_ids = {g for g, c in cat_map.items() if c in ("dens_only", "both")}
+    _add_hull_mesh(rp_ids, "#d95f02", "RP cluster hull")
+    _add_hull_mesh(dens_ids, "#7570b3", "Density cluster hull")
+
+    # Centroids
+    if rp_c3 is not None:
+        fig.add_trace(go.Scatter3d(
+            x=[rp_c3[0]], y=[rp_c3[1]], z=[rp_c3[2]],
+            mode="markers", marker=dict(size=10, symbol="diamond",
+                                        color="#d95f02", line=dict(color="black", width=1)),
+            name="RP centroid", hoverinfo="name",
+        ))
+    if dens_c3 is not None:
+        fig.add_trace(go.Scatter3d(
+            x=[dens_c3[0]], y=[dens_c3[1]], z=[dens_c3[2]],
+            mode="markers", marker=dict(size=8, symbol="diamond",
+                                        color="#7570b3", line=dict(color="black", width=1)),
+            name="Density centroid", hoverinfo="name",
+        ))
+
+    fig.update_layout(
+        title=f"{sample_id}: {title_suffix} ({len(gene_ids)} genes)",
+        scene=dict(
+            xaxis_title=ax_labels[0],
+            yaxis_title=ax_labels[1],
+            zaxis_title=ax_labels[2],
+        ),
+        width=950, height=750,
+        legend=dict(font=dict(size=10)),
+        margin=dict(l=0, r=0, t=40, b=0),
+    )
+
+    html_path = output_path.with_suffix(".html")
+    fig.write_html(str(html_path), include_plotlyjs="cdn")
+    logger.info("Saved interactive 3-D plot: %s", html_path)
+
+    # Also save a static PNG via plotly's kaleido if available
+    try:
+        png_path = output_path.with_suffix(".png")
+        fig.write_image(str(png_path), width=950, height=750, scale=2)
+    except Exception:
+        logger.debug("Static PNG export from plotly failed (kaleido not installed?)")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Codon-usage genome landscape (line plot across genome position)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -5940,6 +6279,65 @@ def generate_single_genome_plots(
             outputs["coa_kde_dual_anchor"] = p.with_suffix(".png")
         except Exception as e:
             logger.warning("COA KDE + dual-anchor overlay plot failed: %s", e)
+
+    # ── 3-D dual-anchor plots (static + interactive) ──────────────────
+    if (_coa_coords_for_landscape is not None
+            and _coa_inertia_for_landscape is not None
+            and dual_anchor_df is not None and not dual_anchor_df.empty):
+        # Static matplotlib 3-D (Axes 1-3)
+        try:
+            p = plot_dir / f"{sample_id}_coa_dual_anchor_3d"
+            plot_coa_kde_dual_anchor_3d(
+                _coa_coords_for_landscape,
+                _coa_inertia_for_landscape,
+                p,
+                sample_id=sample_id,
+                rp_gene_ids=rp_gene_ids,
+                dual_anchor_df=dual_anchor_df,
+                rp_centroid=rp_centroid,
+                density_centroid=density_centroid,
+            )
+            outputs["coa_dual_anchor_3d"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("3-D dual-anchor static plot failed: %s", e)
+
+        # Interactive plotly 3-D (Axes 1-3)
+        try:
+            p = plot_dir / f"{sample_id}_coa_dual_anchor_3d_interactive"
+            plot_coa_kde_dual_anchor_3d_interactive(
+                _coa_coords_for_landscape,
+                _coa_inertia_for_landscape,
+                p,
+                sample_id=sample_id,
+                rp_gene_ids=rp_gene_ids,
+                dual_anchor_df=dual_anchor_df,
+                rp_centroid=rp_centroid,
+                density_centroid=density_centroid,
+                n_coa_axes=3,
+            )
+            outputs["coa_dual_anchor_3d_interactive"] = p.with_suffix(".html")
+        except Exception as e:
+            logger.warning("3-D dual-anchor interactive plot failed: %s", e)
+
+        # Interactive plotly N-D→3-D PCA projection (all classification axes)
+        _n_axes = len(rp_centroid) if rp_centroid is not None else 8
+        if _n_axes > 3:
+            try:
+                p = plot_dir / f"{sample_id}_coa_dual_anchor_{_n_axes}d_interactive"
+                plot_coa_kde_dual_anchor_3d_interactive(
+                    _coa_coords_for_landscape,
+                    _coa_inertia_for_landscape,
+                    p,
+                    sample_id=sample_id,
+                    rp_gene_ids=rp_gene_ids,
+                    dual_anchor_df=dual_anchor_df,
+                    rp_centroid=rp_centroid,
+                    density_centroid=density_centroid,
+                    n_coa_axes=_n_axes,
+                )
+                outputs[f"coa_dual_anchor_{_n_axes}d_interactive"] = p.with_suffix(".html")
+            except Exception as e:
+                logger.warning("%d-D dual-anchor interactive plot failed: %s", _n_axes, e)
 
     # ── CU genome landscape (30-gene bins) ─────────────────────────────
     if dual_anchor_df is not None and not dual_anchor_df.empty:
