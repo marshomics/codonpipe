@@ -1,4 +1,4 @@
-"""Advanced codon usage analyses: COA, S-value, neutrality, PR2, delta RSCU,
+"""Advanced codon usage analyses: COA, RSCU distance, neutrality, PR2, delta RSCU,
 tRNA-codon correlation, COG enrichment, gene length vs bias, and ENC-ENC' difference.
 
 All analyses are computed from data already available in the pipeline
@@ -147,10 +147,16 @@ def compute_coa_on_rscu(
     }
 
 
-# ─── S-value (RSCU distance to ribosomal proteins) ──────────────────────────
+# ─── RSCU distance to reference profile ─────────────────────────────────────
+#
+# Previously called "S-value" in earlier versions of this pipeline. Renamed
+# to avoid confusion with the Sharp & Li (1987) S index (codon adaptation
+# index based on relative adaptedness weights and geometric means). This
+# metric is a straightforward Euclidean or chi-squared distance between a
+# gene's RSCU vector and a reference RSCU profile.
 
 
-def compute_s_value(
+def compute_rscu_distance(
     rscu_gene_df: pd.DataFrame,
     rscu_rp: dict[str, float] | None,
     metric: str = "euclidean",
@@ -167,7 +173,7 @@ def compute_s_value(
     and composition-independent.  Ribosomal proteins are the traditional
     fallback.
 
-    Genes with low S-values have codon usage similar to the reference
+    Genes with low RSCU distance have codon usage similar to the reference
     (i.e. adapted toward translational optimization).
 
     Args:
@@ -178,7 +184,7 @@ def compute_s_value(
         rscu_mahal_cluster: Mahalanobis optimal cluster RSCU dict (preferred reference).
 
     Returns:
-        DataFrame with gene, S_value, S_reference columns.
+        DataFrame with gene, RSCU_distance, RSCU_distance_reference columns.
     """
     # Priority: Mahalanobis cluster > ACE consensus > RP
     if rscu_mahal_cluster is not None:
@@ -192,11 +198,11 @@ def compute_s_value(
         ref_label = "rp"
 
     if ref is None:
-        return pd.DataFrame(columns=[COL_GENE, "S_value", "S_reference"])
+        return pd.DataFrame(columns=[COL_GENE, "RSCU_distance", "RSCU_distance_reference"])
 
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns and c in ref]
     if not rscu_cols:
-        return pd.DataFrame(columns=[COL_GENE, "S_value", "S_reference"])
+        return pd.DataFrame(columns=[COL_GENE, "RSCU_distance", "RSCU_distance_reference"])
 
     ref_vec = np.array([ref[c] for c in rscu_cols])
     gene_mat = rscu_gene_df[rscu_cols].values
@@ -211,9 +217,13 @@ def compute_s_value(
 
     return pd.DataFrame({
         COL_GENE: rscu_gene_df[COL_GENE].values,
-        "S_value": dists,
-        "S_reference": ref_label,
+        "RSCU_distance": dists,
+        "RSCU_distance_reference": ref_label,
     })
+
+
+# Backward-compatibility alias for external code that imported the old name
+compute_s_value = compute_rscu_distance
 
 
 # ─── ENC - ENC' difference ──────────────────────────────────────────────────
@@ -275,14 +285,14 @@ def compute_gc12_gc3(ffn_path: Path, min_length: int = 240) -> pd.DataFrame:
 
         gc1 = gc2 = gc3 = total1 = total2 = total3 = 0
         for i in range(0, len(seq) - 2, 3):
-            for pos_offset, counters in [(0, "1"), (1, "2"), (2, "3")]:
+            for pos_offset, pos_label in [(0, "1"), (1, "2"), (2, "3")]:
                 base = seq[i + pos_offset]
                 if base in "ACGT":
-                    if counters == "1":
+                    if pos_label == "1":
                         total1 += 1
                         if base in "GC":
                             gc1 += 1
-                    elif counters == "2":
+                    elif pos_label == "2":
                         total2 += 1
                         if base in "GC":
                             gc2 += 1
@@ -345,14 +355,14 @@ def compute_pr2(ffn_path: Path, min_length: int = 240) -> pd.DataFrame:
 
         if at_total > 0 and gc_total > 0:
             rows.append({
-                "gene": rec.id,
+                COL_GENE: rec.id,
                 "A3_ratio": a3 / at_total,
                 "G3_ratio": g3 / gc_total,
                 "length": len(seq),
             })
 
     return pd.DataFrame(rows) if rows else pd.DataFrame(
-        columns=["gene", "A3_ratio", "G3_ratio", "length"]
+        columns=[COL_GENE, "A3_ratio", "G3_ratio", "length"]
     )
 
 
@@ -399,7 +409,7 @@ def compute_delta_rscu(
 
     # Merge RSCU with expression tiers
     merged = rscu_gene_df.merge(
-        expr_df[["gene", class_col]], on="gene", how="inner"
+        expr_df[[COL_GENE, class_col]], on=COL_GENE, how="inner"
     )
 
     if rscu_reference is not None:
@@ -578,8 +588,10 @@ def compute_trna_codon_correlation(
 
     rows = []
     for col in rscu_cols:
+        if col not in RSCU_COL_TO_CODON:
+            continue
         codon = RSCU_COL_TO_CODON[col]
-        aa = col.split("-")[0]
+        aa = col.split("-")[0] if "-" in col else col
         trna_n = trna_map.get(codon, 0)
 
         row = {
@@ -821,7 +833,7 @@ def run_advanced_analyses(
         cog_result_tsv: COGclassifier result.tsv (for COG enrichment).
         rscu_ace: ACE consensus RSCU dict.
         rscu_mahal_cluster: Mahalanobis optimal cluster RSCU dict. When provided,
-            S-value uses this as the reference (highest priority).
+            RSCU distance uses this as the reference (highest priority).
 
     Returns:
         Dict of output DataFrames and file paths.
@@ -840,18 +852,18 @@ def run_advanced_analyses(
             outputs[key] = df
             outputs[f"{key}_path"] = out_path
 
-    # 2. S-value (reference priority: Mahalanobis cluster > ACE consensus > RP)
+    # 2. RSCU distance (reference priority: Mahalanobis cluster > ACE consensus > RP)
     if rscu_mahal_cluster is not None:
         ref_label = "Mahalanobis cluster"
     elif rscu_ace is not None:
         ref_label = "ACE consensus"
     else:
         ref_label = "ribosomal proteins"
-    logger.info("Computing S-value (RSCU distance to %s) for %s", ref_label, sample_id)
-    s_val_df = compute_s_value(rscu_gene_df, rscu_rp, rscu_ace=rscu_ace,
-                                rscu_mahal_cluster=rscu_mahal_cluster)
+    logger.info("Computing RSCU distance to %s for %s", ref_label, sample_id)
+    s_val_df = compute_rscu_distance(rscu_gene_df, rscu_rp, rscu_ace=rscu_ace,
+                                      rscu_mahal_cluster=rscu_mahal_cluster)
     if not s_val_df.empty:
-        out_path = adv_dir / f"{sample_id}_s_value.tsv"
+        out_path = adv_dir / f"{sample_id}_rscu_distance.tsv"
         s_val_df.to_csv(out_path, sep="\t", index=False)
         outputs["s_value"] = s_val_df
         outputs["s_value_path"] = out_path
