@@ -138,7 +138,7 @@ def run_single_genome(
         5. CU bias statistics (ENCprime, MILC via coRdon)
         6. Expression level prediction (MELP/CAI/Fop)
         7. Pathway enrichment (hypergeometric test on high/low expression genes)
-        8. Advanced analyses (COA, S-value, neutrality, PR2, delta RSCU,
+        8. Advanced analyses (COA, RSCU distance, neutrality, PR2, delta RSCU,
            tRNA-codon correlation, COG enrichment, gene length vs bias,
            ENC-ENC' difference)
         9. Mahalanobis clustering — COA-based Mahalanobis distance clustering
@@ -814,27 +814,27 @@ def run_single_genome(
         except Exception as e:
             logger.warning("RP-based pathway enrichment failed: %s. Continuing.", e, exc_info=True)
 
-    # ── Step 9d: Recompute S-value, delta RSCU, COG enrichment with Mahalanobis ──
+    # ── Step 9d: Recompute RSCU distance, delta RSCU, COG enrichment with Mahalanobis ──
     # Step 8 computed these against RP-based tiers / genome-average baseline.
     # Now recompute with Mahalanobis cluster as both the expression reference
     # (tiers already updated in 9b) and as the RSCU baseline for delta RSCU.
     if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty:
         try:
             from codonpipe.modules.advanced_analyses import (
-                compute_s_value, compute_delta_rscu, compute_cog_enrichment,
+                compute_rscu_distance, compute_delta_rscu, compute_cog_enrichment,
             )
             rscu_mahal_dict = mahal_cluster_rscu.to_dict()
             adv_dir = output_dir / "advanced"
 
-            logger.info("[Step 9d/12] Recomputing S-value with Mahalanobis-cluster RSCU reference")
-            s_val_mahal_df = compute_s_value(rscu_gene_df, rscu_rp,
-                                            rscu_mahal_cluster=rscu_mahal_dict)
+            logger.info("[Step 9d/12] Recomputing RSCU distance with Mahalanobis-cluster reference")
+            s_val_mahal_df = compute_rscu_distance(rscu_gene_df, rscu_rp,
+                                                    rscu_mahal_cluster=rscu_mahal_dict)
             if not s_val_mahal_df.empty:
-                s_val_path = adv_dir / f"{sample_id}_s_value.tsv"
+                s_val_path = adv_dir / f"{sample_id}_rscu_distance.tsv"
                 s_val_mahal_df.to_csv(s_val_path, sep="\t", index=False)
                 all_outputs["advanced_s_value_path"] = s_val_path
                 advanced_results["s_value"] = s_val_mahal_df
-                logger.info("S-value recomputed against Mahalanobis-cluster reference (%d genes)", len(s_val_mahal_df))
+                logger.info("RSCU distance recomputed against Mahalanobis-cluster reference (%d genes)", len(s_val_mahal_df))
 
             # Delta RSCU with Mahalanobis-based expression tiers (genome-avg baseline)
             if expr_df is not None:
