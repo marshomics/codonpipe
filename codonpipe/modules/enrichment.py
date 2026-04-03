@@ -629,7 +629,10 @@ def generate_codon_inefficiency_report(
     # Select and order output columns
     out_cols = [
         "gene",
+        "gene_length_codons",
         "core_CAI",
+        "rare_codon_freq",
+        "rare_codon_burden",
         "n_core_rare_codons",
         "n_genome_rare_codons",
         "mahalanobis_distance",
