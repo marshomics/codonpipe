@@ -62,12 +62,15 @@ class TestPairwiseWilcoxon:
 
 class TestZscoreNormalization:
     def test_zscore_mean_zero(self, sample_rscu_df):
-        result = compute_zscore_normalization(sample_rscu_df, ["Phe-UUU", "Phe-UUC"])
+        # Test z-score explicitly (CLR is now the default)
+        result = compute_zscore_normalization(sample_rscu_df, ["Phe-UUU", "Phe-UUC"], method="zscore")
         assert abs(result["Phe-UUU"].mean()) < 0.01
         assert abs(result["Phe-UUC"].mean()) < 0.01
 
     def test_zscore_std_one(self, sample_rscu_df):
-        result = compute_zscore_normalization(sample_rscu_df, ["Phe-UUU"])
+        # Default method is now CLR (centered log-ratio), not z-score.
+        # Test z-score explicitly for backward compat.
+        result = compute_zscore_normalization(sample_rscu_df, ["Phe-UUU"], method="zscore")
         assert abs(result["Phe-UUU"].std() - 1.0) < 0.1
 
     def test_preserves_other_columns(self, sample_rscu_df):
