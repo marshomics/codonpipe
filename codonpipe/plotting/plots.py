@@ -6452,6 +6452,108 @@ def generate_single_genome_plots(
         except Exception as e:
             logger.warning("ENC-GC3 landscape plot failed: %s", e)
 
+    # ── Codon usage inefficiency disconnect plots ──────────────────────
+    # Load the inefficiency report from disk (generated in pipeline step 9e)
+    _ineff_report = None
+    _ineff_path = output_dir / "enrichment_mahal" / f"{sample_id}_codon_inefficiency_report.tsv"
+    if _ineff_path.exists():
+        try:
+            _ineff_report = pd.read_csv(_ineff_path, sep="\t")
+        except Exception as e:
+            logger.warning("Failed to load codon inefficiency report: %s", e)
+
+    _rp_rscu_dict = (dict(mahal_cluster_rscu)
+                     if mahal_cluster_rscu is not None
+                     and not (hasattr(mahal_cluster_rscu, "empty") and mahal_cluster_rscu.empty)
+                     else None)
+
+    if _ineff_report is not None and not _ineff_report.empty:
+        # Re-rank by rare_codon_burden descending (the report ships sorted by
+        # core_CAI ascending, but these plots specifically visualize the burden
+        # metric from the Mahalanobis-cluster adaptation weights).
+        if ("rare_codon_burden" in _ineff_report.columns
+                and _ineff_report["rare_codon_burden"].notna().any()):
+            _ineff_report = (_ineff_report
+                             .sort_values("rare_codon_burden", ascending=False)
+                             .reset_index(drop=True))
+        else:
+            logger.info("SKIPPED: inefficiency disconnect plots "
+                        "(rare_codon_burden column missing or empty)")
+            _ineff_report = None  # gate out downstream plots
+
+    if _ineff_report is not None and not _ineff_report.empty:
+        # 1. Waterfall plot
+        try:
+            p = plot_dir / f"{sample_id}_inefficiency_waterfall"
+            result = plot_inefficiency_waterfall(
+                _ineff_report, p, sample_id=sample_id,
+            )
+            if result:
+                outputs["inefficiency_waterfall"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Inefficiency waterfall plot failed: %s", e, exc_info=True)
+
+        # 2. RSCU deviation heatmap (top 50 genes)
+        if rscu_gene_df is not None and _rp_rscu_dict:
+            try:
+                p = plot_dir / f"{sample_id}_inefficiency_rscu_deviation"
+                result = plot_inefficiency_rscu_deviation_heatmap(
+                    _ineff_report, rscu_gene_df, _rp_rscu_dict,
+                    p, sample_id=sample_id, n_genes=50,
+                )
+                if result:
+                    outputs["inefficiency_rscu_deviation"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Inefficiency RSCU deviation heatmap failed: %s", e, exc_info=True)
+
+        # 3. Adaptation weight ridge/violin plot
+        if rscu_gene_df is not None and _rp_rscu_dict:
+            try:
+                p = plot_dir / f"{sample_id}_inefficiency_adaptation_weights"
+                result = plot_inefficiency_adaptation_weight_ridges(
+                    _ineff_report, rscu_gene_df, _rp_rscu_dict,
+                    p, sample_id=sample_id,
+                )
+                if result:
+                    outputs["inefficiency_adaptation_weights"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Inefficiency adaptation weight plot failed: %s", e, exc_info=True)
+
+        # 4. Scatter: rare codon burden vs core CAI
+        try:
+            p = plot_dir / f"{sample_id}_inefficiency_scatter"
+            result = plot_inefficiency_scatter(
+                _ineff_report, p, sample_id=sample_id,
+            )
+            if result:
+                outputs["inefficiency_scatter"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Inefficiency scatter plot failed: %s", e, exc_info=True)
+
+        # 5. Cumulative burden curve
+        try:
+            p = plot_dir / f"{sample_id}_inefficiency_cumulative"
+            result = plot_inefficiency_cumulative_burden(
+                _ineff_report, p, sample_id=sample_id,
+            )
+            if result:
+                outputs["inefficiency_cumulative"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Inefficiency cumulative burden plot failed: %s", e, exc_info=True)
+
+        # 6. Per-codon grouped bar: RP cluster vs tier medians
+        if rscu_gene_df is not None and _rp_rscu_dict:
+            try:
+                p = plot_dir / f"{sample_id}_inefficiency_per_codon"
+                result = plot_inefficiency_per_codon_usage(
+                    _ineff_report, rscu_gene_df, _rp_rscu_dict,
+                    p, sample_id=sample_id,
+                )
+                if result:
+                    outputs["inefficiency_per_codon"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Inefficiency per-codon bar plot failed: %s", e, exc_info=True)
+
     return outputs
 
 
@@ -6836,108 +6938,6 @@ def _generate_bio_ecology_plots(
             logger.info("SKIPPED: circular CU map (no RSCU/ENC data)")
     except Exception as e:
         logger.warning("Circular CU map failed: %s", e, exc_info=True)
-
-    # ── Codon usage inefficiency disconnect plots ──────────────────────
-    # Load the inefficiency report from disk (generated in pipeline step 9e)
-    _ineff_report = None
-    _ineff_path = output_dir / "enrichment_mahal" / f"{sample_id}_codon_inefficiency_report.tsv"
-    if _ineff_path.exists():
-        try:
-            _ineff_report = pd.read_csv(_ineff_path, sep="\t")
-        except Exception as e:
-            logger.warning("Failed to load codon inefficiency report: %s", e)
-
-    _rp_rscu_dict = (dict(mahal_cluster_rscu)
-                     if mahal_cluster_rscu is not None
-                     and not (hasattr(mahal_cluster_rscu, "empty") and mahal_cluster_rscu.empty)
-                     else None)
-
-    if _ineff_report is not None and not _ineff_report.empty:
-        # Re-rank by rare_codon_burden descending (the report ships sorted by
-        # core_CAI ascending, but these plots specifically visualize the burden
-        # metric from the Mahalanobis-cluster adaptation weights).
-        if ("rare_codon_burden" in _ineff_report.columns
-                and _ineff_report["rare_codon_burden"].notna().any()):
-            _ineff_report = (_ineff_report
-                             .sort_values("rare_codon_burden", ascending=False)
-                             .reset_index(drop=True))
-        else:
-            logger.info("SKIPPED: inefficiency disconnect plots "
-                        "(rare_codon_burden column missing or empty)")
-            _ineff_report = None  # gate out downstream plots
-
-    if _ineff_report is not None and not _ineff_report.empty:
-        # 1. Waterfall plot
-        try:
-            p = plot_dir / f"{sample_id}_inefficiency_waterfall"
-            result = plot_inefficiency_waterfall(
-                _ineff_report, p, sample_id=sample_id,
-            )
-            if result:
-                outputs["inefficiency_waterfall"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Inefficiency waterfall plot failed: %s", e, exc_info=True)
-
-        # 2. RSCU deviation heatmap (top 50 genes)
-        if rscu_gene_df is not None and _rp_rscu_dict:
-            try:
-                p = plot_dir / f"{sample_id}_inefficiency_rscu_deviation"
-                result = plot_inefficiency_rscu_deviation_heatmap(
-                    _ineff_report, rscu_gene_df, _rp_rscu_dict,
-                    p, sample_id=sample_id, n_genes=50,
-                )
-                if result:
-                    outputs["inefficiency_rscu_deviation"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Inefficiency RSCU deviation heatmap failed: %s", e, exc_info=True)
-
-        # 3. Adaptation weight ridge/violin plot
-        if rscu_gene_df is not None and _rp_rscu_dict:
-            try:
-                p = plot_dir / f"{sample_id}_inefficiency_adaptation_weights"
-                result = plot_inefficiency_adaptation_weight_ridges(
-                    _ineff_report, rscu_gene_df, _rp_rscu_dict,
-                    p, sample_id=sample_id,
-                )
-                if result:
-                    outputs["inefficiency_adaptation_weights"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Inefficiency adaptation weight plot failed: %s", e, exc_info=True)
-
-        # 4. Scatter: rare codon freq vs core CAI
-        try:
-            p = plot_dir / f"{sample_id}_inefficiency_scatter"
-            result = plot_inefficiency_scatter(
-                _ineff_report, p, sample_id=sample_id,
-            )
-            if result:
-                outputs["inefficiency_scatter"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Inefficiency scatter plot failed: %s", e, exc_info=True)
-
-        # 5. Cumulative burden curve
-        try:
-            p = plot_dir / f"{sample_id}_inefficiency_cumulative"
-            result = plot_inefficiency_cumulative_burden(
-                _ineff_report, p, sample_id=sample_id,
-            )
-            if result:
-                outputs["inefficiency_cumulative"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Inefficiency cumulative burden plot failed: %s", e, exc_info=True)
-
-        # 6. Per-codon grouped bar: RP cluster vs tier medians
-        if rscu_gene_df is not None and _rp_rscu_dict:
-            try:
-                p = plot_dir / f"{sample_id}_inefficiency_per_codon"
-                result = plot_inefficiency_per_codon_usage(
-                    _ineff_report, rscu_gene_df, _rp_rscu_dict,
-                    p, sample_id=sample_id,
-                )
-                if result:
-                    outputs["inefficiency_per_codon"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Inefficiency per-codon bar plot failed: %s", e, exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
