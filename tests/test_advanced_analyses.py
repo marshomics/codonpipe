@@ -14,7 +14,7 @@ from codonpipe.modules.advanced_analyses import (
     compute_gc12_gc3,
     compute_gene_length_bias,
     compute_pr2,
-    compute_s_value,
+    compute_rscu_distance,
     compute_trna_codon_correlation,
     extract_trna_counts_from_gff,
     _reverse_complement,
@@ -129,30 +129,29 @@ class TestCOA:
         assert result == {}
 
 
-class TestSValue:
-    def test_s_value_computed(self):
+class TestRSCUDistance:
+    def test_rscu_distance_computed(self):
         rscu_df = _make_rscu_gene_df(50)
-        # Use first gene as pseudo-reference
         rscu_rp = {col: 1.0 for col in RSCU_COLUMN_NAMES}
-        result = compute_s_value(rscu_df, rscu_rp)
-        assert "S_value" in result.columns
+        result = compute_rscu_distance(rscu_df, rscu_rp)
+        assert "RSCU_distance" in result.columns
         assert len(result) == 50
-        assert (result["S_value"] >= 0).all()
+        assert (result["RSCU_distance"] >= 0).all()
 
-    def test_s_value_no_reference(self):
+    def test_rscu_distance_no_reference(self):
         rscu_df = _make_rscu_gene_df(50)
-        result = compute_s_value(rscu_df, None)
+        result = compute_rscu_distance(rscu_df, None)
         assert result.empty
 
-    def test_s_value_identical_to_ref_is_zero(self):
-        """A gene with identical RSCU to reference should have S=0."""
+    def test_rscu_distance_identical_to_ref_is_zero(self):
+        """A gene with identical RSCU to reference should have distance=0."""
         ref = {col: 1.5 for col in RSCU_COLUMN_NAMES}
         data = {"gene": ["test_gene"], "length": [600]}
         for col in RSCU_COLUMN_NAMES:
             data[col] = [1.5]
         rscu_df = pd.DataFrame(data)
-        result = compute_s_value(rscu_df, ref)
-        assert abs(result.iloc[0]["S_value"]) < 1e-10
+        result = compute_rscu_distance(rscu_df, ref)
+        assert abs(result.iloc[0]["RSCU_distance"]) < 1e-10
 
 
 class TestENCDiff:
