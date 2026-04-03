@@ -305,6 +305,17 @@ def detect_genomic_islands(
     divergence exceeds the *baseline_pctl* percentile of the genome-wide
     divergence distribution.  Overlapping/adjacent regions are merged.
 
+    .. note:: Exploratory heuristic
+
+       This is a codon-usage-based genomic island screen, not a
+       validated detection method. The default parameters (bin_size=30,
+       sigma=1, prominence=0.08) were chosen empirically for genomes in
+       the 2000-5000 gene range and have NOT been benchmarked against
+       databases like IslandViewer, IslandPath-DIMOB, or SIGI-HMM.
+       For small genomes (<1000 genes), 30-gene bins yield very few
+       windows and sensitivity will be low. Results should be treated
+       as candidates for follow-up, not definitive island calls.
+
     Args:
         dual_anchor_df: DataFrame with ``gene``, ``rp_membership``,
             ``density_membership`` columns.
@@ -314,7 +325,10 @@ def detect_genomic_islands(
             meaningful start/end positions; without it, positions are
             gene-index based and the output is less useful.
         bin_size: Genes per bin (should match the landscape plot).
+            Default 30; reduce for small genomes (<1500 genes).
         prominence: Minimum peak prominence in the divergence trace.
+            Default 0.08; this is a heuristic with no formal biological
+            derivation.
         baseline_pctl: Percentile of genome-wide bin divergence used as
             the expansion threshold around each peak.
 
@@ -429,6 +443,9 @@ def detect_genomic_islands(
 
     # Merge overlapping/adjacent regions
     regions.sort()
+    if not regions:
+        return pd.DataFrame(columns=["island_start", "island_end", "island_length", "n_genes",
+                                      "mean_divergence", "max_divergence"])
     merged: list[tuple[int, int]] = [regions[0]]
     for lo, hi in regions[1:]:
         prev_lo, prev_hi = merged[-1]
@@ -663,7 +680,7 @@ def detect_hgt_candidates(
         ref_vals = np.array([ref_series.get(c, np.nan) for c in rscu_cols])
         if np.any(np.isnan(ref_vals)):
             # Fill missing codons with genome mean for those positions
-            genome_mean = X.mean(axis=0) if not pca_applied else rscu_df[rscu_cols].values.mean(axis=0)
+            genome_mean = X.mean(axis=0) if not pca_applied else rscu_gene_df[rscu_cols].values.mean(axis=0)
             nan_mask = np.isnan(ref_vals)
             ref_vals[nan_mask] = genome_mean[nan_mask]
         # If PCA was applied, project reference into PCA space
@@ -698,11 +715,21 @@ def detect_hgt_candidates(
 
     mahal_dists = np.array(mahal_dists)
 
-    # Chi-squared p-value from Mahalanobis distance (df = n_features)
+    # Chi-squared p-value from Mahalanobis distance (df = n_features).
+    # WARNING: These p-values are approximate. LedoitWolf shrinkage biases
+    # the covariance estimate toward the identity, inflating Mahalanobis
+    # distances for off-diagonal-heavy covariance structures and deflating
+    # them otherwise. The resulting chi-squared p-values have poorly
+    # calibrated type I error rates and should NOT be interpreted as exact.
+    # The adaptive quantile-based threshold (below) is more defensible for
+    # high-confidence HGT calls. FDR-corrected p-values are provided for
+    # ranking purposes but may be anti-conservative or conservative depending
+    # on the degree of shrinkage.
     p_values = 1 - stats.chi2.cdf(mahal_dists ** 2, df=n_features)
-    # Note: p-values are approximate because LedoitWolf shrinkage introduces bias
-    # in the covariance estimate, invalidating the exact chi-squared assumption.
-    logger.info("HGT p-values are approximate (LedoitWolf shrinkage covariance used)")
+    logger.warning(
+        "HGT chi-squared p-values are approximate due to LedoitWolf shrinkage; "
+        "use adaptive quantile threshold for high-confidence calls"
+    )
 
     # GC3 deviation from genome mean
     merged_gc3 = enc_df[["gene", "GC3"]].copy()
@@ -896,6 +923,7 @@ def quantify_translational_selection(
     expr_df: pd.DataFrame,
     ffn_path: Path,
     optimal_percentile: float = 0.75,
+    optimal_delta_threshold: float = 0.05,
 ) -> dict[str, pd.DataFrame]:
     """Quantify translational selection via optimal codon identification and Fop analysis.
 
@@ -913,6 +941,12 @@ def quantify_translational_selection(
         expr_df: Expression table with gene and at least one of MELP, CAI,
             or Fop columns.
         ffn_path: Path to CDS nucleotide FASTA.
+        optimal_delta_threshold: Minimum delta-RSCU (high-expression minus
+            genome average) for a codon to be called "optimal". Default
+            0.05; suitable for organisms with moderate translational
+            selection (e.g. E. coli). Lower values (0.02-0.03) may be
+            appropriate for organisms with weak selection. This is a
+            heuristic cutoff, not derived from a significance test.
 
     Returns:
         Dict with keys: "optimal_codons", "fop_gradient", "position_effects".
@@ -965,7 +999,7 @@ def quantify_translational_selection(
                 "delta_rscu": round(delta, 4),
                 "genome_avg_rscu": round(genome_avg_rscu[col], 4),
                 "high_expr_rscu": round(high_avg_rscu[col], 4),
-                "is_optimal": 1 if delta > 0.05 else 0,
+                "is_optimal": 1 if delta > optimal_delta_threshold else 0,
                 "expression_metric": metric,
             })
         optimal_df = pd.DataFrame(optimal_rows)
@@ -1437,12 +1471,40 @@ def compute_operon_codon_coadaptation(
             random_dists.append(euclidean(rscu_map[g1], rscu_map[g2]))
 
     if random_dists:
-        median_random = np.median(random_dists)
-        result_df["same_operon_prediction"] = (
-            result_df["rscu_distance"] < median_random
-        )
+        random_dists_arr = np.array(random_dists)
+        median_random = np.median(random_dists_arr)
+        n_null = len(random_dists_arr)
+
+        # Compute empirical p-value for each pair: fraction of null distances
+        # that are <= the observed distance (one-sided test for whether the
+        # pair is closer than expected by chance).
+        empirical_p = np.array([
+            (np.sum(random_dists_arr <= d) + 1) / (n_null + 1)  # +1 for conservative estimate
+            for d in result_df["rscu_distance"].values
+        ])
+        result_df["empirical_p"] = empirical_p
+
+        # Benjamini-Hochberg FDR correction
+        n_tests = len(empirical_p)
+        sorted_idx = np.argsort(empirical_p)
+        sorted_p = empirical_p[sorted_idx]
+        fdr_vals = np.empty(n_tests)
+        for i, rank in enumerate(range(1, n_tests + 1)):
+            fdr_vals[i] = sorted_p[i] * n_tests / rank
+        # Enforce monotonicity (cumulative minimum from the right)
+        for i in range(n_tests - 2, -1, -1):
+            fdr_vals[i] = min(fdr_vals[i], fdr_vals[i + 1])
+        fdr_vals = np.clip(fdr_vals, 0, 1)
+        # Map back to original order
+        fdr_result = np.empty(n_tests)
+        fdr_result[sorted_idx] = fdr_vals
+        result_df["fdr"] = fdr_result
+
+        result_df["same_operon_prediction"] = result_df["fdr"] < 0.05
         result_df["random_baseline_median"] = median_random
     else:
+        result_df["empirical_p"] = np.nan
+        result_df["fdr"] = np.nan
         result_df["same_operon_prediction"] = False
         result_df["random_baseline_median"] = np.nan
 
