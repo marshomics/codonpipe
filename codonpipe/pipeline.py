@@ -25,7 +25,12 @@ from codonpipe.modules.enrichment import run_enrichment_analysis
 from codonpipe.modules.advanced_analyses import run_advanced_analyses
 from codonpipe.modules.mahal_clustering import run_mahal_clustering
 from codonpipe.modules.cluster_stability import run_stability_analysis
-from codonpipe.modules.bio_ecology import run_bio_ecology_analyses, annotate_gff_with_cu_class
+from codonpipe.modules.bio_ecology import (
+    run_bio_ecology_analyses,
+    annotate_gff_with_cu_class,
+    detect_genomic_islands,
+    annotate_gff_with_genomic_islands,
+)
 from codonpipe.modules.codon_table_formats import generate_all_codon_tables
 from codonpipe.modules.statistics import run_batch_statistics
 from codonpipe.modules.comparative import run_comparative_analyses
@@ -1021,6 +1026,34 @@ def run_single_genome(
             logger.info("[Step 10b] CU-annotated GFF saved to %s", _cu_gff_path)
         except Exception as e:
             logger.warning("CU-annotated GFF generation failed: %s. Continuing.", e, exc_info=True)
+
+    # ── Step 10c: Genomic island GFF ─────────────────────────────────────
+    # Detect divergent-CU peaks from the landscape trace and write a GFF
+    # with genomic_island region features overlaid on the original annotation.
+    if resolved_gff is not None and _dual_df is not None and not _dual_df.empty:
+        try:
+            islands = detect_genomic_islands(
+                dual_anchor_df=_dual_df,
+                rscu_gene_df=rscu_gene_df,
+                enc_df=enc_df,
+                gff_path=resolved_gff,
+            )
+            if islands:
+                _island_gff_path = output_dir / "prokka" / f"{sample_id}_genomic_islands.gff"
+                _island_gff_path.parent.mkdir(parents=True, exist_ok=True)
+                annotate_gff_with_genomic_islands(
+                    gff_path=resolved_gff,
+                    islands=islands,
+                    output_path=_island_gff_path,
+                )
+                all_outputs["genomic_islands_gff"] = _island_gff_path
+                all_outputs["genomic_islands"] = islands
+                logger.info(
+                    "[Step 10c] Genomic island GFF saved to %s (%d islands)",
+                    _island_gff_path, len(islands),
+                )
+        except Exception as e:
+            logger.warning("Genomic island detection failed: %s. Continuing.", e, exc_info=True)
 
     # ── Step 11: Codon usage tables ──────────────────────────────────────
     logger.info("[Step 11/12] Generating codon usage tables in all standard formats")
