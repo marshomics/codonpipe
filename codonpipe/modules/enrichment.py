@@ -547,9 +547,10 @@ def generate_codon_inefficiency_report(
         ko_col = _find_ko_column(kofam_df)
         gene_col = _find_gene_column(kofam_df)
         if ko_col and gene_col:
-            ko_info = kofam_df[[gene_col, ko_col]].copy()
+            ko_cols = [gene_col, ko_col]
             if "KO_definition" in kofam_df.columns:
-                ko_info = kofam_df[[gene_col, ko_col, "KO_definition"]].copy()
+                ko_cols.append("KO_definition")
+            ko_info = kofam_df[ko_cols].copy()
             ko_info = ko_info.rename(columns={gene_col: "gene", ko_col: "KO"})
             clusters = clusters.merge(ko_info, on="gene", how="left")
     if "KO" not in clusters.columns:
