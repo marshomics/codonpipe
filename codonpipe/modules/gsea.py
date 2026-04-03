@@ -172,8 +172,11 @@ def run_preranked_gsea(
     n = len(genes)
 
     rows = []
-    all_null_pos = []
-    all_null_neg = []
+    # Collect null NES values (not raw ES) for pooled FDR à la
+    # Subramanian et al. (2005).  Each entry is an array of NES values
+    # from permutations for one gene set.
+    pooled_null_nes_pos: list[np.ndarray] = []
+    pooled_null_nes_neg: list[np.ndarray] = []
 
     for gs_name, gs_genes in gene_sets.items():
         # Intersect gene set with ranked list
@@ -187,23 +190,34 @@ def run_preranked_gsea(
         # Permutation null
         null_es = _permutation_es(mask, weights, n_perm, rng, exponent)
 
-        # Separate positive and negative null distributions for NES
-        pos_null = null_es[null_es >= 0]
-        neg_null = null_es[null_es < 0]
+        # Separate positive and negative null ES for NES normalisation
+        pos_null_es = null_es[null_es >= 0]
+        neg_null_es = null_es[null_es < 0]
+        mean_pos = np.mean(pos_null_es) if len(pos_null_es) > 0 else 0.0
+        mean_neg = np.mean(neg_null_es) if len(neg_null_es) > 0 else 0.0
 
-        # Nominal p-value
+        # Nominal p-value (one-sided, against full null)
         if es >= 0:
             p_val = (np.sum(null_es >= es) + 1) / (n_perm + 1)
         else:
             p_val = (np.sum(null_es <= es) + 1) / (n_perm + 1)
 
         # Normalized enrichment score
-        if es >= 0 and len(pos_null) > 0:
-            nes = es / np.mean(pos_null) if np.mean(pos_null) > 0 else 0.0
-        elif es < 0 and len(neg_null) > 0:
-            nes = es / abs(np.mean(neg_null)) if np.mean(neg_null) != 0 else 0.0
+        if es >= 0 and mean_pos > 0:
+            nes = es / mean_pos
+        elif es < 0 and mean_neg != 0:
+            nes = es / abs(mean_neg)
         else:
             nes = 0.0
+
+        # Normalise the null ES values into null NES using the same
+        # per-gene-set means, then pool across gene sets for FDR.
+        if mean_pos > 0:
+            null_nes_pos = pos_null_es / mean_pos
+            pooled_null_nes_pos.append(null_nes_pos)
+        if mean_neg != 0:
+            null_nes_neg = neg_null_es / abs(mean_neg)
+            pooled_null_nes_neg.append(null_nes_neg)
 
         # Leading edge: genes contributing to the ES before the peak
         if es >= 0:
@@ -211,9 +225,6 @@ def run_preranked_gsea(
         else:
             peak_idx = np.argmin(running_sum)
         leading_edge = [genes[i] for i in range(peak_idx + 1) if mask[i]]
-
-        all_null_pos.append(pos_null)
-        all_null_neg.append(neg_null)
 
         rows.append({
             "gene_set": gs_name,
@@ -232,7 +243,55 @@ def run_preranked_gsea(
         ])
 
     result = pd.DataFrame(rows)
-    result["fdr"] = benjamini_hochberg(result["p_value"].values)
+
+    # ── FDR in NES space (Subramanian et al. 2005) ──────────────────
+    #
+    # For each observed NES*, FDR is the ratio of the fraction of null
+    # NES values exceeding NES* to the fraction of observed NES values
+    # exceeding NES*.  Positive and negative NES are handled separately.
+    #
+    # FDR_pos(NES*) = (#{null NES ≥ NES*} / N_null_pos) /
+    #                 (#{obs  NES ≥ NES*} / N_obs_pos)
+    # FDR_neg(NES*) = (#{null NES ≤ NES*} / N_null_neg) /
+    #                 (#{obs  NES ≤ NES*} / N_obs_neg)
+
+    all_null_pos = (np.concatenate(pooled_null_nes_pos)
+                    if pooled_null_nes_pos else np.array([]))
+    all_null_neg = (np.concatenate(pooled_null_nes_neg)
+                    if pooled_null_nes_neg else np.array([]))
+
+    obs_nes = result["nes"].values
+    obs_pos_mask = obs_nes >= 0
+    obs_neg_mask = obs_nes < 0
+    n_obs_pos = obs_pos_mask.sum()
+    n_obs_neg = obs_neg_mask.sum()
+
+    fdr_values = np.ones(len(result))
+
+    # Positive NES
+    if n_obs_pos > 0 and len(all_null_pos) > 0:
+        for i in np.where(obs_pos_mask)[0]:
+            nes_i = obs_nes[i]
+            # Fraction of null NES ≥ nes_i
+            frac_null = np.sum(all_null_pos >= nes_i) / len(all_null_pos)
+            # Fraction of observed positive NES ≥ nes_i
+            frac_obs = np.sum(obs_nes[obs_pos_mask] >= nes_i) / n_obs_pos
+            fdr_values[i] = (frac_null / frac_obs) if frac_obs > 0 else 1.0
+
+    # Negative NES
+    if n_obs_neg > 0 and len(all_null_neg) > 0:
+        for i in np.where(obs_neg_mask)[0]:
+            nes_i = obs_nes[i]
+            # Fraction of null NES ≤ nes_i (more extreme negative)
+            frac_null = np.sum(all_null_neg <= nes_i) / len(all_null_neg)
+            # Fraction of observed negative NES ≤ nes_i
+            frac_obs = np.sum(obs_nes[obs_neg_mask] <= nes_i) / n_obs_neg
+            fdr_values[i] = (frac_null / frac_obs) if frac_obs > 0 else 1.0
+
+    # Cap at 1.0
+    fdr_values = np.minimum(fdr_values, 1.0)
+
+    result["fdr"] = np.round(fdr_values, 6)
     result = result.sort_values("p_value").reset_index(drop=True)
 
     return result
