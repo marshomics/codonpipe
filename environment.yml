@@ -21,6 +21,8 @@ dependencies:
   - seaborn>=0.12
   - biopython>=1.81
   - umap-learn>=0.5
+  - plotly>=5.18
+  - python-kaleido>=0.2
   - tqdm>=4.65
   - click>=8.1
 
