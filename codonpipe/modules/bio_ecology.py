@@ -280,6 +280,289 @@ def annotate_gff_with_cu_class(
     return output_path
 
 
+# ── Genomic island detection from CU landscape ────────────────────────
+
+
+def detect_genomic_islands(
+    dual_anchor_df: pd.DataFrame,
+    rscu_gene_df: pd.DataFrame,
+    enc_df: pd.DataFrame,
+    gff_path: Path | None = None,
+    bin_size: int = 30,
+    prominence: float = 0.08,
+    baseline_pctl: float = 50.0,
+) -> list[dict]:
+    """Detect genomic islands as peaks in the divergent-CU landscape.
+
+    Replicates the binning logic of ``plot_cu_genome_landscape``: genes
+    are ordered by genomic position, grouped into *bin_size*-gene bins,
+    and a per-bin divergence score is computed as
+    ``1 − max(rp_membership, density_membership)``.
+
+    Peaks in the divergence trace are identified with
+    ``scipy.signal.find_peaks`` using a *prominence* threshold.  Each
+    peak is then expanded outward to all contiguous bins whose
+    divergence exceeds the *baseline_pctl* percentile of the genome-wide
+    divergence distribution.  Overlapping/adjacent regions are merged.
+
+    Args:
+        dual_anchor_df: DataFrame with ``gene``, ``rp_membership``,
+            ``density_membership`` columns.
+        rscu_gene_df: Per-gene RSCU table (gene ordering fallback).
+        enc_df: ENC table (gene ordering fallback).
+        gff_path: GFF3 file for genomic coordinates.  Required for
+            meaningful start/end positions; without it, positions are
+            gene-index based and the output is less useful.
+        bin_size: Genes per bin (should match the landscape plot).
+        prominence: Minimum peak prominence in the divergence trace.
+        baseline_pctl: Percentile of genome-wide bin divergence used as
+            the expansion threshold around each peak.
+
+    Returns:
+        List of dicts, each with keys ``island_id``, ``start_bp``,
+        ``end_bp``, ``seqname``, ``n_genes``, ``genes``,
+        ``mean_divergence``, ``peak_divergence``.
+        Empty list if detection is not possible.
+    """
+    from scipy.signal import find_peaks
+    from scipy.ndimage import gaussian_filter1d
+
+    if dual_anchor_df is None or dual_anchor_df.empty:
+        return []
+    for col in ("rp_membership", "density_membership"):
+        if col not in dual_anchor_df.columns:
+            return []
+
+    # ── Gene ordering (same as landscape plot) ──────────────────────
+    # Inline the position logic rather than importing from plotting
+    known_genes = set(dual_anchor_df["gene"].astype(str))
+    gene_coords: dict[str, tuple[int, int, str, str]] = {}  # gene → (start, end, strand, seqname)
+
+    if gff_path is not None and Path(gff_path).exists():
+        with open(gff_path) as fh:
+            for line in fh:
+                if line.startswith("#") or line.startswith(">"):
+                    continue
+                parts = line.strip().split("\t")
+                if len(parts) < 9 or parts[2] != "CDS":
+                    continue
+                try:
+                    start, end = int(parts[3]), int(parts[4])
+                except (ValueError, IndexError):
+                    continue
+                seqname = parts[0]
+                strand = parts[6]
+                attrs = parts[8]
+                candidates = _extract_gene_ids_from_attrs(attrs)
+                for cid in candidates:
+                    if cid in known_genes and cid not in gene_coords:
+                        gene_coords[cid] = (start, end, strand, seqname)
+                        break
+
+    # Build ordered gene list with positions
+    da_map: dict[str, dict[str, float]] = {}
+    for _, row in dual_anchor_df.iterrows():
+        gid = str(row["gene"])
+        da_map[gid] = {
+            "rp": float(row.get("rp_membership", 0.0)),
+            "dens": float(row.get("density_membership", 0.0)),
+        }
+
+    if gene_coords:
+        # Sort genes by genomic start position
+        ordered = sorted(
+            ((g, c) for g, c in gene_coords.items() if g in da_map),
+            key=lambda x: x[1][0],
+        )
+        genes_ordered = [g for g, _ in ordered]
+        coords_ordered = [c for _, c in ordered]
+    else:
+        # Fallback to RSCU file order
+        if rscu_gene_df is not None and "gene" in rscu_gene_df.columns:
+            genes_ordered = [g for g in rscu_gene_df["gene"].tolist() if g in da_map]
+        elif enc_df is not None and "gene" in enc_df.columns:
+            genes_ordered = [g for g in enc_df["gene"].tolist() if g in da_map]
+        else:
+            return []
+        coords_ordered = None
+
+    if len(genes_ordered) < bin_size * 2:
+        return []
+
+    # ── Compute per-gene divergence and bin ─────────────────────────
+    rp_scores = np.array([da_map[g]["rp"] for g in genes_ordered])
+    dens_scores = np.array([da_map[g]["dens"] for g in genes_ordered])
+    div_scores = 1.0 - np.maximum(rp_scores, dens_scores)
+
+    n_genes = len(genes_ordered)
+    n_bins = n_genes // bin_size
+    if n_bins < 3:
+        return []
+
+    n_used = n_bins * bin_size
+    div_binned = div_scores[:n_used].reshape(n_bins, bin_size).mean(axis=1)
+
+    # ── Peak detection ──────────────────────────────────────────────
+    # Lightly smooth to suppress single-bin noise
+    div_smooth = gaussian_filter1d(div_binned, sigma=1.0)
+    baseline = np.percentile(div_smooth, baseline_pctl)
+
+    peak_indices, properties = find_peaks(
+        div_smooth,
+        prominence=prominence,
+        distance=2,
+    )
+
+    if len(peak_indices) == 0:
+        return []
+
+    # ── Expand each peak to contiguous above-baseline bins ──────────
+    regions: list[tuple[int, int]] = []  # (start_bin, end_bin) inclusive
+    for pi in peak_indices:
+        lo = pi
+        while lo > 0 and div_smooth[lo - 1] > baseline:
+            lo -= 1
+        hi = pi
+        while hi < n_bins - 1 and div_smooth[hi + 1] > baseline:
+            hi += 1
+        regions.append((lo, hi))
+
+    # Merge overlapping/adjacent regions
+    regions.sort()
+    merged: list[tuple[int, int]] = [regions[0]]
+    for lo, hi in regions[1:]:
+        prev_lo, prev_hi = merged[-1]
+        if lo <= prev_hi + 1:
+            merged[-1] = (prev_lo, max(prev_hi, hi))
+        else:
+            merged.append((lo, hi))
+
+    # ── Map bins back to genomic coordinates ────────────────────────
+    islands: list[dict] = []
+    for idx, (bin_lo, bin_hi) in enumerate(merged, start=1):
+        gene_start_idx = bin_lo * bin_size
+        gene_end_idx = min((bin_hi + 1) * bin_size, n_used) - 1
+        island_genes = genes_ordered[gene_start_idx:gene_end_idx + 1]
+        island_div = div_scores[gene_start_idx:gene_end_idx + 1]
+
+        if coords_ordered:
+            start_bp = coords_ordered[gene_start_idx][0]
+            end_bp = coords_ordered[gene_end_idx][1]
+            seqname = coords_ordered[gene_start_idx][3]
+        else:
+            start_bp = gene_start_idx
+            end_bp = gene_end_idx
+            seqname = "unknown"
+
+        islands.append({
+            "island_id": f"GI_{idx:02d}",
+            "seqname": seqname,
+            "start_bp": start_bp,
+            "end_bp": end_bp,
+            "n_genes": len(island_genes),
+            "genes": island_genes,
+            "mean_divergence": float(np.mean(island_div)),
+            "peak_divergence": float(np.max(island_div)),
+        })
+
+    logger.info(
+        "Detected %d genomic island(s) from CU landscape divergence peaks",
+        len(islands),
+    )
+    return islands
+
+
+def annotate_gff_with_genomic_islands(
+    gff_path: Path,
+    islands: list[dict],
+    output_path: Path,
+) -> Path:
+    """Write a GFF3 file with original features plus genomic island regions.
+
+    All original lines are preserved unchanged.  After the header block,
+    one ``region``-type feature is inserted per detected island:
+
+    .. code-block:: text
+
+       seqname  CodonPipe  genomic_island  start  end  .  .  .  ID=GI_01;Name=genomic_island_01;...
+
+    The island features use source ``CodonPipe`` and type
+    ``genomic_island``, making them a distinct annotation track in
+    genome browsers (Artemis, IGV, JBrowse).
+
+    Each feature carries attributes:
+
+      - ``ID`` / ``Name`` — island identifier (e.g. ``GI_01``).
+      - ``n_genes`` — number of genes in the island.
+      - ``mean_divergence`` — mean CU divergence score across island genes.
+      - ``peak_divergence`` — maximum CU divergence score.
+      - ``color`` — ``#d95f02`` (coral, matching the landscape plot).
+
+    Args:
+        gff_path: Original GFF3 file.
+        islands: List of island dicts from ``detect_genomic_islands()``.
+        output_path: Destination for the annotated GFF3.
+
+    Returns:
+        The *output_path* that was written.
+    """
+    if not islands:
+        # No islands — just copy the original GFF unchanged
+        import shutil
+        shutil.copy2(gff_path, output_path)
+        logger.info("No genomic islands to annotate; GFF copied unchanged")
+        return output_path
+
+    # Build island feature lines
+    island_lines: list[str] = []
+    for isl in islands:
+        attrs = (
+            f"ID={isl['island_id']};"
+            f"Name={isl['island_id']};"
+            f"n_genes={isl['n_genes']};"
+            f"mean_divergence={isl['mean_divergence']:.3f};"
+            f"peak_divergence={isl['peak_divergence']:.3f};"
+            f"color=#d95f02"
+        )
+        parts = [
+            isl["seqname"],
+            "CodonPipe",
+            "genomic_island",
+            str(isl["start_bp"]),
+            str(isl["end_bp"]),
+            ".",
+            ".",
+            ".",
+            attrs,
+        ]
+        island_lines.append("\t".join(parts) + "\n")
+
+    # Write: original header lines, then island features, then the rest
+    with open(gff_path) as fin, open(output_path, "w") as fout:
+        # Pass through header lines first
+        body_lines: list[str] = []
+        for line in fin:
+            if line.startswith("#"):
+                fout.write(line)
+            else:
+                body_lines.append(line)
+                break
+        # Insert island region features right before the first body line
+        for il in island_lines:
+            fout.write(il)
+        # Write the buffered first body line and the rest
+        for line in body_lines:
+            fout.write(line)
+        for line in fin:
+            fout.write(line)
+
+    logger.info(
+        "Genomic island GFF written to %s: %d island(s)",
+        output_path.name, len(islands),
+    )
+    return output_path
+
+
 def detect_hgt_candidates(
     rscu_gene_df: pd.DataFrame,
     enc_df: pd.DataFrame,
