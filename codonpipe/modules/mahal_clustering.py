@@ -378,6 +378,57 @@ def _compute_core_cai(
     return gene_cai
 
 
+def _compute_gene_lengths_codons(
+    ffn_path: Path, min_length: int = MIN_GENE_LENGTH,
+) -> dict[str, int]:
+    """Count coding codons per gene (excluding stop)."""
+    gene_lengths: dict[str, int] = {}
+    for rec in SeqIO.parse(str(ffn_path), "fasta"):
+        seq = str(rec.seq)
+        if len(seq) < min_length:
+            continue
+        gene_lengths[rec.id] = len(seq) // 3
+    return gene_lengths
+
+
+def _compute_rare_codon_burden(
+    ffn_path: Path,
+    adaptation_weights: dict[str, float],
+    rarity_ceiling: float = 0.3,
+    min_length: int = MIN_GENE_LENGTH,
+) -> dict[str, float]:
+    """Rare codon burden: length-normalized, rarity-weighted score.
+
+    For each codon in a gene, if its adaptation weight w_i is below
+    *rarity_ceiling*, the codon contributes (1 - w_i) to the burden
+    sum.  The total is divided by the number of scored codons, giving
+    a per-codon average.  Higher values mean more (and more severe)
+    rare codons.
+
+    This metric complements core_CAI by explicitly isolating the impact
+    of disfavoured codons while ignoring well-adapted ones.  CAI weights
+    all codons equally; burden focuses exclusively on the rare tail.
+    """
+    from codonpipe.modules.rscu import dna_to_rna
+    gene_burden: dict[str, float] = {}
+    for rec in SeqIO.parse(str(ffn_path), "fasta"):
+        seq = str(rec.seq)
+        if len(seq) < min_length:
+            continue
+        rna = dna_to_rna(seq)
+        burden_sum, n = 0.0, 0
+        for i in range(0, len(rna) - 2, 3):
+            codon = rna[i:i + 3]
+            if codon in adaptation_weights:
+                w = adaptation_weights[codon]
+                n += 1
+                if w < rarity_ceiling:
+                    burden_sum += (1.0 - w)
+        if n > 0:
+            gene_burden[rec.id] = burden_sum / n
+    return gene_burden
+
+
 def _identify_rare_codons(rscu_series: pd.Series, threshold: float = 0.1) -> set[str]:
     """Codons with RSCU below threshold."""
     rare: set[str] = set()
@@ -765,8 +816,9 @@ def _fit_cluster(
             else:
                 cluster_rscu = cluster_df[rscu_cols].mean()
 
-    # Core-CAI
+    # Core-CAI and adaptation weights (reused for rare codon burden)
     gene_core_cai: dict[str, float] = {}
+    adapt_w: dict[str, float] = {}
     if not cluster_rscu.empty and ffn_path and ffn_path.exists():
         adapt_w = _rscu_to_adaptation_weights(cluster_rscu)
         if adapt_w:
@@ -775,6 +827,8 @@ def _fit_cluster(
     # Rare codons
     core_rare_per_gene: dict[str, int] = {}
     genome_rare_per_gene: dict[str, int] = {}
+    gene_length_codons: dict[str, int] = {}
+    rare_codon_burden: dict[str, float] = {}
     if not cluster_rscu.empty and ffn_path and ffn_path.exists():
         core_rare = _identify_rare_codons(cluster_rscu)
         if core_rare:
@@ -784,6 +838,9 @@ def _fit_cluster(
             genome_rare = _identify_rare_codons(genome_rscu)
             if genome_rare:
                 genome_rare_per_gene = _count_rare_codons_per_gene(ffn_path, genome_rare)
+        gene_length_codons = _compute_gene_lengths_codons(ffn_path)
+        if adapt_w:
+            rare_codon_burden = _compute_rare_codon_burden(ffn_path, adapt_w)
 
     # Anchor-gene counts (RP genes in RP cluster, or seed genes in density cluster)
     n_anchor_in_cluster = 0
@@ -803,6 +860,8 @@ def _fit_cluster(
         "gene_core_cai": gene_core_cai,
         "core_rare_per_gene": core_rare_per_gene,
         "genome_rare_per_gene": genome_rare_per_gene,
+        "gene_length_codons": gene_length_codons,
+        "rare_codon_burden": rare_codon_burden,
         "n_cluster": len(cluster_gene_ids),
         "n_anchor_in_cluster": n_anchor_in_cluster,
         "outlier_mask": outlier_mask if outlier_mask is not None else np.array([], dtype=bool),
@@ -1367,6 +1426,8 @@ def run_mahal_clustering(
     gene_core_cai = primary["gene_core_cai"]
     core_rare_per_gene = primary["core_rare_per_gene"]
     genome_rare_per_gene = primary["genome_rare_per_gene"]
+    gene_length_codons = primary["gene_length_codons"]
+    rare_codon_burden = primary["rare_codon_burden"]
     n_cluster = primary["n_cluster"]
     n_rp_in_cluster = primary["n_rp_in_cluster"]
 
@@ -1424,12 +1485,22 @@ def run_mahal_clustering(
     results["mahal_rp_cosine_sim"] = rp_cosine_sim
 
     # ── Save RP cluster outputs ──────────────────────────────────────
+    # Compute length-normalized rare codon frequency
+    _rare_freq = {}
+    for gid in gene_ids:
+        n_rare = core_rare_per_gene.get(gid, 0)
+        n_codons = gene_length_codons.get(gid, 0)
+        _rare_freq[gid] = n_rare / n_codons if n_codons > 0 else np.nan
+
     cluster_df = pd.DataFrame({
         "gene": gene_ids,
         "mahalanobis_distance": distances,
         "core_CAI": [gene_core_cai.get(gid, np.nan) for gid in gene_ids],
+        "gene_length_codons": [gene_length_codons.get(gid, 0) for gid in gene_ids],
         "n_core_rare_codons": [core_rare_per_gene.get(gid, 0) for gid in gene_ids],
         "n_genome_rare_codons": [genome_rare_per_gene.get(gid, 0) for gid in gene_ids],
+        "rare_codon_freq": [round(_rare_freq.get(gid, np.nan), 5) for gid in gene_ids],
+        "rare_codon_burden": [round(rare_codon_burden.get(gid, np.nan), 5) for gid in gene_ids],
         "membership_score": probabilities[:, 1],
         "in_optimized_set": [gid in cluster_gene_ids for gid in gene_ids],
         "is_ribosomal_protein": [gid in rp_gene_ids for gid in gene_ids],
