@@ -28,6 +28,10 @@ args <- commandArgs(trailingOnly = TRUE)
 fasta_file <- args[1]
 output_file <- args[2]
 min_len <- as.integer(args[3])
+if (is.na(min_len)) {
+    message("ERROR: min_length argument is not a valid integer: ", args[3])
+    quit(status = 1)
+}
 
 tryCatch({
     fasta <- readSet(file = fasta_file)
@@ -44,6 +48,11 @@ tryCatch({
 
     result <- cbind(scores_df, names_df, width_df)
     result <- subset(result, width > min_len)
+
+    if (nrow(result) == 0) {
+        message("ERROR: No genes passed the minimum length filter (min_len=", min_len, ")")
+        quit(status = 1)
+    }
 
     write.table(result, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
     cat("__METRIC__ analysis complete:", nrow(result), "genes\n")
@@ -136,7 +145,7 @@ def _run_r_statistic(
         if not output_file.exists():
             raise RuntimeError(
                 f"{method_name} R script did not produce output for {sample_id}. "
-                f"stderr: {result.stderr[:500] if result.stderr else '(none)'}"
+                f"stderr: {result.stderr[:2000] if result.stderr else '(none)'}"
             )
     finally:
         r_script_path.unlink(missing_ok=True)
