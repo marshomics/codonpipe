@@ -6837,6 +6837,603 @@ def _generate_bio_ecology_plots(
     except Exception as e:
         logger.warning("Circular CU map failed: %s", e, exc_info=True)
 
+    # ── Codon usage inefficiency disconnect plots ──────────────────────
+    # Load the inefficiency report from disk (generated in pipeline step 9e)
+    _ineff_report = None
+    _ineff_path = output_dir / "enrichment_mahal" / f"{sample_id}_codon_inefficiency_report.tsv"
+    if _ineff_path.exists():
+        try:
+            _ineff_report = pd.read_csv(_ineff_path, sep="\t")
+        except Exception as e:
+            logger.warning("Failed to load codon inefficiency report: %s", e)
+
+    _rp_rscu_dict = (dict(mahal_cluster_rscu)
+                     if mahal_cluster_rscu is not None
+                     and not (hasattr(mahal_cluster_rscu, "empty") and mahal_cluster_rscu.empty)
+                     else None)
+
+    if _ineff_report is not None and not _ineff_report.empty:
+        # Re-rank by rare_codon_burden descending (the report ships sorted by
+        # core_CAI ascending, but these plots specifically visualize the burden
+        # metric from the Mahalanobis-cluster adaptation weights).
+        if ("rare_codon_burden" in _ineff_report.columns
+                and _ineff_report["rare_codon_burden"].notna().any()):
+            _ineff_report = (_ineff_report
+                             .sort_values("rare_codon_burden", ascending=False)
+                             .reset_index(drop=True))
+        else:
+            logger.info("SKIPPED: inefficiency disconnect plots "
+                        "(rare_codon_burden column missing or empty)")
+            _ineff_report = None  # gate out downstream plots
+
+    if _ineff_report is not None and not _ineff_report.empty:
+        # 1. Waterfall plot
+        try:
+            p = plot_dir / f"{sample_id}_inefficiency_waterfall"
+            result = plot_inefficiency_waterfall(
+                _ineff_report, p, sample_id=sample_id,
+            )
+            if result:
+                outputs["inefficiency_waterfall"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Inefficiency waterfall plot failed: %s", e, exc_info=True)
+
+        # 2. RSCU deviation heatmap (top 50 genes)
+        if rscu_gene_df is not None and _rp_rscu_dict:
+            try:
+                p = plot_dir / f"{sample_id}_inefficiency_rscu_deviation"
+                result = plot_inefficiency_rscu_deviation_heatmap(
+                    _ineff_report, rscu_gene_df, _rp_rscu_dict,
+                    p, sample_id=sample_id, n_genes=50,
+                )
+                if result:
+                    outputs["inefficiency_rscu_deviation"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Inefficiency RSCU deviation heatmap failed: %s", e, exc_info=True)
+
+        # 3. Adaptation weight ridge/violin plot
+        if rscu_gene_df is not None and _rp_rscu_dict:
+            try:
+                p = plot_dir / f"{sample_id}_inefficiency_adaptation_weights"
+                result = plot_inefficiency_adaptation_weight_ridges(
+                    _ineff_report, rscu_gene_df, _rp_rscu_dict,
+                    p, sample_id=sample_id,
+                )
+                if result:
+                    outputs["inefficiency_adaptation_weights"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Inefficiency adaptation weight plot failed: %s", e, exc_info=True)
+
+        # 4. Scatter: rare codon freq vs core CAI
+        try:
+            p = plot_dir / f"{sample_id}_inefficiency_scatter"
+            result = plot_inefficiency_scatter(
+                _ineff_report, p, sample_id=sample_id,
+            )
+            if result:
+                outputs["inefficiency_scatter"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Inefficiency scatter plot failed: %s", e, exc_info=True)
+
+        # 5. Cumulative burden curve
+        try:
+            p = plot_dir / f"{sample_id}_inefficiency_cumulative"
+            result = plot_inefficiency_cumulative_burden(
+                _ineff_report, p, sample_id=sample_id,
+            )
+            if result:
+                outputs["inefficiency_cumulative"] = p.with_suffix(".png")
+        except Exception as e:
+            logger.warning("Inefficiency cumulative burden plot failed: %s", e, exc_info=True)
+
+        # 6. Per-codon grouped bar: RP cluster vs tier medians
+        if rscu_gene_df is not None and _rp_rscu_dict:
+            try:
+                p = plot_dir / f"{sample_id}_inefficiency_per_codon"
+                result = plot_inefficiency_per_codon_usage(
+                    _ineff_report, rscu_gene_df, _rp_rscu_dict,
+                    p, sample_id=sample_id,
+                )
+                if result:
+                    outputs["inefficiency_per_codon"] = p.with_suffix(".png")
+            except Exception as e:
+                logger.warning("Inefficiency per-codon bar plot failed: %s", e, exc_info=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Codon usage inefficiency disconnect plots
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Suite of plots that visualize the codon usage disconnect between genes with
+# the least efficient codon usage and the bootstrapped, stable RP cluster
+# determined by Mahalanobis clustering.  Each plot highlights how the bottom
+# N genes (by core_CAI or rare_codon_burden) use codons that are substantially
+# different from the translationally optimized reference set.
+
+
+def plot_inefficiency_waterfall(
+    report_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+    tiers: tuple[int, ...] = (20, 100, 200),
+) -> Path | None:
+    """Horizontal waterfall of the most codon-inefficient genes.
+
+    Each bar represents a gene ranked by rare_codon_burden (descending).
+    Bar length encodes the burden — a length-normalised, rarity-weighted
+    score derived from the RP Mahalanobis cluster's adaptation weights.
+    Colour intensity maps to membership_score (distance from the RP cluster).
+
+    Tier boundaries (default 20, 100, 200) are shown as horizontal lines so
+    the viewer can see where each cutoff falls.
+
+    Expects *report_df* pre-sorted by rare_codon_burden descending.
+    """
+    _apply_style()
+    if report_df.empty:
+        return None
+
+    if "rare_codon_burden" not in report_df.columns or not report_df["rare_codon_burden"].notna().any():
+        return None
+    metric_col = "rare_codon_burden"
+    xlabel = "Rare codon burden"
+
+    max_genes = max(tiers) if tiers else 200
+    df = report_df.head(min(max_genes, len(report_df))).copy()
+    n_genes = len(df)
+
+    # Colour by membership_score (low = far from cluster = dark red)
+    if "membership_score" in df.columns and df["membership_score"].notna().any():
+        color_vals = 1.0 - df["membership_score"].fillna(0).values
+    else:
+        color_vals = np.linspace(1, 0.3, n_genes)
+
+    cmap = plt.cm.Reds
+    colors = cmap(0.3 + 0.7 * color_vals)
+
+    fig_height = max(5, n_genes * 0.12 + 1.5)
+    fig, ax = plt.subplots(figsize=(9, fig_height))
+    y_pos = np.arange(n_genes)[::-1]  # top = worst
+
+    ax.barh(y_pos, df[metric_col].values, color=colors, edgecolor="none", height=0.8)
+
+    # Gene labels (show only if ≤ 60 genes, else too crowded)
+    if n_genes <= 60:
+        labels = df["gene"].astype(str).values
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(labels, fontsize=6)
+    else:
+        ax.set_yticks([])
+        ax.set_ylabel(f"Genes ranked by inefficiency (n = {n_genes})")
+
+    # Tier boundary lines
+    tier_colors = {20: "#e41a1c", 100: "#ff7f00", 200: "#984ea3"}
+    for t in sorted(tiers):
+        if t <= n_genes:
+            ax.axhline(n_genes - t - 0.5, color=tier_colors.get(t, "grey"),
+                       linestyle="--", linewidth=1.0, alpha=0.8)
+            ax.text(ax.get_xlim()[1] * 0.98, n_genes - t - 0.5,
+                    f"  top {t}", va="center", ha="right",
+                    fontsize=7, color=tier_colors.get(t, "grey"), fontweight="bold")
+
+    ax.set_xlabel(xlabel)
+    title = f"{sample_id}: Codon usage inefficiency waterfall" if sample_id else "Codon usage inefficiency waterfall"
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.invert_yaxis()
+
+    # Colourbar for membership score
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 1))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, shrink=0.5, pad=0.02)
+    cbar.set_label("Distance from RP cluster\n(1 − membership score)", fontsize=8)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+    return output_path
+
+
+def plot_inefficiency_rscu_deviation_heatmap(
+    report_df: pd.DataFrame,
+    rscu_gene_df: pd.DataFrame,
+    rp_cluster_rscu: dict[str, float],
+    output_path: Path,
+    sample_id: str = "",
+    n_genes: int = 50,
+) -> Path | None:
+    """Heatmap of per-gene RSCU deviation from the RP cluster optimum.
+
+    Rows are the top *n_genes* genes with the highest rare_codon_burden.
+    Columns are codons grouped by amino acid family.  Cell values are
+    (gene_RSCU − RP_RSCU) so blue = under-use of the optimal codon, red =
+    over-use of a non-optimal codon.
+
+    Expects *report_df* pre-sorted by rare_codon_burden descending.
+    """
+    _apply_style()
+    if report_df.empty or rscu_gene_df is None or not rp_cluster_rscu:
+        return None
+    if "rare_codon_burden" not in report_df.columns or not report_df["rare_codon_burden"].notna().any():
+        return None
+
+    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns and c in rp_cluster_rscu]
+    if not rscu_cols:
+        return None
+
+    top_genes = report_df["gene"].head(n_genes).values
+    gene_data = rscu_gene_df[rscu_gene_df["gene"].isin(top_genes)].copy()
+    if gene_data.empty:
+        return None
+
+    # Preserve rank order from report
+    gene_order = {g: i for i, g in enumerate(top_genes)}
+    gene_data["_rank"] = gene_data["gene"].map(gene_order)
+    gene_data = gene_data.sort_values("_rank")
+
+    # Compute deviation matrix
+    rp_vals = np.array([rp_cluster_rscu.get(c, 0.0) for c in rscu_cols])
+    dev_matrix = gene_data[rscu_cols].values - rp_vals[np.newaxis, :]
+
+    fig_height = max(4, len(gene_data) * 0.22 + 2)
+    fig, ax = plt.subplots(figsize=(16, fig_height))
+
+    vmax = np.nanpercentile(np.abs(dev_matrix), 98)
+    im = ax.imshow(dev_matrix, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+                   interpolation="nearest")
+
+    # X-axis: codon labels grouped by amino acid
+    codon_labels = [c.split("-")[-1] for c in rscu_cols]
+    ax.set_xticks(np.arange(len(rscu_cols)))
+    ax.set_xticklabels(codon_labels, fontsize=5.5, rotation=90)
+
+    # Amino acid family separators
+    prev_aa = None
+    for i, col in enumerate(rscu_cols):
+        aa = col.split("-")[0]
+        if prev_aa is not None and aa != prev_aa:
+            ax.axvline(i - 0.5, color="black", linewidth=0.5, alpha=0.5)
+        prev_aa = aa
+
+    # Y-axis: gene names
+    gene_labels = gene_data["gene"].astype(str).values
+    if len(gene_labels) <= 80:
+        ax.set_yticks(np.arange(len(gene_labels)))
+        ax.set_yticklabels(gene_labels, fontsize=5)
+    else:
+        ax.set_yticks([])
+        ax.set_ylabel(f"Genes (n = {len(gene_labels)}, ranked by inefficiency)")
+
+    cbar = fig.colorbar(im, ax=ax, shrink=0.6, pad=0.02)
+    cbar.set_label("RSCU deviation from RP cluster\n(gene − optimum)", fontsize=9)
+
+    title = f"{sample_id}: RSCU deviation — top {len(gene_data)} inefficient genes" if sample_id else f"RSCU deviation — top {len(gene_data)} inefficient genes"
+    ax.set_title(title, fontsize=12, fontweight="bold")
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+    return output_path
+
+
+def plot_inefficiency_adaptation_weight_ridges(
+    report_df: pd.DataFrame,
+    rscu_gene_df: pd.DataFrame,
+    rp_cluster_rscu: dict[str, float],
+    output_path: Path,
+    sample_id: str = "",
+    tiers: tuple[int, ...] = (20, 100, 200),
+) -> Path | None:
+    """Ridge / violin plot comparing codon adaptation weight distributions.
+
+    For each tier (bottom 20, 100, 200 genes by rare_codon_burden), plots
+    the distribution of per-codon adaptation weights alongside the RP cluster
+    reference.  Adaptation weights are Sharp & Li (1987):
+    w_codon = RSCU_codon / max(RSCU in family).  This shows that inefficient
+    genes systematically use codons with low adaptation weights.
+
+    Expects *report_df* pre-sorted by rare_codon_burden descending.
+    """
+    _apply_style()
+    if report_df.empty or rscu_gene_df is None or not rp_cluster_rscu:
+        return None
+    if "rare_codon_burden" not in report_df.columns or not report_df["rare_codon_burden"].notna().any():
+        return None
+
+    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns and c in rp_cluster_rscu]
+    if not rscu_cols:
+        return None
+
+    # Compute adaptation weights from RP cluster RSCU
+    # Group codons by amino acid family, w = RSCU / max(RSCU in family)
+    from codonpipe.utils.codon_tables import AA_CODON_GROUPS_RSCU
+    rp_weights = {}
+    for aa, codons in AA_CODON_GROUPS_RSCU.items():
+        cols_in_family = [f"{aa}-{c}" for c in codons if f"{aa}-{c}" in rp_cluster_rscu]
+        if not cols_in_family:
+            continue
+        max_rscu = max(rp_cluster_rscu.get(c, 0) for c in cols_in_family)
+        if max_rscu <= 0:
+            continue
+        for c in cols_in_family:
+            rp_weights[c] = rp_cluster_rscu.get(c, 0) / max_rscu
+
+    w_cols = [c for c in rscu_cols if c in rp_weights]
+    if not w_cols:
+        return None
+
+    # For each gene, compute per-codon adaptation weights using the RP family max
+    gene_w_matrix = rscu_gene_df[rscu_gene_df["gene"].isin(report_df["gene"])].copy()
+    for aa, codons in AA_CODON_GROUPS_RSCU.items():
+        cols_in_family = [f"{aa}-{c}" for c in codons if f"{aa}-{c}" in gene_w_matrix.columns]
+        if not cols_in_family:
+            continue
+        family_max = gene_w_matrix[cols_in_family].max(axis=1).replace(0, np.nan)
+        for c in cols_in_family:
+            if c in gene_w_matrix.columns:
+                gene_w_matrix[c] = gene_w_matrix[c] / family_max
+
+    # Build violin data
+    top_genes_by_tier = {}
+    for t in sorted(tiers):
+        tier_genes = set(report_df["gene"].head(t).values)
+        top_genes_by_tier[t] = tier_genes
+
+    fig, axes = plt.subplots(1, len(tiers), figsize=(5.5 * len(tiers), 6), sharey=True)
+    if len(tiers) == 1:
+        axes = [axes]
+
+    tier_colors = {20: "#e41a1c", 100: "#ff7f00", 200: "#984ea3"}
+
+    for ax, t in zip(axes, sorted(tiers)):
+        tier_genes = top_genes_by_tier[t]
+        tier_data = gene_w_matrix[gene_w_matrix["gene"].isin(tier_genes)]
+        if tier_data.empty:
+            continue
+
+        # Flatten all per-codon weights for this tier
+        tier_w_flat = tier_data[w_cols].values.flatten()
+        tier_w_flat = tier_w_flat[~np.isnan(tier_w_flat)]
+
+        # RP reference weights
+        rp_w_flat = np.array([rp_weights[c] for c in w_cols])
+
+        # Plot
+        parts = ax.violinplot([tier_w_flat, rp_w_flat], positions=[0, 1],
+                              showmeans=True, showmedians=True, showextrema=False)
+        for i, pc in enumerate(parts["bodies"]):
+            pc.set_facecolor(tier_colors.get(t, "#666666") if i == 0 else "#2ca02c")
+            pc.set_alpha(0.6)
+        parts["cmeans"].set_color("black")
+        parts["cmedians"].set_color("black")
+        parts["cmedians"].set_linestyle("--")
+
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels([f"Bottom {t}\ngenes", "RP cluster"], fontsize=9)
+        ax.set_ylabel("Adaptation weight (w)" if ax == axes[0] else "")
+        ax.set_title(f"n = {t}", fontsize=11, fontweight="bold")
+
+        # Annotate medians
+        med_tier = np.nanmedian(tier_w_flat)
+        med_rp = np.nanmedian(rp_w_flat)
+        ax.text(0, med_tier + 0.03, f"{med_tier:.3f}", ha="center", fontsize=7, color=tier_colors.get(t, "#666"))
+        ax.text(1, med_rp + 0.03, f"{med_rp:.3f}", ha="center", fontsize=7, color="#2ca02c")
+
+    suptitle = f"{sample_id}: Adaptation weight distributions" if sample_id else "Adaptation weight distributions"
+    fig.suptitle(suptitle, fontsize=13, fontweight="bold", y=1.02)
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+    return output_path
+
+
+def plot_inefficiency_scatter(
+    report_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+    tiers: tuple[int, ...] = (20, 100, 200),
+) -> Path | None:
+    """Scatter plot: rare codon burden vs core CAI with tier highlights.
+
+    Each gene is a point.  The bottom 20/100/200 by rare_codon_burden are
+    highlighted in distinct colours against the genome background.  RP genes
+    are marked with black edge rings.  This exposes the joint relationship
+    between how heavy a gene's rare codon load is and how far its overall
+    adaptation has drifted from the RP cluster optimum.
+
+    Expects *report_df* pre-sorted by rare_codon_burden descending.
+    """
+    _apply_style()
+    if report_df.empty:
+        return None
+
+    if "rare_codon_burden" not in report_df.columns or not report_df["rare_codon_burden"].notna().any():
+        return None
+    has_cai = "core_CAI" in report_df.columns and report_df["core_CAI"].notna().any()
+    if not has_cai:
+        return None
+
+    y_col = "rare_codon_burden"
+    y_label = "Rare codon burden"
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+
+    # Background: all genes
+    ax.scatter(report_df["core_CAI"], report_df[y_col],
+               s=8, c="#d0d0d0", alpha=0.4, edgecolors="none", label="Genome", zorder=1)
+
+    # Tier highlights (largest tier first so smaller tiers overlay)
+    tier_colors = {20: "#e41a1c", 100: "#ff7f00", 200: "#984ea3"}
+    for t in sorted(tiers, reverse=True):
+        tier_df = report_df.head(t)
+        ax.scatter(tier_df["core_CAI"], tier_df[y_col],
+                   s=14, c=tier_colors.get(t, "#666"), alpha=0.7,
+                   edgecolors="none", label=f"Bottom {t}", zorder=2 + t)
+
+    # RP overlay
+    if "is_ribosomal_protein" in report_df.columns:
+        rp_df = report_df[report_df["is_ribosomal_protein"] == True]  # noqa: E712
+        if not rp_df.empty:
+            ax.scatter(rp_df["core_CAI"], rp_df[y_col],
+                       s=30, facecolors="none", edgecolors="black", linewidths=1.0,
+                       label="Ribosomal proteins", zorder=10)
+
+    ax.set_xlabel("Core CAI (adaptation to RP cluster)", fontsize=11)
+    ax.set_ylabel(y_label, fontsize=11)
+    title = f"{sample_id}: Codon efficiency landscape" if sample_id else "Codon efficiency landscape"
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.legend(fontsize=8, loc="upper left", framealpha=0.9)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+    return output_path
+
+
+def plot_inefficiency_cumulative_burden(
+    report_df: pd.DataFrame,
+    output_path: Path,
+    sample_id: str = "",
+    tiers: tuple[int, ...] = (20, 100, 200),
+) -> Path | None:
+    """Cumulative rare codon burden curve across all genes.
+
+    Genes are rank-ordered by rare_codon_burden descending.  The y-axis
+    shows cumulative rare codon burden as a fraction of the genome total,
+    and tier boundaries are marked.  This reveals what fraction of the
+    genome's total "rare codon load" is concentrated in the bottom N genes.
+
+    Expects *report_df* pre-sorted by rare_codon_burden descending.
+    """
+    _apply_style()
+    if report_df.empty:
+        return None
+
+    if "rare_codon_burden" not in report_df.columns or not report_df["rare_codon_burden"].notna().any():
+        return None
+    metric_col = "rare_codon_burden"
+    ylabel = "Cumulative rare codon burden (fraction of total)"
+
+    vals = report_df[metric_col].fillna(0).values
+    total = vals.sum()
+    if total <= 0:
+        return None
+
+    cumulative = np.cumsum(vals) / total
+    ranks = np.arange(1, len(cumulative) + 1)
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.plot(ranks, cumulative, color="#2166ac", linewidth=1.5)
+    ax.fill_between(ranks, 0, cumulative, alpha=0.08, color="#2166ac")
+
+    # Tier markers
+    tier_colors = {20: "#e41a1c", 100: "#ff7f00", 200: "#984ea3"}
+    for t in sorted(tiers):
+        if t <= len(cumulative):
+            y_val = cumulative[t - 1]
+            ax.axvline(t, color=tier_colors.get(t, "grey"), linestyle="--",
+                       linewidth=1.0, alpha=0.8)
+            ax.plot(t, y_val, "o", color=tier_colors.get(t, "grey"), markersize=6, zorder=5)
+            pct = y_val * 100
+            ax.annotate(f"Top {t}: {pct:.1f}%",
+                        xy=(t, y_val), xytext=(t + len(cumulative) * 0.03, y_val),
+                        fontsize=8, color=tier_colors.get(t, "grey"), fontweight="bold",
+                        arrowprops=dict(arrowstyle="-", color=tier_colors.get(t, "grey"),
+                                        lw=0.5))
+
+    # Diagonal reference (uniform distribution)
+    ax.plot([1, len(ranks)], [1 / len(ranks), 1.0], color="grey",
+            linestyle=":", linewidth=0.8, alpha=0.5, label="Uniform distribution")
+
+    ax.set_xlabel("Gene rank (most inefficient → least)", fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
+    title = f"{sample_id}: Cumulative rare codon burden" if sample_id else "Cumulative rare codon burden"
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_xlim(1, len(ranks))
+    ax.set_ylim(0, 1.02)
+    ax.legend(fontsize=8, loc="lower right")
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+    return output_path
+
+
+def plot_inefficiency_per_codon_usage(
+    report_df: pd.DataFrame,
+    rscu_gene_df: pd.DataFrame,
+    rp_cluster_rscu: dict[str, float],
+    output_path: Path,
+    sample_id: str = "",
+    tiers: tuple[int, ...] = (20, 100, 200),
+) -> Path | None:
+    """Per-codon RSCU comparison: RP cluster vs bottom-N gene tiers.
+
+    Grouped bar chart with one group per codon (59 sense codons), organised
+    by amino acid family.  Each group has a bar for the RP cluster RSCU and
+    one bar per tier (bottom 20, 100, 200 by rare_codon_burden), showing
+    median RSCU of that tier's genes.  Codons where the tier median diverges
+    most from the RP optimum are the specific rare codons driving inefficiency.
+
+    Expects *report_df* pre-sorted by rare_codon_burden descending.
+    """
+    _apply_style()
+    if report_df.empty or rscu_gene_df is None or not rp_cluster_rscu:
+        return None
+    if "rare_codon_burden" not in report_df.columns or not report_df["rare_codon_burden"].notna().any():
+        return None
+
+    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns and c in rp_cluster_rscu]
+    if not rscu_cols:
+        return None
+
+    n_codons = len(rscu_cols)
+    n_groups = 1 + len(tiers)  # RP + each tier
+    bar_width = 0.8 / n_groups
+    x = np.arange(n_codons)
+
+    fig, ax = plt.subplots(figsize=(20, 5.5))
+
+    # RP cluster bars
+    rp_vals = [rp_cluster_rscu.get(c, 0) for c in rscu_cols]
+    ax.bar(x - 0.4 + bar_width * 0.5, rp_vals, bar_width, color="#2ca02c",
+           alpha=0.85, label="RP cluster", edgecolor="none")
+
+    # Tier bars
+    tier_colors = {20: "#e41a1c", 100: "#ff7f00", 200: "#984ea3"}
+    for j, t in enumerate(sorted(tiers)):
+        tier_genes = set(report_df["gene"].head(t).values)
+        tier_data = rscu_gene_df[rscu_gene_df["gene"].isin(tier_genes)]
+        if tier_data.empty:
+            continue
+        tier_medians = tier_data[rscu_cols].median().values
+        offset = -0.4 + bar_width * (j + 1.5)
+        ax.bar(x + offset, tier_medians, bar_width,
+               color=tier_colors.get(t, "#666"), alpha=0.75,
+               label=f"Bottom {t}", edgecolor="none")
+
+    # Amino acid family separators and labels
+    prev_aa = None
+    aa_starts = []
+    for i, col in enumerate(rscu_cols):
+        aa = col.split("-")[0]
+        if prev_aa is not None and aa != prev_aa:
+            ax.axvline(i - 0.5, color="black", linewidth=0.4, alpha=0.4)
+            aa_starts.append((i, aa))
+        elif prev_aa is None:
+            aa_starts.append((i, aa))
+        prev_aa = aa
+
+    # Codon triplet labels
+    codon_labels = [c.split("-")[-1] for c in rscu_cols]
+    ax.set_xticks(x)
+    ax.set_xticklabels(codon_labels, fontsize=5.5, rotation=90)
+
+    ax.set_ylabel("RSCU", fontsize=11)
+    ax.set_xlabel("Codon (grouped by amino acid family)", fontsize=11)
+    title = f"{sample_id}: Per-codon RSCU — RP cluster vs inefficient genes" if sample_id else "Per-codon RSCU — RP cluster vs inefficient genes"
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.legend(fontsize=8, loc="upper right", framealpha=0.9)
+    ax.set_xlim(-0.5, n_codons - 0.5)
+
+    fig.tight_layout()
+    _save_fig(fig, output_path)
+    return output_path
+
 
 def generate_batch_plots(
     combined_df: pd.DataFrame,
