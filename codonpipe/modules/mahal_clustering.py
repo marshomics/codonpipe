@@ -12,11 +12,14 @@ Identifies two clusters in COA (Correspondence Analysis) space:
    chi-squared boundary methodology.
 
 Both clusters use the **same** machinery:
-  - MinCovDet covariance estimation (two-pass outlier removal)
+  - MinCovDet covariance estimation (two-pass outlier removal; see note
+    on heuristic calibration in ``_fit_robust_rp_reference``)
   - Chi-squared threshold: sqrt(chi2.ppf(p, df=n_axes)), giving a
     principled, covariance-independent boundary
-  - Distance-weighted RSCU pooling for the cluster reference
-  - Soft membership via sigmoid on Mahalanobis distance
+  - Distance-weighted RSCU pooling: linear weights w = max(1 - d/threshold, 0)
+    for computing the cluster's aggregate RSCU reference profile
+  - Soft membership reporting via sigmoid on Mahalanobis distance
+    (``_distance_to_membership``), used for probabilistic gene classification
 
 When RP genes split into distinct sub-populations (e.g. HGT, ribosome
 specialisation), the module detects multiple sub-clusters via GMM+BIC and
@@ -171,10 +174,10 @@ def _fit_robust_rp_reference(
     # is more reliable and avoids sklearn determinant-increase warnings.
     min_for_mcd = max(min_rp, 2 * n_axes + 3)
 
-    if n_rp < max(min_rp, n_axes + 2):
+    if n_rp < max(min_rp, 2 * n_axes + 3):
         logger.info(
             "Only %d reference genes (< %d); using empirical covariance",
-            n_rp, max(min_rp, n_axes + 2),
+            n_rp, max(min_rp, 2 * n_axes + 3),
         )
         centroid = X_rp.mean(axis=0)
         cov = _empirical_cov(X_rp)
@@ -195,6 +198,16 @@ def _fit_robust_rp_reference(
             logger.debug("MinCovDet failed (%s); falling back", e)
             return None
 
+    # Two-pass outlier removal heuristic:
+    # Pass 1 identifies outliers using the chi-squared critical value on
+    # distances from the initial MCD fit. Pass 2 refits MCD on the
+    # cleaned subset. Because the covariance changes between passes,
+    # the Pass 1 threshold is not exactly calibrated for the Pass 2
+    # model. In practice this is conservative (tends to remove more
+    # outliers than a single-pass procedure) and has proven stable
+    # across a range of microbial genomes, but it is a heuristic
+    # rather than a statistically exact procedure.
+    #
     # Pass 1
     result_1 = _try_mcd(X_rp)
     if result_1 is not None:
@@ -1395,6 +1408,18 @@ def run_mahal_clustering(
         fit["rp_gene_ids"] = sc_ids
         fit["rp_indices"] = sc_indices
         fit["rp_dists_all"] = fit["distances"][sc_indices]
+        # Build an RP-level outlier mask aligned with rp_dists_all /
+        # sc_indices (one entry per RP gene in the full gene array).
+        # The sub-cluster-level outlier_mask has len(X_sc) entries;
+        # sc_indices maps sub-cluster genes back to the full gene array.
+        # We need one bool per RP gene in sc_ids, in the same order as
+        # sc_indices.
+        _sc_gene_list = [g for g in gene_ids if g in sc_ids]
+        _rp_outlier = np.array([
+            outlier_mask[j] if j < len(outlier_mask) else False
+            for j, g in enumerate(_sc_gene_list)
+        ], dtype=bool) if len(_sc_gene_list) == len(sc_indices) else np.zeros(len(sc_indices), dtype=bool)
+        fit["rp_outlier_mask"] = _rp_outlier
         fit["n_rp_in_cluster"] = len(fit["cluster_gene_ids"] & sc_ids)
         fit["subcluster_index"] = sc_idx
 
@@ -1413,7 +1438,7 @@ def run_mahal_clustering(
     centroid = primary["centroid"]
     cov = primary["cov"]
     cov_inv = primary["cov_inv"]
-    rp_outlier_mask = primary["outlier_mask"]
+    rp_outlier_mask = primary.get("rp_outlier_mask", np.zeros(len(primary["rp_indices"]), dtype=bool))
     rp_indices = primary["rp_indices"]
     rp_gene_ids = primary["rp_gene_ids"]
     distances = primary["distances"]
