@@ -63,7 +63,7 @@ def pairwise_wilcoxon(
             # Extract amino acid from column name (format: {AA}{digits}-{codon}).
             # Validate the expected format before extracting.
             parts = col.split("-")
-            aa = parts[0].rstrip("0123456789") if len(parts) == 2 else col
+            aa = parts[0].rstrip("0123456789") if len(parts) >= 2 and parts[0] else col
             results.append({
                 "codon": col,
                 "amino_acid": aa,
