@@ -4903,10 +4903,13 @@ def plot_genomic_cu_landscape(
         ax_top.legend(handles=legend_elements, loc="upper right", fontsize=8)
 
     ax_top.set_title(f"Codon usage landscape — {sample_id}", fontsize=12)
-    try:
-        fig.tight_layout()
-    except ValueError:
-        pass  # Mixed Axes types (e.g. polar + cartesian) are incompatible with tight_layout
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*tight_layout.*")
+        try:
+            fig.tight_layout()
+        except ValueError:
+            pass
     _save_fig(fig, output_path)
 
 
@@ -5522,7 +5525,10 @@ def plot_binned_mahal_landscape(
         f"Mahalanobis distance landscape (quantile-binned) — {sample_id}",
         fontsize=12,
     )
-    fig.tight_layout()
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*tight_layout.*")
+        fig.tight_layout()
     _save_fig(fig, output_path)
 
 
