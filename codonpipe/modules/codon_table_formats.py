@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 from Bio import SeqIO
 
+from codonpipe.utils.io import get_output_subdir
 from codonpipe.utils.codon_tables import (
     AA_CODON_GROUPS,
     AA_CODON_GROUPS_RSCU,
@@ -422,7 +423,7 @@ def generate_all_codon_tables(
         Dict mapping output descriptions to file paths.
     """
     output_dir = Path(output_dir)
-    codon_dir = output_dir / "codon_tables"
+    codon_dir = get_output_subdir(output_dir, "codon_usage", "codon_tables")
     codon_dir.mkdir(parents=True, exist_ok=True)
 
     outputs = {}
@@ -501,43 +502,34 @@ def generate_all_codon_tables(
         rscu_table = compute_rscu_table(ffn, gene_ids)
         w_values = compute_relative_adaptiveness(ffn, gene_ids)
 
-        # Save individual format tables
-        formats = {
-            "absolute": abs_counts,
-            "frequency_per_thousand": freq_per_1k,
-            "rscu": rscu_table,
-            "relative_adaptiveness": w_values,
-        }
-
-        for fmt_name, df in formats.items():
-            if not df.empty:
-                out_path = codon_dir / f"{sample_id}_{geneset_name}_{fmt_name}.tsv"
-                df.to_csv(out_path, sep="\t", index=False)
-                outputs[f"{geneset_name}_{fmt_name}"] = out_path
-                logger.info("Saved %s to %s", fmt_name, out_path)
-
-        # Create combined summary table (side-by-side all formats)
-        # Use explicit merge on 'codon' to avoid index-alignment issues
-        # between tables with different codon sets (e.g. 64 vs 59 codons).
+        # Merge count tables (absolute, frequency_per_thousand, rscu) into codon_counts.tsv
+        # Keep relative_adaptiveness separate (it has w_value/is_optimal semantics)
         if not rscu_table.empty:
-            summary = rscu_table[["codon", "amino_acid", "rscu"]].copy()
-            summary = summary.merge(
-                abs_counts[["codon", "count"]].rename(columns={"count": "abs_count"}),
+            codon_counts = rscu_table[["codon", "amino_acid"]].copy()
+            codon_counts = codon_counts.merge(
+                abs_counts[["codon", "count"]],
                 on="codon", how="left",
             )
-            summary = summary.merge(
-                freq_per_1k[["codon", "per_thousand"]].rename(columns={"per_thousand": "freq_per_1000"}),
+            codon_counts = codon_counts.merge(
+                freq_per_1k[["codon", "per_thousand"]],
                 on="codon", how="left",
             )
-            summary = summary.merge(
-                w_values[["codon", "w_value"]],
+            codon_counts = codon_counts.merge(
+                rscu_table[["codon", "rscu"]],
                 on="codon", how="left",
             )
-
-            summary_path = codon_dir / f"{sample_id}_{geneset_name}_summary.tsv"
-            summary.to_csv(summary_path, sep="\t", index=False)
-            outputs[f"{geneset_name}_summary"] = summary_path
-            logger.info("Saved combined summary to %s", summary_path)
+            
+            counts_path = codon_dir / f"{sample_id}_{geneset_name}_codon_counts.tsv"
+            codon_counts.to_csv(counts_path, sep="	", index=False)
+            outputs[f"{geneset_name}_codon_counts"] = counts_path
+            logger.info("Saved codon counts to %s", counts_path)
+        
+        # Save relative_adaptiveness as a separate file (only this keeps w_value semantics)
+        if not w_values.empty:
+            adapt_path = codon_dir / f"{sample_id}_{geneset_name}_relative_adaptiveness.tsv"
+            w_values.to_csv(adapt_path, sep="	", index=False)
+            outputs[f"{geneset_name}_relative_adaptiveness"] = adapt_path
+            logger.info("Saved relative adaptiveness to %s", adapt_path)
 
     # Compute codon adaptation weights (reference vs all)
     if "ribosomal" in gene_sets and "all" in gene_sets:
