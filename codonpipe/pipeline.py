@@ -51,7 +51,7 @@ from codonpipe.utils.codon_tables import (
     EXPRESSION_METRICS, EXPRESSION_CLASS_COLS,
     RP_PREFIX,
 )
-from codonpipe.utils.io import load_batch_table, write_tsv
+from codonpipe.utils.io import get_output_subdir, load_batch_table, write_tsv
 
 logger = logging.getLogger("codonpipe")
 
@@ -123,6 +123,7 @@ def run_single_genome(
     auto_select_multiplier: bool = False,
     stability_core_threshold: float = 0.5,
     kegg_ko_pathway: Path | None = None,
+    kegg_cache_dir: Path | None = None,
     gff_file: Path | None = None,
     force: bool = False,
     skip_gsea: bool = False,
@@ -194,6 +195,10 @@ def run_single_genome(
             to be considered "core" in the stability analysis (default 0.5).
             Set to 0.9 for a high-confidence subset.
         kegg_ko_pathway: User-supplied KO-to-pathway mapping TSV for offline use.
+        kegg_cache_dir: Shared directory for cached KEGG KO/pathway maps.
+            When running many samples in batch, pass a single shared path
+            (e.g. {batch_output}/.cache) so the REST download runs once.
+            When None, each sample uses its own {output_dir}/.cache.
         gff_file: GFF3 annotation file for tRNA extraction (auto-detected from
             Prokka output if omitted).
         force: Rerun all steps.
@@ -324,12 +329,12 @@ def run_single_genome(
     if not skip_expression and rp_ids_file and rp_ids_file.exists() and skip_mahal:
         logger.info("[Step 6/12] Running expression level prediction (MELP/CAI/Fop)")
         try:
-            expr_outputs = run_expression_analysis(
+            expr_outputs, expr_df = run_expression_analysis(
                 ffn_path, rp_ids_file, output_dir, sample_id, force=force,
             )
             all_outputs.update(expr_outputs)
 
-            if "expression_combined" in expr_outputs:
+            if expr_df is None and "expression_combined" in expr_outputs:
                 expr_df = pd.read_csv(expr_outputs["expression_combined"], sep="\t")
 
                 # Merge ENC' residual (ENC - ENC') as first-class column
@@ -374,6 +379,7 @@ def run_single_genome(
             enrich_outputs = run_enrichment_analysis(
                 expr_df, kofam_df, output_dir, sample_id,
                 kegg_ko_pathway_file=kegg_ko_pathway,
+                cache_dir=kegg_cache_dir,
             )
             all_outputs.update(enrich_outputs)
             # Load enrichment results for plotting.  Prefix with "rp_" so
@@ -662,13 +668,13 @@ def run_single_genome(
             len(mahal_cluster_gene_ids),
         )
         try:
-            mahal_expr_outputs = run_expression_analysis(
+            mahal_expr_outputs, expr_df = run_expression_analysis(
                 ffn_path, mahal_cluster_ids_path, output_dir, sample_id,
                 force=True,  # overwrite the RP-based expression files
             )
             all_outputs.update(mahal_expr_outputs)
 
-            if "expression_combined" in mahal_expr_outputs:
+            if expr_df is None and "expression_combined" in mahal_expr_outputs:
                 mahal_expr_df = pd.read_csv(mahal_expr_outputs["expression_combined"], sep="\t")
 
                 # Preserve RP-based scores as secondary columns
@@ -726,11 +732,11 @@ def run_single_genome(
     if not skip_mahal and expr_df is None and not skip_expression and rp_ids_file and rp_ids_file.exists():
         logger.warning("[Step 9b fallback] Mahalanobis-based expression unavailable; falling back to RP-based expression analysis")
         try:
-            expr_outputs = run_expression_analysis(
+            expr_outputs, expr_df = run_expression_analysis(
                 ffn_path, rp_ids_file, output_dir, sample_id, force=force,
             )
             all_outputs.update(expr_outputs)
-            if "expression_combined" in expr_outputs:
+            if expr_df is None and "expression_combined" in expr_outputs:
                 expr_df = pd.read_csv(expr_outputs["expression_combined"], sep="\t")
         except (FileNotFoundError, RuntimeError) as e:
             logger.warning("RP-based expression analysis failed: %s. Continuing.", e, exc_info=True)
@@ -787,6 +793,7 @@ def run_single_genome(
                 expr_df, kofam_df, output_dir, sample_id,
                 kegg_ko_pathway_file=kegg_ko_pathway,
                 output_subdir="enrichment_mahal",
+                cache_dir=kegg_cache_dir,
             )
             all_outputs.update({
                 f"mahal_{k}": v for k, v in mahal_enrich_outputs.items()
@@ -806,6 +813,7 @@ def run_single_genome(
             enrich_outputs = run_enrichment_analysis(
                 expr_df, kofam_df, output_dir, sample_id,
                 kegg_ko_pathway_file=kegg_ko_pathway,
+                cache_dir=kegg_cache_dir,
             )
             all_outputs.update(enrich_outputs)
             for key, path in enrich_outputs.items():
@@ -824,7 +832,7 @@ def run_single_genome(
                 compute_rscu_distance, compute_delta_rscu, compute_cog_enrichment,
             )
             rscu_mahal_dict = mahal_cluster_rscu.to_dict()
-            adv_dir = output_dir / "advanced"
+            adv_dir = get_output_subdir(output_dir, "comparative", "advanced")
 
             logger.info("[Step 9d/12] Recomputing RSCU distance with Mahalanobis-cluster reference")
             s_val_mahal_df = compute_rscu_distance(rscu_gene_df, rscu_rp,
@@ -836,21 +844,34 @@ def run_single_genome(
                 advanced_results["s_value"] = s_val_mahal_df
                 logger.info("RSCU distance recomputed against Mahalanobis-cluster reference (%d genes)", len(s_val_mahal_df))
 
-            # Delta RSCU with Mahalanobis-based expression tiers (genome-avg baseline)
+            # Consolidated delta RSCU with Mahalanobis-based expression tiers.
+            # Rebuilds {sample_id}_rscu_deltas.tsv (overwrites step 8's file)
+            # so the latest tier definition wins. One file, two baselines:
+            #   - baseline="genome_avg"   : COL_EXPRESSION_CLASS only
+            #   - baseline="mahal_cluster": all four class columns
             if expr_df is not None:
-                for class_col in [COL_EXPRESSION_CLASS]:
-                    if class_col in expr_df.columns:
-                        delta_df = compute_delta_rscu(rscu_gene_df, expr_df, class_col)
-                        if not delta_df.empty:
-                            metric = class_col.replace("_class", "")
-                            out_path = adv_dir / f"{sample_id}_delta_rscu_{metric}.tsv"
-                            delta_df.to_csv(out_path, sep="\t", index=False)
-                            all_outputs[f"advanced_delta_rscu_{metric}_path"] = out_path
-                            advanced_results[f"delta_rscu_{metric}"] = delta_df
+                all_deltas = []
 
-            # Delta RSCU with Mahalanobis cluster RSCU as the baseline
-            # (deviation of high-expression genes from Mahalanobis cluster)
-            if expr_df is not None:
+                # Helper: normalize {label}_rscu column → ref_rscu and add baseline col
+                def _normalize(df: pd.DataFrame, metric: str, baseline: str,
+                               ref_col: str) -> pd.DataFrame:
+                    d = df.copy()
+                    if ref_col in d.columns:
+                        d = d.rename(columns={ref_col: "ref_rscu"})
+                    d["metric"] = metric
+                    d["baseline"] = baseline
+                    return d
+
+                # Genome-average baseline (primary expression class)
+                if COL_EXPRESSION_CLASS in expr_df.columns:
+                    delta_df = compute_delta_rscu(rscu_gene_df, expr_df, COL_EXPRESSION_CLASS)
+                    if not delta_df.empty:
+                        metric = COL_EXPRESSION_CLASS.replace("_class", "")
+                        all_deltas.append(_normalize(
+                            delta_df, metric, "genome_avg", "genome_avg_rscu",
+                        ))
+
+                # Mahalanobis-cluster baseline (all four class columns)
                 for class_col in [COL_EXPRESSION_CLASS, COL_CAI_CLASS, COL_MELP_CLASS, COL_FOP_CLASS]:
                     if class_col in expr_df.columns:
                         delta_mahal_df = compute_delta_rscu(
@@ -860,10 +881,36 @@ def run_single_genome(
                         )
                         if not delta_mahal_df.empty:
                             metric = class_col.replace("_class", "")
-                            out_path = adv_dir / f"{sample_id}_delta_rscu_{metric}_mahal_ref.tsv"
-                            delta_mahal_df.to_csv(out_path, sep="\t", index=False)
-                            all_outputs[f"advanced_delta_rscu_{metric}_mahal_ref_path"] = out_path
-                            advanced_results[f"delta_rscu_{metric}_mahal_ref"] = delta_mahal_df
+                            all_deltas.append(_normalize(
+                                delta_mahal_df, metric, "mahal_cluster", "mahal_cluster_rscu",
+                            ))
+
+                if all_deltas:
+                    combined_deltas = pd.concat(all_deltas, ignore_index=True)
+                    # Reorder: metric, baseline first
+                    lead = ["metric", "baseline"]
+                    cols = lead + [c for c in combined_deltas.columns if c not in lead]
+                    combined_deltas = combined_deltas[cols]
+
+                    out_path = adv_dir / f"{sample_id}_rscu_deltas.tsv"
+                    combined_deltas.to_csv(out_path, sep="\t", index=False)
+                    all_outputs["advanced_rscu_deltas_path"] = out_path
+                    advanced_results["rscu_deltas"] = combined_deltas
+                    logger.info(
+                        "Consolidated delta RSCU (Mahalanobis tiers) to %s", out_path,
+                    )
+
+                    # Back-compat keys so plotting and downstream consumers
+                    # still find per-metric / per-baseline DataFrames.
+                    for (baseline, suffix) in (("genome_avg", ""), ("mahal_cluster", "_mahal_ref")):
+                        bmask = combined_deltas["baseline"] == baseline
+                        if not bmask.any():
+                            continue
+                        for metric in combined_deltas.loc[bmask, "metric"].unique():
+                            mmask = bmask & (combined_deltas["metric"] == metric)
+                            sub = combined_deltas.loc[mmask].drop(columns=["metric", "baseline"])
+                            advanced_results[f"delta_rscu_{metric}{suffix}"] = sub
+                            all_outputs[f"advanced_delta_rscu_{metric}{suffix}_path"] = out_path
 
             # Preserve RP-based COG enrichment before overwriting
             if "cog_enrichment" in advanced_results:
@@ -920,7 +967,7 @@ def run_single_genome(
             from codonpipe.modules.enrichment import load_ko_pathway_map, load_pathway_names
             from codonpipe.plotting.gsea_plots import generate_gsea_plots
 
-            cache_dir = output_dir / ".cache"
+            cache_dir = kegg_cache_dir if kegg_cache_dir is not None else output_dir / ".cache"
             ko_pw_map = load_ko_pathway_map(
                 user_file=kegg_ko_pathway, cache_dir=cache_dir,
             )
@@ -1147,6 +1194,14 @@ def run_batch(
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Shared KEGG cache — avoids re-downloading KO/pathway maps per sample.
+    # Respects an explicit override in kwargs (unusual; single-sample mode).
+    if "kegg_cache_dir" not in kwargs:
+        batch_cache_dir = output_dir / ".cache"
+        batch_cache_dir.mkdir(parents=True, exist_ok=True)
+        kwargs["kegg_cache_dir"] = batch_cache_dir
+        logger.info("Shared KEGG cache: %s", batch_cache_dir)
 
     df = load_batch_table(batch_table)
     n_samples = len(df)
