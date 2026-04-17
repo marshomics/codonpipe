@@ -34,7 +34,7 @@ from codonpipe.utils.codon_tables import (
     COL_MELP_CLASS,
     COL_FOP_CLASS,
 )
-from codonpipe.utils.io import find_gene_id_column
+from codonpipe.utils.io import find_gene_id_column, get_output_subdir
 from codonpipe.utils.statistics import benjamini_hochberg
 
 logger = logging.getLogger("codonpipe")
@@ -838,7 +838,7 @@ def run_advanced_analyses(
     Returns:
         Dict of output DataFrames and file paths.
     """
-    adv_dir = output_dir / "advanced"
+    adv_dir = get_output_subdir(output_dir, "comparative", "advanced")
     adv_dir.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, pd.DataFrame | Path] = {}
 
@@ -896,20 +896,51 @@ def run_advanced_analyses(
         outputs["pr2"] = pr2_df
         outputs["pr2_path"] = out_path
 
-    # 6. Delta RSCU
+    # 6. Delta RSCU (genome-average baseline). Step 9d of the pipeline
+    # overwrites this file with Mahalanobis-based tiers and adds
+    # mahal_cluster baseline rows when Mahalanobis clustering is enabled.
+    # Schema: metric, baseline, codon_col, codon, amino_acid, ref_rscu,
+    # high_expr_rscu, delta_rscu.
     if expr_df is not None:
         logger.info("Computing delta RSCU (high-expression vs genome avg) for %s", sample_id)
         delta_class_cols = [COL_EXPRESSION_CLASS,
                            COL_CAI_CLASS, COL_MELP_CLASS, COL_FOP_CLASS]
+        all_deltas = []
+
         for class_col in delta_class_cols:
             if class_col in expr_df.columns:
                 delta_df = compute_delta_rscu(rscu_gene_df, expr_df, class_col)
                 if not delta_df.empty:
                     metric = class_col.replace("_class", "")
-                    out_path = adv_dir / f"{sample_id}_delta_rscu_{metric}.tsv"
-                    delta_df.to_csv(out_path, sep="\t", index=False)
-                    outputs[f"delta_rscu_{metric}"] = delta_df
-                    outputs[f"delta_rscu_{metric}_path"] = out_path
+                    # Normalize {reference_label}_rscu -> ref_rscu and tag
+                    delta_df = delta_df.rename(columns={"genome_avg_rscu": "ref_rscu"})
+                    delta_df["metric"] = metric
+                    delta_df["baseline"] = "genome_avg"
+                    all_deltas.append(delta_df)
+
+        if all_deltas:
+            combined_deltas = pd.concat(all_deltas, ignore_index=True)
+            # Reorder columns: metric, baseline first
+            lead = ["metric", "baseline"]
+            cols = lead + [c for c in combined_deltas.columns if c not in lead]
+            combined_deltas = combined_deltas[cols]
+
+            out_path = adv_dir / f"{sample_id}_rscu_deltas.tsv"
+            combined_deltas.to_csv(out_path, sep="\t", index=False)
+            outputs["rscu_deltas"] = combined_deltas
+            outputs["rscu_deltas_path"] = out_path
+            logger.info("Consolidated delta RSCU to %s", out_path)
+
+            # Back-compat per-metric keys (genome-avg baseline only at this step)
+            for class_col in delta_class_cols:
+                if class_col in expr_df.columns:
+                    metric = class_col.replace("_class", "")
+                    mask = combined_deltas["metric"] == metric
+                    if mask.any():
+                        outputs[f"delta_rscu_{metric}"] = (
+                            combined_deltas[mask].drop(columns=["metric", "baseline"])
+                        )
+                        outputs[f"delta_rscu_{metric}_path"] = out_path
 
     # 7. tRNA gene copy number correlation
     if gff_path is not None and gff_path.exists():
