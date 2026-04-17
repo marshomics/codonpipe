@@ -7,7 +7,7 @@ import logging
 import shutil
 from pathlib import Path
 
-from codonpipe.utils.io import check_tool, run_cmd
+from codonpipe.utils.io import get_output_subdir, check_tool, run_cmd
 
 logger = logging.getLogger("codonpipe")
 
@@ -127,7 +127,7 @@ def run_prokka(
             faa, ffn, fna, gff, gbk, tsv, txt, log
     """
     check_tool("prokka")
-    prokka_dir = output_dir / "prokka"
+    prokka_dir = get_output_subdir(output_dir, "annotation", "prokka")
 
     # Check for existing output
     expected_faa = prokka_dir / f"{sample_id}.faa"
