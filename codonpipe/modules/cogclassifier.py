@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from codonpipe.utils.io import get_output_subdir
 
 import pandas as pd
 from Bio import SeqIO
@@ -57,7 +58,7 @@ def run_cogclassifier(
         Path to the COGclassifier result TSV.
     """
     check_tool("COGclassifier")
-    cog_dir = output_dir / "cogclassifier"
+    cog_dir = get_output_subdir(output_dir, "annotation", "cogclassifier")
 
     # COGclassifier v1 writes result.tsv; v2 writes cog_classify.tsv
     result_candidates = [cog_dir / "result.tsv", cog_dir / "cog_classify.tsv"]
@@ -158,7 +159,7 @@ def extract_ribosomal_proteins(
         )
 
     # Extract sequences
-    rp_dir = output_dir / "ribosomal_proteins"
+    rp_dir = get_output_subdir(output_dir, "annotation", "ribosomal_proteins")
     rp_dir.mkdir(parents=True, exist_ok=True)
 
     outputs = {}
