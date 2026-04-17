@@ -31,7 +31,7 @@ from codonpipe.utils.codon_tables import (
     SENSE_CODONS,
     dna_to_rna,
 )
-from codonpipe.utils.io import find_gene_id_column
+from codonpipe.utils.io import find_gene_id_column, get_output_subdir
 from codonpipe.utils.statistics import benjamini_hochberg
 
 logger = logging.getLogger("codonpipe")
@@ -1674,7 +1674,7 @@ def run_bio_ecology_analyses(
         Dict of analysis names -> DataFrames/file paths. Includes nested dicts for
         multi-output analyses (e.g., translational_selection).
     """
-    eco_dir = output_dir / "bio_ecology"
+    eco_dir = get_output_subdir(output_dir, "comparative", "bio_ecology")
     eco_dir.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, pd.DataFrame | Path | dict] = {}
 
