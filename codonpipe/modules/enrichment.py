@@ -20,6 +20,7 @@ import pandas as pd
 from scipy import stats
 
 from codonpipe import __version__
+from codonpipe.utils.io import get_output_subdir
 from codonpipe.utils.statistics import benjamini_hochberg
 
 logger = logging.getLogger("codonpipe")
@@ -340,6 +341,7 @@ def run_enrichment_analysis(
     fdr_threshold: float = 0.05,
     metrics: list[str] | None = None,
     output_subdir: str = "enrichment",
+    cache_dir: Path | None = None,
 ) -> dict[str, Path]:
     """Run pathway enrichment for high- and low-expression gene sets.
 
@@ -361,16 +363,18 @@ def run_enrichment_analysis(
             'high', 'medium', 'low'.  Defaults to ["CAI", "MELP", "Fop"].
         output_subdir: Subdirectory name under output_dir for results.
             Defaults to "enrichment".
+        cache_dir: Shared KEGG cache directory. If None, uses per-sample
+            cache at output_dir / ".cache" for backward compatibility.
 
     Returns:
         Dict of output file paths.
     """
-    enrich_dir = output_dir / output_subdir
-    enrich_dir.mkdir(parents=True, exist_ok=True)
+    enrich_dir = get_output_subdir(output_dir, "expression", output_subdir)
     outputs = {}
 
     # Load KO-pathway mapping if not provided
-    cache_dir = output_dir / ".cache"
+    if cache_dir is None:
+        cache_dir = output_dir / ".cache"
     if ko_pathway_map is None:
         ko_pathway_map = load_ko_pathway_map(
             user_file=kegg_ko_pathway_file, cache_dir=cache_dir,
@@ -431,6 +435,9 @@ def run_enrichment_analysis(
         metrics = ["CAI", "MELP", "Fop"]
     test_metrics = [m for m in metrics if f"{m}_class" in expr_annotated.columns]
 
+    # Collect all enrichment results
+    all_results = []
+
     for metric in test_metrics:
         class_col = f"{metric}_class"
         for tier in ["high", "low"]:
@@ -449,15 +456,35 @@ def run_enrichment_analysis(
                 pathway_names=pathway_names, fdr_threshold=fdr_threshold,
             )
 
-            out_path = enrich_dir / f"{sample_id}_{metric}_{tier}_enrichment.tsv"
-            result.to_csv(out_path, sep="\t", index=False)
-            outputs[f"enrichment_{metric}_{tier}"] = out_path
+            # Add metric and tier columns
+            result["metric"] = metric
+            result["tier"] = tier
+            all_results.append(result)
 
             n_sig = result["significant"].sum() if "significant" in result.columns else 0
             logger.info(
                 "%s %s-%s enrichment: %d pathways tested, %d significant (FDR < %.2f)",
                 sample_id, metric, tier, len(result), n_sig, fdr_threshold,
             )
+
+    # Consolidate all results into a single pathways.tsv file
+    if all_results:
+        combined = pd.concat(all_results, ignore_index=True)
+        # Reorder columns: metric and tier first
+        cols = ["metric", "tier"] + [c for c in combined.columns if c not in ["metric", "tier"]]
+        combined = combined[cols]
+        
+        pathways_path = enrich_dir / f"{sample_id}_pathways.tsv"
+        combined.to_csv(pathways_path, sep="	", index=False)
+        outputs["pathways"] = pathways_path
+        logger.info("Consolidated enrichment results to %s (%d pathway-tier combinations)",
+                    pathways_path, len(combined))
+        
+        # For backward compatibility, also populate enrichment_{metric}_{tier} keys
+        # that all point at the same pathways.tsv file
+        for metric in test_metrics:
+            for tier in ["high", "low"]:
+                outputs[f"enrichment_{metric}_{tier}"] = pathways_path
 
     return outputs
 
