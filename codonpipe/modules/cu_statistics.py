@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 
 from codonpipe.utils.codon_tables import MIN_GENE_LENGTH
-from codonpipe.utils.io import check_tool, run_cmd
+from codonpipe.utils.io import check_tool, get_output_subdir, run_cmd
 
 logger = logging.getLogger("codonpipe")
 
@@ -104,7 +104,7 @@ def run_cu_statistics(
         Dict of output file paths keyed by statistic name.
     """
     check_tool("Rscript")
-    stats_dir = output_dir / "cu_statistics"
+    stats_dir = get_output_subdir(output_dir, "codon_usage", "cu_statistics")
     stats_dir.mkdir(parents=True, exist_ok=True)
     outputs = {}
 
