@@ -19,7 +19,7 @@ from codonpipe.utils.codon_tables import (
     COL_MELP, COL_CAI, COL_FOP, EXPRESSION_METRICS,
     COL_MELP_CLASS, COL_CAI_CLASS, COL_FOP_CLASS, COL_EXPRESSION_CLASS,
 )
-from codonpipe.utils.io import check_tool, run_cmd
+from codonpipe.utils.io import check_tool, get_output_subdir, run_cmd
 
 logger = logging.getLogger("codonpipe")
 
@@ -87,7 +87,7 @@ def run_expression_analysis(
     output_dir: Path,
     sample_id: str,
     force: bool = False,
-) -> dict[str, Path]:
+) -> tuple[dict[str, Path], pd.DataFrame | None]:
     """Run MELP, CAI, and Fop expression level prediction.
 
     Args:
@@ -95,13 +95,17 @@ def run_expression_analysis(
         rp_ids_file: Path to text file with ribosomal protein IDs (one per line).
         output_dir: Base output directory.
         sample_id: Sample identifier.
-        force: Rerun even if output exists.
+        force: Accepted for API compatibility; ignored. Outputs are written
+            to a fresh temporary directory on every call, so there is never
+            a prior result to skip.
 
     Returns:
-        Dict of output file paths (melp, cai, fop, expression_combined).
+        Tuple of (outputs_dict, combined_dataframe) where outputs_dict contains
+        file paths and combined_dataframe is the combined expression table
+        (or None if skipped/failed).
     """
     check_tool("Rscript")
-    expr_dir = output_dir / "expression"
+    expr_dir = get_output_subdir(output_dir, "expression", "scores")
     expr_dir.mkdir(parents=True, exist_ok=True)
     outputs = {}
 
@@ -116,33 +120,43 @@ def run_expression_analysis(
         outputs["_skipped"] = "no_rp_ids"
         return outputs
 
-    # Run each metric using the shared R script template
-    for metric, outname in [("MELP", "melp"), ("CAI", "cai"), ("Fop", "fop")]:
-        out_path = expr_dir / f"{sample_id}_{outname}.tsv"
-        if not out_path.exists() or force:
+    # Use temporary directory for per-metric coRdon outputs
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        
+        # Run each metric using the shared R script template
+        outputs_dict = {}
+        # Every invocation writes into a fresh TemporaryDirectory, so there
+        # is no prior output to skip. The ``force`` parameter is retained
+        # for API compatibility but has no effect here.
+        _ = force
+        for metric, outname in [("MELP", "melp"), ("CAI", "cai"), ("Fop", "fop")]:
+            out_path = tmpdir / f"{sample_id}_{outname}.tsv"
             logger.info("Computing %s expression scores for %s", metric, sample_id)
             _run_r_expression(
                 _expression_r_script(metric),
                 ffn_path, rp_ids_file, out_path, metric, sample_id,
             )
-        outputs[outname] = out_path
+            outputs_dict[outname] = out_path
 
-    melp_out = outputs.get("melp", expr_dir / f"{sample_id}_melp.tsv")
-    cai_out = outputs.get("cai", expr_dir / f"{sample_id}_cai.tsv")
-    fop_out = outputs.get("fop", expr_dir / f"{sample_id}_fop.tsv")
+        melp_out = outputs_dict.get("melp", tmpdir / f"{sample_id}_melp.tsv")
+        cai_out = outputs_dict.get("cai", tmpdir / f"{sample_id}_cai.tsv")
+        fop_out = outputs_dict.get("fop", tmpdir / f"{sample_id}_fop.tsv")
 
-    # Combine and classify expression levels
-    combined_out = expr_dir / f"{sample_id}_expression.tsv"
-    if melp_out.exists() and cai_out.exists():
-        combined = _combine_expression(melp_out, cai_out, fop_out, sample_id)
-        combined.to_csv(combined_out, sep="\t", index=False)
-        outputs["expression_combined"] = combined_out
-        logger.info(
-            "Expression analysis: %d genes classified for %s",
-            len(combined), sample_id,
-        )
+        # Combine and classify expression levels
+        combined_df = None
+        if melp_out.exists() and cai_out.exists():
+            combined = _combine_expression(melp_out, cai_out, fop_out, sample_id)
+            combined_out = expr_dir / f"{sample_id}_expression.tsv"
+            combined.to_csv(combined_out, sep="	", index=False)
+            outputs["expression_combined"] = combined_out
+            combined_df = combined
+            logger.info(
+                "Expression analysis: %d genes classified for %s",
+                len(combined), sample_id,
+            )
 
-    return outputs
+    return (outputs, combined_df)
 
 
 def _run_r_expression(
@@ -201,11 +215,14 @@ def _classify_by_percentile(
     hi_thresh = np.nanpercentile(vals, high_pctl)
     lo_thresh = np.nanpercentile(vals, low_pctl)
 
-    return pd.Series(
-        np.where(series >= hi_thresh, "high",
-                 np.where(series <= lo_thresh, "low", "medium")),
-        index=series.index,
-    )
+    # Build labels row-by-row so that NaN scores stay "unknown" instead of
+    # being collapsed into "medium" (NaN >= x and NaN <= x are both False,
+    # so a naive np.where chain misclassifies missing values).
+    result = pd.Series("medium", index=series.index, dtype=object)
+    result[series.isna()] = "unknown"
+    result[series >= hi_thresh] = "high"
+    result[series <= lo_thresh] = "low"
+    return result
 
 
 def _rename_score_column(df: pd.DataFrame, target_name: str) -> pd.DataFrame:
