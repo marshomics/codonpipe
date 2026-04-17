@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from codonpipe.utils.io import get_output_subdir
 
 import pandas as pd
 
@@ -37,7 +38,7 @@ def run_kofamscan(
     """
     check_tool("exec_annotation")
 
-    kofam_dir = output_dir / "kofamscan"
+    kofam_dir = get_output_subdir(output_dir, "annotation", "kofamscan")
     kofam_dir.mkdir(parents=True, exist_ok=True)
     result_file = kofam_dir / f"{sample_id}_kofam.tsv"
     tmp_dir = kofam_dir / "tmp"
