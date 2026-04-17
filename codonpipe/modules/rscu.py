@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from Bio import SeqIO
 
+from codonpipe.utils.io import get_output_subdir
 from codonpipe.utils.codon_tables import (
     AA_CODON_GROUPS,
     AA_CODON_GROUPS_RSCU,
@@ -332,7 +333,7 @@ def run_rscu_analysis(
     Returns:
         Dict of output file paths.
     """
-    rscu_dir = output_dir / "rscu"
+    rscu_dir = get_output_subdir(output_dir, "codon_usage", "rscu")
     rscu_dir.mkdir(parents=True, exist_ok=True)
     outputs = {}
 
