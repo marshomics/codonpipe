@@ -207,3 +207,37 @@ def find_gene_id_column(
         return df.columns[0]
 
     return None
+
+
+def get_output_subdir(
+    base_dir: Path,
+    category: str,
+    subcategory: str | None = None,
+) -> Path:
+    """Get and create an output subdirectory for organized output structure.
+    
+    Maps old-style flat directories to new role-based hierarchy:
+    - annotation/ contains: prokka, cogclassifier, kofamscan, ribosomal_proteins
+    - codon_usage/ contains: rscu, cu_statistics, codon_tables
+    - expression/ contains: scores, enrichment, enrichment_mahal, gmm_clustering
+    - comparative/ contains: advanced, bio_ecology
+    - plots/ unchanged
+    - .cache/ unchanged
+    
+    Args:
+        base_dir: Base output directory (typically {output_dir}/{sample_id}/).
+        category: Role category (annotation, codon_usage, expression, comparative, plots, .cache).
+        subcategory: Optional subcategory within the role (prokka, rscu, enrichment, etc.).
+    
+    Returns:
+        Path to the subdirectory, created if it doesn't exist.
+    """
+    base_dir = Path(base_dir)
+    
+    if subcategory:
+        subdir = base_dir / category / subcategory
+    else:
+        subdir = base_dir / category
+    
+    subdir.mkdir(parents=True, exist_ok=True)
+    return subdir
