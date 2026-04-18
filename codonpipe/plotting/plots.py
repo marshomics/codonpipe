@@ -6455,7 +6455,7 @@ def generate_single_genome_plots(
     # ── Codon usage inefficiency disconnect plots ──────────────────────
     # Load the inefficiency report from disk (generated in pipeline step 9e)
     _ineff_report = None
-    _ineff_path = output_dir / "enrichment_mahal" / f"{sample_id}_codon_inefficiency_report.tsv"
+    _ineff_path = output_dir / "expression" / "enrichment_mahal" / f"{sample_id}_codon_inefficiency_report.tsv"
     if _ineff_path.exists():
         try:
             _ineff_report = pd.read_csv(_ineff_path, sep="\t")
