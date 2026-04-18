@@ -254,8 +254,8 @@ def run_single_genome(
         logger.info("[Step 3/12] Loading pre-computed KofamScan results from %s", kofam_results_file)
         try:
             kofam_df = parse_kofamscan(kofam_results_file)
-            kofam_out = output_dir / "kofamscan" / f"{sample_id}_kofam_parsed.tsv"
-            kofam_out.parent.mkdir(parents=True, exist_ok=True)
+            kofam_dir = get_output_subdir(output_dir, "annotation", "kofamscan")
+            kofam_out = kofam_dir / f"{sample_id}_kofam_parsed.tsv"
             kofam_df.to_csv(kofam_out, sep="\t", index=False)
             all_outputs["kofam_parsed"] = kofam_out
         except Exception as e:
@@ -269,7 +269,8 @@ def run_single_genome(
                 cpus=cpus, force=force,
             )
             kofam_df = parse_kofamscan(kofam_result)
-            kofam_out = output_dir / "kofamscan" / f"{sample_id}_kofam_parsed.tsv"
+            kofam_dir = get_output_subdir(output_dir, "annotation", "kofamscan")
+            kofam_out = kofam_dir / f"{sample_id}_kofam_parsed.tsv"
             kofam_df.to_csv(kofam_out, sep="\t", index=False)
             all_outputs["kofam_parsed"] = kofam_out
         except (FileNotFoundError, RuntimeError) as e:
@@ -294,7 +295,8 @@ def run_single_genome(
     # Annotate RSCU with KofamScan if available
     if kofam_df is not None and not kofam_df.empty:
         annotated = annotate_with_kofam(rscu_gene_df, kofam_df)
-        ann_path = output_dir / "rscu" / f"{sample_id}_rscu_annotated.tsv"
+        rscu_dir = get_output_subdir(output_dir, "codon_usage", "rscu")
+        ann_path = rscu_dir / f"{sample_id}_rscu_annotated.tsv"
         annotated.to_csv(ann_path, sep="\t", index=False)
         all_outputs["rscu_annotated"] = ann_path
     else:
@@ -359,7 +361,8 @@ def run_single_genome(
                 # Annotate with KofamScan
                 if kofam_df is not None and not kofam_df.empty:
                     expr_ann = annotate_with_kofam(expr_df, kofam_df)
-                    expr_ann_path = output_dir / "expression" / f"{sample_id}_expression_annotated.tsv"
+                    expr_ann_dir = get_output_subdir(output_dir, "expression")
+                    expr_ann_path = expr_ann_dir / f"{sample_id}_expression_annotated.tsv"
                     expr_ann.to_csv(expr_ann_path, sep="\t", index=False)
                     all_outputs["expression_annotated"] = expr_ann_path
         except (FileNotFoundError, RuntimeError) as e:
@@ -409,8 +412,8 @@ def run_single_genome(
             if gff_candidate and Path(gff_candidate).exists():
                 resolved_gff = Path(gff_candidate)
         if resolved_gff is None:
-            # Try Prokka output directory
-            prokka_gff = output_dir / "prokka" / f"{sample_id}.gff"
+            # Try Prokka output directory (under the annotation/ hierarchy)
+            prokka_gff = output_dir / "annotation" / "prokka" / f"{sample_id}.gff"
             if prokka_gff.exists():
                 resolved_gff = prokka_gff
 
@@ -640,11 +643,10 @@ def run_single_genome(
     # Refresh the cluster IDs path reference for Step 9b
     mahal_cluster_ids_path = mahal_results.get("mahal_cluster_ids_path")
 
-    # Save Mahalanobis cluster RSCU to rscu/ directory alongside genome and RP RSCU
+    # Save Mahalanobis cluster RSCU to codon_usage/rscu/ alongside genome and RP RSCU
     if mahal_cluster_rscu is not None and not mahal_cluster_rscu.empty:
         try:
-            rscu_dir = output_dir / "rscu"
-            rscu_dir.mkdir(parents=True, exist_ok=True)
+            rscu_dir = get_output_subdir(output_dir, "codon_usage", "rscu")
             mahal_rscu_path = rscu_dir / f"{sample_id}_rscu_mahal_cluster.tsv"
             mahal_cluster_rscu.to_frame("RSCU").to_csv(mahal_rscu_path, sep="\t")
             all_outputs["rscu_mahal_cluster"] = mahal_rscu_path
@@ -710,7 +712,8 @@ def run_single_genome(
                 # Annotate with KofamScan
                 if kofam_df is not None and not kofam_df.empty:
                     expr_ann = annotate_with_kofam(mahal_expr_df, kofam_df)
-                    expr_ann_path = output_dir / "expression" / f"{sample_id}_expression_annotated.tsv"
+                    expr_ann_dir = get_output_subdir(output_dir, "expression")
+                    expr_ann_path = expr_ann_dir / f"{sample_id}_expression_annotated.tsv"
                     expr_ann.to_csv(expr_ann_path, sep="\t", index=False)
                     all_outputs["expression_annotated"] = expr_ann_path
 
@@ -769,9 +772,14 @@ def run_single_genome(
                 sample_id, tss_caveat,
             )
 
-        # Re-save expression TSV with the new columns
-        expr_combined_path = output_dir / "expression" / f"{sample_id}_expression.tsv"
-        if expr_combined_path.exists():
+        # Re-save expression TSV with the new columns. The canonical path
+        # is recorded in all_outputs by whichever expression step ran (RP
+        # fallback or Mahalanobis-based). Fall back to the known location
+        # under expression/scores/ if the key is missing.
+        expr_combined_path = all_outputs.get("expression_combined")
+        if expr_combined_path is None:
+            expr_combined_path = output_dir / "expression" / "scores" / f"{sample_id}_expression.tsv"
+        if Path(expr_combined_path).exists():
             try:
                 expr_df.to_csv(expr_combined_path, sep="\t", index=False)
             except Exception as e:
@@ -938,7 +946,7 @@ def run_single_genome(
         try:
             from codonpipe.modules.enrichment import generate_codon_inefficiency_report
 
-            report_path = output_dir / "enrichment_mahal" / f"{sample_id}_codon_inefficiency_report.tsv"
+            report_path = get_output_subdir(output_dir, "expression", "enrichment_mahal") / f"{sample_id}_codon_inefficiency_report.tsv"
             result_path = generate_codon_inefficiency_report(
                 mahal_clusters_path=Path(mahal_results["mahal_clusters_path"]),
                 kofam_df=kofam_df,
@@ -1061,8 +1069,8 @@ def run_single_genome(
     if resolved_gff is not None and _dual_df is not None and not _dual_df.empty:
         try:
             _hgt_df = bio_outputs.get("hgt_candidates") if bio_outputs else None
-            _cu_gff_path = output_dir / "prokka" / f"{sample_id}_cu_annotated.gff"
-            _cu_gff_path.parent.mkdir(parents=True, exist_ok=True)
+            _prokka_out_dir = get_output_subdir(output_dir, "annotation", "prokka")
+            _cu_gff_path = _prokka_out_dir / f"{sample_id}_cu_annotated.gff"
             annotate_gff_with_cu_class(
                 gff_path=resolved_gff,
                 dual_anchor_df=_dual_df,
@@ -1086,8 +1094,8 @@ def run_single_genome(
                 gff_path=resolved_gff,
             )
             if islands:
-                _island_gff_path = output_dir / "prokka" / f"{sample_id}_genomic_islands.gff"
-                _island_gff_path.parent.mkdir(parents=True, exist_ok=True)
+                _prokka_out_dir = get_output_subdir(output_dir, "annotation", "prokka")
+                _island_gff_path = _prokka_out_dir / f"{sample_id}_genomic_islands.gff"
                 annotate_gff_with_genomic_islands(
                     gff_path=resolved_gff,
                     islands=islands,
