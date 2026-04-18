@@ -31,6 +31,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from codonpipe.utils.io import get_output_subdir
+
 logger = logging.getLogger("codonpipe")
 
 # ── Availability detection ──────────────────────────────────────────────
@@ -452,8 +454,7 @@ def run_grodon(
         logger.warning("gRodon2: CDS FASTA not found: %s", ffn_path)
         return None
 
-    eco_dir = output_dir / "bio_ecology"
-    eco_dir.mkdir(parents=True, exist_ok=True)
+    eco_dir = get_output_subdir(output_dir, "comparative", "bio_ecology")
 
     # Write R script to temp file and run it
     with tempfile.NamedTemporaryFile(mode="w", suffix=".R", delete=False) as r_file:
