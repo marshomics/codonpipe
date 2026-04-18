@@ -473,18 +473,27 @@ def run_enrichment_analysis(
         # Reorder columns: metric and tier first
         cols = ["metric", "tier"] + [c for c in combined.columns if c not in ["metric", "tier"]]
         combined = combined[cols]
-        
+
         pathways_path = enrich_dir / f"{sample_id}_pathways.tsv"
-        combined.to_csv(pathways_path, sep="	", index=False)
+        combined.to_csv(pathways_path, sep="\t", index=False)
         outputs["pathways"] = pathways_path
         logger.info("Consolidated enrichment results to %s (%d pathway-tier combinations)",
                     pathways_path, len(combined))
-        
-        # For backward compatibility, also populate enrichment_{metric}_{tier} keys
-        # that all point at the same pathways.tsv file
+
+        # Write per-metric-per-tier slices so downstream consumers load the
+        # correct subset rather than the union. Previously every
+        # ``enrichment_{metric}_{tier}`` key aliased to the same combined
+        # file, which made every tier and every metric render identically.
         for metric in test_metrics:
             for tier in ["high", "low"]:
-                outputs[f"enrichment_{metric}_{tier}"] = pathways_path
+                slice_df = combined[
+                    (combined["metric"] == metric) & (combined["tier"] == tier)
+                ].reset_index(drop=True)
+                if slice_df.empty:
+                    continue
+                slice_path = enrich_dir / f"{sample_id}_pathways_{metric}_{tier}.tsv"
+                slice_df.to_csv(slice_path, sep="\t", index=False)
+                outputs[f"enrichment_{metric}_{tier}"] = slice_path
 
     return outputs
 
