@@ -127,7 +127,11 @@ def run_prokka(
             faa, ffn, fna, gff, gbk, tsv, txt, log
     """
     check_tool("prokka")
-    prokka_dir = get_output_subdir(output_dir, "annotation", "prokka")
+    # Ensure the parent ``annotation/`` exists, but do NOT pre-create the
+    # final ``prokka/`` subdirectory — Prokka refuses to write into an
+    # existing folder unless ``--force`` is passed.
+    annotation_dir = get_output_subdir(output_dir, "annotation")
+    prokka_dir = annotation_dir / "prokka"
 
     # Check for existing output
     expected_faa = prokka_dir / f"{sample_id}.faa"
@@ -138,6 +142,18 @@ def run_prokka(
         outputs = _collect_outputs(prokka_dir, sample_id)
         outputs["locustag"] = locustag
         return outputs
+
+    # If the directory exists but lacks the expected .faa, a prior run
+    # crashed mid-way. Prokka would bail with "Folder already exists"; pass
+    # --force so we can re-run cleanly instead of dead-ending.
+    overwrite_stale = prokka_dir.exists() and not expected_faa.exists()
+    if overwrite_stale and not force:
+        logger.info(
+            "Prokka output directory %s exists but is incomplete; "
+            "overwriting with --force",
+            prokka_dir,
+        )
+
     if locustag != sample_id:
         logger.info(
             "Sample ID '%s' exceeds GenBank locus tag limit (%d chars); "
@@ -155,7 +171,7 @@ def run_prokka(
     ]
     if metagenome:
         cmd.append("--metagenome")
-    if force:
+    if force or overwrite_stale:
         cmd.append("--force")
     if extra_args:
         cmd.extend(extra_args)
