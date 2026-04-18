@@ -154,8 +154,10 @@ def compute_rscu_table(
         min_length: Minimum sequence length in nucleotides to include.
 
     Returns:
-        DataFrame with columns: codon, amino_acid, count, rscu
-        Only includes sense codons (excludes stops, Met, Trp).
+        DataFrame with columns: codon, amino_acid, count, rscu.
+        Covers all 64 codons. Met (AUG) and Trp (UGG) have RSCU = 1.0 (sole
+        codon for their amino acid). Stop codons have RSCU = NaN (undefined;
+        stops aren't translated).
     """
     total_counts = _filter_sequences_by_ids(ffn_path, gene_ids, min_length)
 
@@ -165,11 +167,16 @@ def compute_rscu_table(
     rscu_vals = compute_rscu_from_counts(total_counts)
     rows = []
 
-    for codon in sorted(SENSE_CODONS.keys()):
-        aa = CODON_TABLE_11[codon]
+    for codon, aa in sorted(CODON_TABLE_11.items()):
         count = total_counts.get(codon, 0)
-        col_name = codon_to_col_name(codon, aa)
-        rscu_val = rscu_vals.get(col_name, np.nan)
+        if aa == "*":
+            rscu_val = np.nan  # RSCU undefined for stop codons
+        elif codon in SENSE_CODONS:
+            col_name = codon_to_col_name(codon, aa)
+            rscu_val = rscu_vals.get(col_name, np.nan)
+        else:
+            # Single-codon amino acid (Met, Trp): RSCU = 1 by definition
+            rscu_val = 1.0
 
         rows.append({
             "codon": codon,
@@ -218,19 +225,32 @@ def compute_relative_adaptiveness(
         max_rscu_per_family[family_name] = max_val
 
     rows = []
-    for codon in sorted(SENSE_CODONS.keys()):
-        aa = CODON_TABLE_11[codon]
-        col_name = codon_to_col_name(codon, aa)
-        family_name = col_name.split("-")[0]
-        rscu_val = rscu_vals.get(col_name, 0.0)
-        max_rscu = max_rscu_per_family.get(family_name, 1.0)
-        w_value = rscu_val / max_rscu if max_rscu > 0 else np.nan
+    for codon, aa in sorted(CODON_TABLE_11.items()):
+        if aa == "*":
+            # Stops: not translated, CAI weights are undefined
+            rows.append({
+                "codon": codon,
+                "amino_acid": aa,
+                "rscu": np.nan,
+                "w_value": np.nan,
+            })
+            continue
+        if codon in SENSE_CODONS:
+            col_name = codon_to_col_name(codon, aa)
+            family_name = col_name.split("-")[0]
+            rscu_val = rscu_vals.get(col_name, 0.0)
+            max_rscu = max_rscu_per_family.get(family_name, 1.0)
+            w_value = rscu_val / max_rscu if max_rscu > 0 else np.nan
+        else:
+            # Single-codon AA (Met, Trp): RSCU = 1, w_value = 1 (trivially optimal)
+            rscu_val = 1.0
+            w_value = 1.0
 
         rows.append({
             "codon": codon,
             "amino_acid": aa,
             "rscu": round(rscu_val, 4),
-            "w_value": round(w_value, 4),
+            "w_value": round(w_value, 4) if not np.isnan(w_value) else np.nan,
         })
 
     return pd.DataFrame(rows)
@@ -282,16 +302,32 @@ def compute_codon_adaptation_weights(
     all_rscu = compute_rscu_from_counts(all_counts)
 
     rows = []
-    for codon in sorted(SENSE_CODONS.keys()):
-        aa = CODON_TABLE_11[codon]
-        col_name = codon_to_col_name(codon, aa)
-        rscu_ref = ref_rscu.get(col_name, 0.0)
-        rscu_all = all_rscu.get(col_name, 0.0)
-
-        # Compute weight: ln(rscu_ref / rscu_all)
-        # Add small pseudocount to avoid log(0)
-        weight = np.log((rscu_ref + pseudocount) / (rscu_all + pseudocount))
-        is_optimal = weight > 0
+    for codon, aa in sorted(CODON_TABLE_11.items()):
+        if aa == "*":
+            # Stops: no meaningful CAI weight; not used for amino-acid encoding
+            rows.append({
+                "codon": codon,
+                "amino_acid": aa,
+                "rscu_ref": np.nan,
+                "rscu_all": np.nan,
+                "weight": np.nan,
+                "is_optimal": False,
+            })
+            continue
+        if codon in SENSE_CODONS:
+            col_name = codon_to_col_name(codon, aa)
+            rscu_ref = ref_rscu.get(col_name, 0.0)
+            rscu_all = all_rscu.get(col_name, 0.0)
+            # Compute weight: ln(rscu_ref / rscu_all). Pseudocount avoids log(0).
+            weight = np.log((rscu_ref + pseudocount) / (rscu_all + pseudocount))
+            is_optimal = bool(weight > 0)
+        else:
+            # Single-codon AA (Met, Trp): RSCU = 1 for both sets; weight = 0.
+            # Definitionally the only usable codon, so is_optimal = True.
+            rscu_ref = 1.0
+            rscu_all = 1.0
+            weight = 0.0
+            is_optimal = True
 
         rows.append({
             "codon": codon,
@@ -502,22 +538,21 @@ def generate_all_codon_tables(
         rscu_table = compute_rscu_table(ffn, gene_ids)
         w_values = compute_relative_adaptiveness(ffn, gene_ids)
 
-        # Merge count tables (absolute, frequency_per_thousand, rscu) into codon_counts.tsv
-        # Keep relative_adaptiveness separate (it has w_value/is_optimal semantics)
-        if not rscu_table.empty:
-            codon_counts = rscu_table[["codon", "amino_acid"]].copy()
-            codon_counts = codon_counts.merge(
-                abs_counts[["codon", "count"]],
-                on="codon", how="left",
-            )
+        # Merge count tables (absolute, frequency_per_thousand, rscu) into codon_counts.tsv.
+        # Base on abs_counts so the output carries all 64 codons (including
+        # stops, Met, Trp) — RSCU column is NaN where undefined.
+        # Keep relative_adaptiveness separate (it has w_value/is_optimal semantics).
+        if not abs_counts.empty:
+            codon_counts = abs_counts[["codon", "amino_acid", "count"]].copy()
             codon_counts = codon_counts.merge(
                 freq_per_1k[["codon", "per_thousand"]],
                 on="codon", how="left",
             )
-            codon_counts = codon_counts.merge(
-                rscu_table[["codon", "rscu"]],
-                on="codon", how="left",
-            )
+            if not rscu_table.empty:
+                codon_counts = codon_counts.merge(
+                    rscu_table[["codon", "rscu"]],
+                    on="codon", how="left",
+                )
             
             counts_path = codon_dir / f"{sample_id}_{geneset_name}_codon_counts.tsv"
             codon_counts.to_csv(counts_path, sep="	", index=False)
