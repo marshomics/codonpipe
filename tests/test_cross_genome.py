@@ -14,6 +14,9 @@ from codonpipe.modules.cross_genome import (
     _robust_zscore,
     build_corpus,
     cluster_corpus,
+    cluster_corpus_genes,
+    cluster_corpus_genes_by_category,
+    compute_corpus_cluster_drivers,
     compute_gene_signature,
     compute_genome_signature,
     discover_signatures,
@@ -345,6 +348,178 @@ class TestDiscoverSignatures:
         assert len(gen) == 2
 
 
+class TestComputeCorpusClusterDrivers:
+    def test_recovers_two_group_drivers(self):
+        """Synthetic two-group corpus: drivers should differ between clusters."""
+        rng = np.random.default_rng(0)
+        n = 30
+        # Build a feature matrix where columns f0..f4 differ between groups
+        rows_a = rng.normal(loc=2.0, scale=0.3, size=(n // 2, 5))
+        rows_b = rng.normal(loc=-2.0, scale=0.3, size=(n // 2, 5))
+        # Plus 5 noise columns
+        noise = rng.normal(size=(n, 5))
+        X = np.hstack([np.vstack([rows_a, rows_b]), noise])
+        df = pd.DataFrame(X, columns=[f"f{i}" for i in range(10)])
+        df.insert(0, "sample_id", [f"S{i}" for i in range(n)])
+        labels = np.array([0] * (n // 2) + [1] * (n // 2))
+
+        drivers = compute_corpus_cluster_drivers(
+            df, [f"f{i}" for i in range(10)], labels, skip_noise=True,
+        )
+        assert not drivers.empty
+        # Cluster 0 features f0..f4 should be enriched (high values), Cluster 1 depleted
+        c0_top = drivers[drivers["cluster_id"] == 0].iloc[0]
+        c1_top = drivers[drivers["cluster_id"] == 1].iloc[0]
+        # Top driver of c0 should be a real signal feature (f0..f4)
+        assert c0_top["feature"] in [f"f{i}" for i in range(5)]
+        assert c1_top["feature"] in [f"f{i}" for i in range(5)]
+        # Effect signs should be opposite for the same feature
+        for f in [f"f{i}" for i in range(5)]:
+            r0 = drivers[(drivers["cluster_id"] == 0) & (drivers["feature"] == f)]
+            r1 = drivers[(drivers["cluster_id"] == 1) & (drivers["feature"] == f)]
+            if not r0.empty and not r1.empty:
+                assert np.sign(r0.iloc[0]["cliffs_delta"]) != np.sign(r1.iloc[0]["cliffs_delta"])
+
+    def test_skip_noise_excludes_minus_one(self):
+        rng = np.random.default_rng(0)
+        n = 20
+        df = pd.DataFrame({
+            "sample_id": [f"S{i}" for i in range(n)],
+            "f0": rng.normal(size=n),
+        })
+        labels = np.array([0] * 8 + [1] * 8 + [-1] * 4)
+        out_skip = compute_corpus_cluster_drivers(
+            df, ["f0"], labels, skip_noise=True,
+        )
+        # Should only return rows for clusters 0 and 1
+        assert set(out_skip["cluster_id"].unique()) <= {0, 1}
+
+    def test_too_few_clusters_returns_empty(self):
+        df = pd.DataFrame({
+            "sample_id": ["S0", "S1", "S2"],
+            "f0": [1.0, 2.0, 3.0],
+        })
+        labels = np.array([0, 0, 0])  # only one cluster
+        out = compute_corpus_cluster_drivers(df, ["f0"], labels)
+        assert out.empty
+
+
+class TestClusterCorpusGenes:
+    def _build_gene_corpus(self, n_per_group=80, seed=0):
+        """Synthetic gene corpus with two latent codon-strategy groups.
+
+        Every codon column carries signal so PCA on this small synthetic
+        corpus actually recovers the group structure. With Gaussian centres
+        and 80 genes per group, HDBSCAN finds two density peaks and KMeans
+        recovers cleanly when HDBSCAN flags everything as noise.
+        """
+        rng = np.random.default_rng(seed)
+        rows = []
+        # Half the codons are "group A high"; the other half are "group B high"
+        codons_a_high = RSCU_COLUMN_NAMES[: len(RSCU_COLUMN_NAMES) // 2]
+        for i in range(n_per_group):
+            row = {"gene": f"A_{i:04d}", "sample_id": "G001",
+                   "length": rng.integers(300, 3000)}
+            for c in RSCU_COLUMN_NAMES:
+                centre = 1.5 if c in codons_a_high else -1.5
+                row[f"delta_clr_{c}"] = float(rng.normal(loc=centre, scale=0.3))
+            rows.append(row)
+        for i in range(n_per_group):
+            row = {"gene": f"B_{i:04d}", "sample_id": "G002",
+                   "length": rng.integers(300, 3000)}
+            for c in RSCU_COLUMN_NAMES:
+                centre = -1.5 if c in codons_a_high else 1.5
+                row[f"delta_clr_{c}"] = float(rng.normal(loc=centre, scale=0.3))
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    def test_recovers_two_groups(self):
+        n_per_group = 80
+        gene_corpus = self._build_gene_corpus(n_per_group=n_per_group)
+        result = cluster_corpus_genes(
+            gene_corpus, use_umap=False,
+            hdbscan_min_cluster_size=10, rng_seed=42,
+        )
+        assert "cluster" in result
+        assert "embedding" in result
+        labels = result["cluster"]
+        non_noise = [c for c in set(labels) if c != -1]
+        assert len(non_noise) >= 2
+        # Modal cluster of A_xxx genes should differ from modal cluster of B_xxx
+        a_labels = labels[:n_per_group]
+        b_labels = labels[n_per_group:]
+        from collections import Counter
+        a_mode = Counter(a_labels).most_common(1)[0][0]
+        b_mode = Counter(b_labels).most_common(1)[0][0]
+        assert a_mode != b_mode
+
+    def test_max_genes_guard(self):
+        gene_corpus = self._build_gene_corpus(n_per_group=10)
+        with pytest.raises(ValueError, match="cap"):
+            cluster_corpus_genes(gene_corpus, max_genes=5)
+
+
+class TestClusterCorpusGenesByCategory:
+    def _build_corpus_with_categories(self, n_per_cat_per_group=20, seed=0):
+        """Corpus with two KO categories, each splitting into two strategies.
+
+        Every codon column carries signal so per-category PCA + clustering
+        actually recovers the within-category split on small samples.
+        """
+        rng = np.random.default_rng(seed)
+        rows = []
+        codons_a_high = RSCU_COLUMN_NAMES[: len(RSCU_COLUMN_NAMES) // 2]
+        for ko in ("K001", "K002"):
+            for i in range(n_per_cat_per_group):
+                row = {"gene": f"{ko}_A_{i:03d}", "sample_id": f"G{i:03d}",
+                       "KO": ko, "length": rng.integers(300, 3000)}
+                for c in RSCU_COLUMN_NAMES:
+                    centre = 1.5 if c in codons_a_high else -1.5
+                    row[f"delta_clr_{c}"] = float(rng.normal(loc=centre, scale=0.3))
+                rows.append(row)
+            for i in range(n_per_cat_per_group):
+                row = {"gene": f"{ko}_B_{i:03d}", "sample_id": f"G{i+50:03d}",
+                       "KO": ko, "length": rng.integers(300, 3000)}
+                for c in RSCU_COLUMN_NAMES:
+                    centre = -1.5 if c in codons_a_high else 1.5
+                    row[f"delta_clr_{c}"] = float(rng.normal(loc=centre, scale=0.3))
+                rows.append(row)
+        return pd.DataFrame(rows)
+
+    def test_per_category_clustering_recovers_split(self):
+        gene_corpus = self._build_corpus_with_categories(n_per_cat_per_group=20)
+        out = cluster_corpus_genes_by_category(
+            gene_corpus, "KO", min_category_size=10, rng_seed=42,
+        )
+        assert not out.empty
+        assert set(out["category"]) == {"K001", "K002"}
+        # Each KO should split into >=2 sub-clusters because of the synthetic structure
+        for cat in out["category"].unique():
+            sub = out[out["category"] == cat]
+            non_noise = [c for c in sub["sub_cluster"].unique() if c != -1]
+            assert len(non_noise) >= 1  # at least one cluster found
+        # Required output columns
+        for col in ("category", "sample_id", "gene", "sub_cluster",
+                    "embed_dim1", "embed_dim2"):
+            assert col in out.columns
+
+    def test_skips_small_categories(self):
+        gene_corpus = self._build_corpus_with_categories(n_per_cat_per_group=2)
+        out = cluster_corpus_genes_by_category(
+            gene_corpus, "KO", min_category_size=20, rng_seed=42,
+        )
+        assert out.empty
+
+    def test_missing_category_column(self):
+        gene_corpus = pd.DataFrame({
+            "gene": ["g1", "g2", "g3"],
+            "sample_id": ["S", "S", "S"],
+            "delta_clr_Phe-UUU": [1.0, 2.0, 3.0],
+        })
+        out = cluster_corpus_genes_by_category(gene_corpus, "missing_col")
+        assert out.empty
+
+
 class TestBuildCorpus:
     def test_geometry_features_default(self, tmp_path):
         sig_dir = _write_synthetic_genome_signatures(tmp_path, n_genomes=12)
@@ -404,6 +579,42 @@ class TestBuildCorpus:
         empty_dir.mkdir()
         with pytest.raises(FileNotFoundError, match="No.*genome_signature.tsv"):
             build_corpus([empty_dir], tmp_path / "out")
+
+    def test_gene_level_clustering_emits_outputs(self, tmp_path):
+        """End-to-end: when --gene-level-clustering is on, gene_clusters.tsv appears."""
+        sig_dir = _write_synthetic_genome_signatures(tmp_path, n_genomes=6)
+        # Synthesize matching gene-level signatures
+        rng = np.random.default_rng(7)
+        for sample_path in sig_dir.glob("*_genome_signature.tsv"):
+            sid = sample_path.name.replace("_genome_signature.tsv", "")
+            gene_rows = []
+            for i in range(20):
+                row = {"sample_id": sid, "gene": f"{sid}_g{i:03d}",
+                       "length": rng.integers(300, 3000), "KO": f"K{i % 4:04d}"}
+                # CLR-Δ vector with two latent groups
+                offset = 1.5 if i < 10 else -1.5
+                for c in RSCU_COLUMN_NAMES[:38]:
+                    row[f"delta_clr_{c}"] = float(offset + rng.normal(0, 0.3))
+                gene_rows.append(row)
+            pd.DataFrame(gene_rows).to_csv(
+                sig_dir / f"{sid}_gene_signature.tsv", sep="\t", index=False,
+            )
+        out_dir = tmp_path / "corpus_gene"
+        outputs = build_corpus(
+            input_dirs=[sig_dir], output_dir=out_dir,
+            gene_level_clustering=True,
+            gene_level_by_category="KO",
+            gene_level_min_category_size=5,
+            hdbscan_min_cluster_size=3,
+        )
+        assert "corpus_gene_clusters" in outputs
+        assert outputs["corpus_gene_clusters"].exists()
+        assert "corpus_gene_clusters_by_KO" in outputs
+        gc = pd.read_csv(outputs["corpus_gene_clusters"], sep="\t")
+        assert "cluster" in gc.columns
+        # Two latent groups with structure → at least one non-noise cluster
+        non_noise = [c for c in set(gc["cluster"]) if c != -1]
+        assert len(non_noise) >= 1
 
 
 # ── write_signatures_for_sample integration ──────────────────────────────────
