@@ -100,7 +100,7 @@ def _effect_label(abs_delta: float) -> str:
     return "large"
 
 
-def _clr_transform(rscu_vec: np.ndarray, pseudocount: float = 1e-6) -> np.ndarray:
+def clr_transform(rscu_vec: np.ndarray, pseudocount: float = 1e-6) -> np.ndarray:
     """Centered log-ratio transform on a single RSCU vector.
 
     Per-AA-family sum constraints make raw Euclidean distance on RSCU
@@ -112,9 +112,14 @@ def _clr_transform(rscu_vec: np.ndarray, pseudocount: float = 1e-6) -> np.ndarra
     return log_a - log_a.mean()
 
 
-def _aitchison_distance(a: np.ndarray, b: np.ndarray) -> float:
+def aitchison_distance(a: np.ndarray, b: np.ndarray) -> float:
     """Aitchison distance = Euclidean of CLR-transformed vectors."""
-    return float(np.linalg.norm(_clr_transform(a) - _clr_transform(b)))
+    return float(np.linalg.norm(clr_transform(a) - clr_transform(b)))
+
+
+# Backward-compat aliases for internal callers / tests
+_clr_transform = clr_transform
+_aitchison_distance = aitchison_distance
 
 
 def _length_quartile_bins(lengths: np.ndarray, n_bins: int = 4) -> np.ndarray:
@@ -537,6 +542,164 @@ def _hgt_flag_enrichment(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Three-way genome partition: Mahal cluster vs bulk vs outliers
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Partition category names (kept here so figure code and tests can reference them)
+PARTITION_MAHAL_CLUSTER = "mahal_cluster"
+PARTITION_OUTLIER = "outlier"
+PARTITION_BULK = "bulk"
+PARTITION_UNKNOWN = "unknown"
+_PARTITION_CATEGORIES = (PARTITION_MAHAL_CLUSTER, PARTITION_BULK, PARTITION_OUTLIER)
+
+
+def assign_gene_partition(
+    base_df: pd.DataFrame,
+    cluster_flag_col: str = "in_optimized_set",
+    outlier_flag_col: str = "hgt_flag_combined",
+) -> pd.Series:
+    """Assign each gene to one of {mahal_cluster, bulk, outlier, unknown}.
+
+    Priority order (each gene falls into exactly one category):
+      1. Mahalanobis cluster member  → 'mahal_cluster'
+      2. Otherwise, if outlier-flagged → 'outlier'
+      3. Otherwise → 'bulk'
+
+    A gene that is neither flagged nor known to be in the cluster (e.g.
+    because the HGT detector skipped it for length reasons, or the Mahal
+    clustering wasn't run) is assigned to 'bulk' if cluster information is
+    available, or 'unknown' if neither flag is present in the input.
+
+    Cluster membership takes precedence over outlier status because the
+    Mahalanobis cluster is defined by closeness to the genome's optimized
+    centroid (a direct codon-usage readout). HGT flags are a separate
+    statistical claim about deviation from the genome bulk — a gene flagged
+    as both is by construction inside a tight cluster of similarly-deviant
+    genes, which is more naturally read as "translationally adapted but
+    located outside the bulk distribution" than as HGT. The priority can be
+    inverted at the call site by reordering the inputs.
+
+    Args:
+        base_df: DataFrame containing the cluster and/or outlier flag columns.
+            Missing columns degrade gracefully; if both are missing every gene
+            gets 'unknown'.
+        cluster_flag_col: column name for the Mahal-cluster boolean.
+        outlier_flag_col: column name for the outlier boolean.
+    """
+    n = len(base_df)
+    has_cluster = cluster_flag_col in base_df.columns
+    has_outlier = outlier_flag_col in base_df.columns
+
+    if not has_cluster and not has_outlier:
+        return pd.Series([PARTITION_UNKNOWN] * n, index=base_df.index)
+
+    # Coerce to numeric first so .fillna(False).astype(bool) doesn't trigger
+    # the pandas object-dtype downcasting FutureWarning on mixed/None inputs.
+    if has_cluster:
+        cluster = pd.Series(
+            base_df[cluster_flag_col].astype("boolean").fillna(False).astype(bool).values,
+            index=base_df.index,
+        )
+    else:
+        cluster = pd.Series(False, index=base_df.index)
+    if has_outlier:
+        outlier = pd.Series(
+            base_df[outlier_flag_col].astype("boolean").fillna(False).astype(bool).values,
+            index=base_df.index,
+        )
+    else:
+        outlier = pd.Series(False, index=base_df.index)
+
+    out = pd.Series(PARTITION_BULK, index=base_df.index, dtype=object)
+    out[outlier & ~cluster] = PARTITION_OUTLIER
+    out[cluster] = PARTITION_MAHAL_CLUSTER
+    return out
+
+
+def _partition_enrichment_test(
+    partition: pd.Series,
+    in_goi: pd.Series,
+) -> pd.DataFrame:
+    """Cross-tab GOI × partition, then chi-squared + per-category Fisher tests.
+
+    Returns one row per category with:
+        category, n_goi, n_background, frac_goi, frac_background,
+        odds_ratio, fisher_p, p_adjusted (BH across categories),
+        plus an 'OMNIBUS' row reporting the chi-squared test across the
+        full 2×3 (GOI × category) contingency table.
+    """
+    from scipy.stats import chi2_contingency, fisher_exact
+
+    df = pd.DataFrame({"partition": partition, "in_goi": in_goi.astype(bool)})
+    df = df.dropna(subset=["partition"])
+    df = df[df["partition"] != PARTITION_UNKNOWN]
+    if df.empty:
+        return pd.DataFrame()
+
+    rows: list[dict] = []
+    cats = [c for c in _PARTITION_CATEGORIES if (df["partition"] == c).any()]
+    n_goi = int(df["in_goi"].sum())
+    n_bg = int((~df["in_goi"]).sum())
+    if n_goi < 1 or n_bg < 1:
+        return pd.DataFrame()
+
+    # Per-category Fisher's exact: 2×2 of (in_category, in_GOI)
+    for cat in cats:
+        in_cat = df["partition"] == cat
+        a = int((in_cat & df["in_goi"]).sum())   # GOI in cat
+        b = int((in_cat & ~df["in_goi"]).sum())  # background in cat
+        c = int((~in_cat & df["in_goi"]).sum())  # GOI outside cat
+        d = int((~in_cat & ~df["in_goi"]).sum()) # background outside cat
+        # Two-sided Fisher's exact; use odds ratio with Haldane correction
+        try:
+            odds, p = fisher_exact([[a, b], [c, d]], alternative="two-sided")
+        except ValueError:
+            odds, p = float("nan"), float("nan")
+        rows.append({
+            "category": cat,
+            "n_goi": a,
+            "n_background": b,
+            "frac_goi": a / n_goi if n_goi else float("nan"),
+            "frac_background": b / n_bg if n_bg else float("nan"),
+            "odds_ratio": float(odds) if not np.isnan(odds) else float("nan"),
+            "fisher_p": float(p) if not np.isnan(p) else float("nan"),
+        })
+
+    # BH FDR across the per-category Fisher tests
+    if rows:
+        adj = benjamini_hochberg(np.array([r["fisher_p"] for r in rows]))
+        for i, r in enumerate(rows):
+            r["p_adjusted"] = float(adj[i])
+
+    # Omnibus chi-squared across the full 2 × len(cats) table
+    omnibus_row = None
+    if len(cats) >= 2:
+        ct = pd.crosstab(df["partition"], df["in_goi"]).reindex(
+            index=cats, columns=[False, True], fill_value=0,
+        )
+        try:
+            chi2, p, dof, _ = chi2_contingency(ct.values)
+            n_total = int(ct.values.sum())
+            cramers_v = float(np.sqrt(chi2 / (n_total * (min(ct.shape) - 1)))) if n_total else float("nan")
+        except Exception:
+            chi2, p, dof, cramers_v = float("nan"), float("nan"), float("nan"), float("nan")
+        omnibus_row = {
+            "category": "OMNIBUS",
+            "n_goi": n_goi,
+            "n_background": n_bg,
+            "frac_goi": 1.0,
+            "frac_background": 1.0,
+            "odds_ratio": cramers_v,  # Cramer's V repurposes this column
+            "fisher_p": float(p),
+            "p_adjusted": float(p),  # one-test row; no adjustment beyond itself
+        }
+    out = pd.DataFrame(rows)
+    if omnibus_row is not None:
+        out = pd.concat([pd.DataFrame([omnibus_row]), out], ignore_index=True)
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Orchestrator
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -745,7 +908,49 @@ def analyze_gene_set(
                 out["hgt_enrichment"] = hgt_path
                 logger.info("Wrote HGT-flag enrichment: %s", hgt_path)
 
-    # ── 6. Mahal-cluster membership two-sided permutation test ────────────
+    # ── 6. Three-way partition: Mahal cluster vs bulk vs outliers ─────────
+    # Build a per-gene partition from whichever flag columns are available.
+    # base already merged in_optimized_set + the HGT flag columns earlier;
+    # gracefully no-op when those flags are absent.
+    flag_block = rscu_gene_df[[COL_GENE]].copy()
+    if mahal_cluster_df is not None and "in_optimized_set" in mahal_cluster_df.columns:
+        flag_block = flag_block.merge(
+            mahal_cluster_df[[COL_GENE, "in_optimized_set"]], on=COL_GENE, how="left",
+        )
+    if hgt_df is not None and "hgt_flag_combined" in hgt_df.columns:
+        flag_block = flag_block.merge(
+            hgt_df[[COL_GENE, "hgt_flag_combined"]], on=COL_GENE, how="left",
+        )
+    flag_block["partition"] = assign_gene_partition(flag_block)
+    flag_block["in_goi"] = flag_block[COL_GENE].isin(matched)
+
+    partition_table = _partition_enrichment_test(
+        flag_block["partition"], flag_block["in_goi"],
+    )
+    if not partition_table.empty:
+        part_path = output_dir / f"{sample_id}_goi_partition.tsv"
+        partition_table.to_csv(part_path, sep="\t", index=False)
+        out["partition"] = part_path
+        # Surface a concise summary in the log so users see the headline result
+        omnibus = partition_table[partition_table["category"] == "OMNIBUS"]
+        if not omnibus.empty:
+            row = omnibus.iloc[0]
+            logger.info(
+                "GOI partition (Mahal/bulk/outlier): omnibus chi-sq p=%.4g (Cramer's V=%.3f); "
+                "see %s for per-category breakdown",
+                row["fisher_p"], row["odds_ratio"], part_path,
+            )
+
+    # Add the per-gene partition to the per-GOI summary table so users see
+    # which category each of their genes belongs to without rejoining files.
+    if "partition" not in summary_df.columns:
+        summary_df = summary_df.merge(
+            flag_block[[COL_GENE, "partition"]], on=COL_GENE, how="left",
+        )
+        # Re-write summary with the new column
+        summary_df.to_csv(summary_path, sep="\t", index=False)
+
+    # ── 7. Mahal-cluster membership two-sided permutation test ────────────
     if mahal_cluster_df is not None and "in_optimized_set" in mahal_cluster_df.columns:
         mahal_block = rscu_gene_df[[COL_GENE, "length"]].merge(
             mahal_cluster_df[[COL_GENE, "in_optimized_set"]],
@@ -799,7 +1004,7 @@ def analyze_gene_set(
                 mahal_path, obs_rate, bg_rate, p_two,
             )
 
-    # ── 7. Six-panel summary figure ────────────────────────────────────────
+    # ── 8. Summary figure ──────────────────────────────────────────────────
     if make_figure:
         try:
             from codonpipe.modules._gene_set_figure import render_summary_figure
@@ -818,6 +1023,8 @@ def analyze_gene_set(
                 rscu_rp=rscu_rp,
                 rscu_mahal_cluster=rscu_mahal_cluster,
                 mahal_cluster_df=mahal_cluster_df,
+                partition_table=partition_table if 'partition_table' in dir() else None,
+                partition_per_gene=flag_block[[COL_GENE, "partition"]] if 'flag_block' in dir() else None,
             )
             if png_path is not None:
                 out["figure_png"] = png_path
