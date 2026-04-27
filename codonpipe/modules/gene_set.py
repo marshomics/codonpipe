@@ -236,7 +236,9 @@ def _build_summary_table(
         enc_cols = [c for c in (COL_GENE, "ENC", "GC3") if c in enc_df.columns]
         base = base.merge(enc_df[enc_cols], on=COL_GENE, how="left")
     for df, score_cols in (
-        (expr_df, ["MELP", "CAI", "Fop", "rp_MELP", "rp_CAI", "rp_Fop"]),
+        (expr_df, ["MELP", "CAI", "Fop", "rp_MELP", "rp_CAI", "rp_Fop",
+                   "MELP_class", "CAI_class", "Fop_class", "expression_class",
+                   "rp_MELP_class", "rp_CAI_class", "rp_Fop_class"]),
         (encprime_df, ["ENCprime"]),
         (milc_df, ["MILC"]),
         (hgt_df, ["mahalanobis_dist", "gc3_deviation", "p_adjusted",
@@ -809,7 +811,9 @@ def analyze_gene_set(
         enc_cols = [c for c in (COL_GENE, "ENC", "GC3") if c in enc_df.columns]
         base = base.merge(enc_df[enc_cols], on=COL_GENE, how="left")
     for df, score_cols in (
-        (expr_df, ["MELP", "CAI", "Fop", "rp_MELP", "rp_CAI", "rp_Fop"]),
+        (expr_df, ["MELP", "CAI", "Fop", "rp_MELP", "rp_CAI", "rp_Fop",
+                   "MELP_class", "CAI_class", "Fop_class", "expression_class",
+                   "rp_MELP_class", "rp_CAI_class", "rp_Fop_class"]),
         (encprime_df, ["ENCprime"]),
         (milc_df, ["MILC"]),
         (hgt_df, ["mahalanobis_dist", "gc3_deviation"]),
@@ -1004,7 +1008,108 @@ def analyze_gene_set(
                 mahal_path, obs_rate, bg_rate, p_two,
             )
 
-    # ── 8. Summary figure ──────────────────────────────────────────────────
+    # ── 8. Extra publication-ready analyses + figures ─────────────────────
+    try:
+        from codonpipe.modules._gene_set_extras import (
+            compute_expression_tier_breakdown,
+            cluster_within_goi,
+            render_expression_tier_figure,
+            render_anomaly_map_figure,
+            render_internal_structure_figure,
+        )
+    except ImportError:
+        compute_expression_tier_breakdown = cluster_within_goi = None
+        render_expression_tier_figure = render_anomaly_map_figure = None
+        render_internal_structure_figure = None
+
+    # 8a. Expression-tier breakdown
+    tier_table = pd.DataFrame()
+    if compute_expression_tier_breakdown is not None:
+        try:
+            tier_table = compute_expression_tier_breakdown(summary_df, base)
+            if not tier_table.empty:
+                tier_path = output_dir / f"{sample_id}_goi_expression_tier_tests.tsv"
+                tier_table.to_csv(tier_path, sep="\t", index=False)
+                out["expression_tier_tests"] = tier_path
+                if make_figure:
+                    png, svg = render_expression_tier_figure(
+                        output_dir, sample_id, tier_table,
+                    )
+                    if png is not None:
+                        out["expression_tier_figure_png"] = png
+                        out["expression_tier_figure_svg"] = svg
+        except Exception as e:
+            logger.warning("Expression-tier breakdown failed: %s", e)
+
+    # 8b. Anomaly map (uses base which already has mahalanobis_dist + gc3_deviation
+    #     when hgt_df was loaded, plus the flag columns merged via flag_block)
+    if make_figure and render_anomaly_map_figure is not None:
+        try:
+            # Build a per-gene base that has both the metric columns and the flag columns
+            anomaly_base = base.copy()
+            if hgt_df is not None and not hgt_df.empty:
+                flag_only_cols = [c for c in
+                                  ("hgt_flag_combined", "hgt_flag_fdr", "gc3_outlier")
+                                  if c in hgt_df.columns and c not in anomaly_base.columns]
+                if flag_only_cols:
+                    anomaly_base = anomaly_base.merge(
+                        hgt_df[[COL_GENE] + flag_only_cols], on=COL_GENE, how="left",
+                    )
+            png, svg = render_anomaly_map_figure(
+                output_dir, sample_id, summary_df, anomaly_base,
+                partition_per_gene=flag_block[[COL_GENE, "partition"]] if "partition" in flag_block.columns else None,
+            )
+            if png is not None:
+                out["anomaly_figure_png"] = png
+                out["anomaly_figure_svg"] = svg
+        except Exception as e:
+            logger.warning("Anomaly map figure failed: %s", e)
+
+    # 8c. Internal GOI clustering + drivers
+    cluster_result = {}
+    if cluster_within_goi is not None and len(matched) >= 6:
+        try:
+            goi_rscu = rscu_gene_df[rscu_gene_df[COL_GENE].isin(matched)]
+            cluster_result = cluster_within_goi(
+                goi_rscu, rscu_genome=rscu_genome, summary_df=summary_df,
+            )
+            if cluster_result:
+                # Cluster assignment table
+                cl_df = pd.DataFrame({
+                    COL_GENE: cluster_result["cluster_id"].index,
+                    "internal_cluster": cluster_result["cluster_id"].values,
+                })
+                cl_path = output_dir / f"{sample_id}_goi_internal_clusters.tsv"
+                cl_df.to_csv(cl_path, sep="\t", index=False)
+                out["internal_clusters"] = cl_path
+                # Drivers
+                if cluster_result.get("drivers_df") is not None and not cluster_result["drivers_df"].empty:
+                    drv_path = output_dir / f"{sample_id}_goi_internal_drivers.tsv"
+                    cluster_result["drivers_df"].to_csv(drv_path, sep="\t", index=False)
+                    out["internal_drivers"] = drv_path
+                # Figure
+                if make_figure and render_internal_structure_figure is not None:
+                    png, svg = render_internal_structure_figure(
+                        output_dir, sample_id, cluster_result, summary_df=summary_df,
+                    )
+                    if png is not None:
+                        out["internal_structure_figure_png"] = png
+                        out["internal_structure_figure_svg"] = svg
+                logger.info(
+                    "Internal GOI clustering: %d cluster(s) (silhouette-selected); "
+                    "see %s",
+                    cluster_result.get("n_clusters", 1), cl_path,
+                )
+        except Exception as e:
+            logger.warning("Within-GOI clustering failed: %s", e, exc_info=True)
+    elif len(matched) < 6:
+        logger.info(
+            "Within-GOI clustering skipped (need >= 6 GOIs, got %d). "
+            "Use a larger GOI list to enable internal-structure analysis.",
+            len(matched),
+        )
+
+    # ── 9. Summary figure ──────────────────────────────────────────────────
     if make_figure:
         try:
             from codonpipe.modules._gene_set_figure import render_summary_figure
@@ -1103,6 +1208,9 @@ _SUBCATEGORY_TO_CATEGORY = {
     "gmm_clustering": "expression",
     "enrichment": "expression",
     "enrichment_mahal": "expression",
+    # mahal_clustering: production CodonPipe writes this at sample-dir top
+    # level (no role parent), so we omit it from the role map. _resolve_path
+    # falls through to <sample_dir>/mahal_clustering/<filename>.
     # comparative role
     "advanced": "comparative",
     "bio_ecology": "comparative",
@@ -1132,6 +1240,28 @@ def _resolve_path(sample_dir: Path, subcategory: str, filename: str) -> Path | N
     flat = sample_dir / subcategory / filename
     if flat.exists():
         return flat
+    return None
+
+
+def _resolve_path_any(
+    sample_dir: Path,
+    subcategories: list[str],
+    filenames: list[str],
+) -> Path | None:
+    """Resolve a file across multiple candidate subdirectory + filename pairs.
+
+    Used for files that have moved or been renamed across pipeline versions.
+    For example, the Mahalanobis-cluster table is named *_gmm_clusters.tsv
+    under gmm_clustering/ in older / demo runs, and *_mahal_clusters.tsv
+    under mahal_clustering/ in current production runs. Pass both subcategory
+    names and both filename patterns; the resolver tries all combinations
+    (in the order given) and returns the first match.
+    """
+    for sub in subcategories:
+        for fname in filenames:
+            p = _resolve_path(sample_dir, sub, fname)
+            if p is not None:
+                return p
     return None
 
 
@@ -1202,7 +1332,14 @@ def load_sample_outputs(sample_dir: Path, sample_id: str) -> dict:
         _resolve_path(sample_dir, "rscu", f"{sample_id}_rscu_ribosomal.tsv")
     )
     rscu_mahal = _read_codon_keyed_rscu(
-        _resolve_path(sample_dir, "gmm_clustering", f"{sample_id}_gmm_cluster_rscu.tsv")
+        _resolve_path_any(
+            sample_dir,
+            subcategories=["mahal_clustering", "gmm_clustering"],
+            filenames=[
+                f"{sample_id}_mahal_cluster_rscu.tsv",
+                f"{sample_id}_gmm_cluster_rscu.tsv",
+            ],
+        )
     )
     if rscu_mahal is not None:
         # The codon-keyed file uses bare codons; remap to RSCU column names.
@@ -1217,8 +1354,15 @@ def load_sample_outputs(sample_dir: Path, sample_id: str) -> dict:
         rscu_mahal = remapped if remapped else rscu_mahal
 
     # Per-gene Mahal-cluster table: distance-to-cluster + in_optimized_set flag.
-    mahal_clusters_path = _resolve_path(
-        sample_dir, "gmm_clustering", f"{sample_id}_gmm_clusters.tsv"
+    # Production CodonPipe writes this as mahal_clustering/<sid>_mahal_clusters.tsv;
+    # the older demo layout is gmm_clustering/<sid>_gmm_clusters.tsv.
+    mahal_clusters_path = _resolve_path_any(
+        sample_dir,
+        subcategories=["mahal_clustering", "gmm_clustering"],
+        filenames=[
+            f"{sample_id}_mahal_clusters.tsv",
+            f"{sample_id}_gmm_clusters.tsv",
+        ],
     )
     mahal_cluster_df = None
     if mahal_clusters_path is not None:
@@ -1237,8 +1381,13 @@ def load_sample_outputs(sample_dir: Path, sample_id: str) -> dict:
             columns={"cbi": "cbi_rp"}
         )
 
-    cbi_mahal_path = _resolve_path(
-        sample_dir, "codon_tables", f"{sample_id}_gmm_cluster_cbi.tsv"
+    cbi_mahal_path = _resolve_path_any(
+        sample_dir,
+        subcategories=["codon_tables"],
+        filenames=[
+            f"{sample_id}_mahal_cluster_cbi.tsv",
+            f"{sample_id}_gmm_cluster_cbi.tsv",
+        ],
     )
     cbi_mahal_df = None
     if cbi_mahal_path is not None:
@@ -1246,7 +1395,7 @@ def load_sample_outputs(sample_dir: Path, sample_id: str) -> dict:
             columns={"cbi": "cbi_mahal"}
         )
 
-    return dict(
+    out = dict(
         rscu_gene_df=rscu_gene_df,
         enc_df=enc_df,
         expr_df=expr_df,
@@ -1260,6 +1409,23 @@ def load_sample_outputs(sample_dir: Path, sample_id: str) -> dict:
         rscu_rp=rscu_rp,
         rscu_mahal_cluster=rscu_mahal,
     )
+
+    # Surface a one-line summary so users can immediately see which optional
+    # files were located and which weren't. Helpful when a downstream panel
+    # complains about "Mahal-cluster distances unavailable" or similar.
+    found = [k for k, v in out.items()
+             if v is not None and (not hasattr(v, 'empty') or not v.empty)]
+    missing = [k for k, v in out.items() if v is None]
+    logger.info(
+        "load_sample_outputs(%s): loaded %d / %d data sources",
+        sample_id, len(found), len(out),
+    )
+    if missing:
+        logger.info(
+            "  missing (downstream analyses needing these will be skipped): %s",
+            ", ".join(missing),
+        )
+    return out
 
 
 def read_goi_file(path: Path) -> set[str]:
