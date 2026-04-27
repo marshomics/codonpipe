@@ -92,10 +92,10 @@ Every genome, whether processed via `run` or `batch`, goes through these steps:
 3. **KofamScan** annotates predicted proteins with KEGG Orthology IDs
 4. **RSCU analysis** computes per-gene RSCU for all CDS, genome-level median RSCU (59 sense codons), concatenated ribosomal protein RSCU, codon frequency tables, and ENC with GC3 content
 5. **CU bias statistics** via coRdon: ENCprime (GC-corrected ENC, Novembre 2002) and MILC (Measure Independent of Length and Composition, Supek & Vlahovicek 2005) per gene
-6. **Expression prediction** via coRdon: MELP, CAI, and Fop (Frequency of optimal codons, Ikemura 1981) using ribosomal proteins as the highly expressed reference set; genes classified into high (>=95th percentile), medium, and low (<=5th percentile) expression tiers per metric
+6. **Expression prediction** via coRdon: MELP, CAI, and Fop (Frequency of optimal codons, Ikemura 1981) using ribosomal proteins as the highly expressed reference set; genes classified into high (>=90th percentile), medium, and low (<=10th percentile) expression tiers per metric. Tier cutoffs are configurable through the `_classify_by_percentile` helper if a more or less stringent split is needed.
 7. **Pathway enrichment** via hypergeometric test for KEGG pathways over-represented in high- and low-expression gene sets, with Benjamini-Hochberg FDR correction
 8. **Advanced analyses**: correspondence analysis (COA) on codon usage, S-value adaptation to the ribosomal reference set, GC12-vs-GC3 neutrality analysis, PR2 (purine/pyrimidine ratio), delta-RSCU distance from the genome average, tRNA-codon co-adaptation correlation (if GFF provided), COG enrichment in high/low bias genes, gene length vs codon bias, and ENC-ENCprime difference
-9. **Biological/ecological analyses**: HGT candidate detection via Mahalanobis distance on RSCU profiles, growth rate prediction (classic CAI-based and gRodon2 if installed), translational selection analysis (Fop gradient, positional effects across 5'/middle/3' gene regions), phage and mobile element detection, strand asymmetry, and operon co-adaptation
+9. **Biological/ecological analyses**: HGT candidate detection via Mahalanobis distance on RSCU profiles (using the 38 independent codon dimensions, since the full 59-codon space is rank-deficient by ~21 due to per-AA-family sum constraints), growth rate prediction via two complementary models (a CAI-based proxy and gRodon2 if installed; see caveats below), translational selection analysis (Fop gradient, positional effects across 5'/middle/3' gene regions), phage and mobile element detection, strand asymmetry, and operon co-adaptation
 10. **Codon usage tables** in six formats: RSCU, absolute counts, per-thousand frequencies, W values (relative adaptiveness), adaptation weights, and CBI (Codon Bias Index)
 11. **Publication-ready plots** at 300 DPI in PNG and SVG (editable in Adobe Illustrator)
 
@@ -203,6 +203,56 @@ All options from `run` are available, plus:
 | `-p, --parallel` | 1 | Samples to process concurrently |
 | `--metadata-cols` | auto-detect | Metadata columns for comparative analysis (repeatable) |
 | `--condition-col` | — | Column designating experimental conditions |
+
+### `codonpipe gene-set`
+
+```
+codonpipe gene-set SAMPLE_DIR --goi-file GOI.txt [OPTIONS]
+```
+
+Compares a shortlist of genes-of-interest (specified by Prokka locus tags) against the rest of the genome's codon usage. Reads the per-sample output directory produced by `codonpipe run` (or `codonpipe batch`) — no recomputation of upstream steps.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--goi-file` | (required) | Text file with locus tags, one per line. Lines beginning with `#` are comments; trailing whitespace-delimited tokens after the locus tag are ignored. |
+| `-s, --sample-id` | dir name | Sample identifier (defaults to the directory name). |
+| `-o, --output-dir` | `<SAMPLE_DIR>/gene_set/` | Output directory. |
+| `--n-permutations` | 999 | Permutation count for Aitchison and HGT-flag tests. |
+| `--no-length-matching` | off | Use uniform-random null instead of length-matched. Recommended only as a sensitivity check. |
+| `--no-figure` | off | Skip the six-panel summary figure. |
+| `--rng-seed` | 42 | Random seed for permutation tests and bootstrap CIs. |
+| `-v, --verbose` | off | Debug-level logging. |
+
+The analysis answers four questions with the data the per-genome pipeline already produced.
+
+(1) Are the GOI translationally optimized? Mann-Whitney + Cliff's delta with bootstrap 95% CI on each scalar metric (CAI, MELP, Fop, ENC, ENCprime, MILC, GC3, mahalanobis_dist, mahal_cluster_distance, membership_score, cbi_rp, cbi_mahal, length, gc3_deviation), tested against rest-of-genome with global BH FDR.
+
+(2) Are the GOI horizontally acquired? Each GOI is positioned in the bio_ecology HGT detector's 38-d Mahalanobis space, plus a one-sided permutation test on the GOI's HGT-flag rate against length-matched control sets for hgt_flag_combined, hgt_flag_fdr, and gc3_outlier.
+
+(3) Are the GOI part of the translationally optimized core? When the pipeline's Mahalanobis-clustering step has run (and its outputs are in `gmm_clustering/`), each GOI gets two complementary readouts: distance to the *cluster centroid* (`mahal_cluster_distance`, biologically distinct from the genome-centroid `mahalanobis_dist` used for HGT detection — one tells you "how far is this gene from the optimized core?", the other tells you "how unusual is this gene's codon usage relative to the bulk genome?"), and a two-sided permutation test on the GOI's `in_optimized_set` rate vs length-matched controls. The Mahal-cluster CBI (`cbi_mahal`) is also included alongside the RP-derived `cbi_rp` so direct comparison of the two reference frames is one column lookup.
+
+(4) Do the GOI share a codon-usage signature distinct from references? Concatenated GOI mean-RSCU vector compared via Aitchison distance (CLR + Euclidean on the 38 independent codon dimensions) to the genome / RP / Mahal-cluster references, with a length-matched permutation null reporting both `p_more_divergent` and `p_more_similar` so the user sees which direction the deviation runs.
+
+Outputs written to `--output-dir`:
+
+- `<sample_id>_goi_summary.tsv` — one row per GOI gene with every available metric and its within-genome percentile rank (computed against rest-of-genome, never against itself). Includes the distinction between `mahalanobis_dist` (genome centroid, from `hgt_candidates.tsv`) and `mahal_cluster_distance` (optimized-cluster centroid, from `gmm_clusters.tsv`), plus `in_optimized_set` and both CBI variants.
+- `<sample_id>_goi_distribution_tests.tsv` — per-metric Mann-Whitney + Cliff's delta + KS, BH-corrected globally.
+- `<sample_id>_goi_rscu_comparison.tsv` — per (codon × reference) Mann-Whitney with global BH; useful for identifying which codons drive any signal.
+- `<sample_id>_goi_aitchison_perm.tsv` — observed Aitchison distance to each reference, permutation null statistics, two-sided p-value and one-sided directional p-values.
+- `<sample_id>_goi_hgt_enrichment.tsv` — one-sided permutation test on each HGT flag's GOI rate vs length-matched controls.
+- `<sample_id>_goi_mahal_membership.tsv` — two-sided permutation test on the GOI's Mahal-cluster membership rate against length-matched controls. Reports both `p_more_in_cluster` (GOI is enriched in the optimized core) and `p_less_in_cluster` (GOI is depleted from it).
+- `<sample_id>_goi_panel.png` / `.svg` — seven-panel summary figure (A: RSCU bars vs reference sets; B: effect-size forest plot per metric; C: COA biplot with GOI highlighted; D: Wright ENC-vs-GC3 plot; E: genome-centroid Mahalanobis distance distribution; F: genome-centroid vs cluster-centroid Mahalanobis biplot, separating "unusual relative to genome" from "near the optimized core"; G: per-GOI percentile-rank heatmap with a green/grey strip marking Mahal-cluster membership). Panel F is the cleanest single-glance answer to "where do my GOIs sit relative to both reference frames at once?".
+
+The `--goi-file` accepts annotated lines, e.g.:
+
+```
+# my favourite operon — sample G0370_i3
+G0370_i3_00132   # phbA
+G0370_i3_00133   # phbB
+G0370_i3_00134   # phbC
+```
+
+Length-matched permutations bin the background by length quartile and reproduce the per-bin counts of the GOI list, since CAI, MELP, ENC, and Mahalanobis distance all have measurable length dependence. Pass `--no-length-matching` only as a sensitivity check.
 
 ### `codonpipe install-grodon`
 
