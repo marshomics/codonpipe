@@ -57,6 +57,8 @@ def render_summary_figure(
     rscu_rp: dict[str, float] | None,
     rscu_mahal_cluster: dict[str, float] | None,
     mahal_cluster_df: pd.DataFrame | None = None,
+    partition_table: pd.DataFrame | None = None,
+    partition_per_gene: pd.DataFrame | None = None,
 ) -> tuple[Path | None, Path | None]:
     """Render the 7-panel figure to PNG + SVG. Returns (png_path, svg_path) or (None, None)."""
     try:
@@ -112,11 +114,20 @@ def render_summary_figure(
         logger.warning("Panel D (Wright) failed: %s", e)
         axD.text(0.5, 0.5, "Panel D unavailable", ha="center", va="center", transform=axD.transAxes)
 
-    # ── Panel E: Mahalanobis distance histogram ───────────────────────────
+    # ── Panel E: Three-way partition (Mahal cluster vs bulk vs outlier) ───
+    # Replaces the genome-centroid Mahal-distance histogram. The biplot in
+    # Panel F still shows the genome-centroid distance distribution along
+    # its X axis, so no information is lost; the partition stacked bar gives
+    # a more direct biological readout. If the partition table isn't
+    # available (Mahal clustering / HGT detection didn't run), we fall back
+    # to the original histogram.
     try:
-        _panel_mahal(axE, hgt_df, in_goi, rscu_gene_df)
+        if partition_table is not None and not partition_table.empty and partition_per_gene is not None:
+            _panel_partition(axE, partition_table, partition_per_gene, in_goi, rscu_gene_df)
+        else:
+            _panel_mahal(axE, hgt_df, in_goi, rscu_gene_df)
     except Exception as e:
-        logger.warning("Panel E (Mahalanobis) failed: %s", e)
+        logger.warning("Panel E (partition / Mahal) failed: %s", e)
         axE.text(0.5, 0.5, "Panel E unavailable", ha="center", va="center", transform=axE.transAxes)
 
     # ── Panel F: Mahalanobis biplot (genome vs cluster centroid) ──────────
@@ -307,6 +318,106 @@ def _panel_mahal(ax, hgt_df, in_goi, rscu_gene_df):
     ax.set_ylabel("# genes")
     ax.set_title("E. Mahalanobis distance distribution")
     ax.legend(loc="upper right", fontsize=8, frameon=False)
+
+
+def _panel_partition(ax, partition_table, partition_per_gene, in_goi, rscu_gene_df):
+    """Stacked bar showing GOI vs background composition across the
+    three-way partition: Mahal cluster, bulk, outliers.
+
+    The bar widths are GOI count and background count (so the eye reads
+    proportions, not absolute numbers — the partition test in
+    <sid>_goi_partition.tsv reports the absolute counts and Fisher p-values).
+    The partition_table argument is used to annotate per-category Fisher
+    p-values directly above the bars when significant.
+    """
+    if partition_per_gene is None or partition_per_gene.empty:
+        ax.text(0.5, 0.5, "Partition unavailable",
+                ha="center", va="center", transform=ax.transAxes)
+        return
+
+    # Recompute per-side counts from the per-gene partition (the table arg is
+    # used for p-values; the per-gene info is the source of truth for counts)
+    goi_genes = set(rscu_gene_df.loc[in_goi, COL_GENE])
+    df = partition_per_gene.copy()
+    df["in_goi"] = df[COL_GENE].isin(goi_genes)
+    df = df[df["partition"].isin(("mahal_cluster", "bulk", "outlier"))]
+    if df.empty:
+        ax.text(0.5, 0.5, "No partitioned genes",
+                ha="center", va="center", transform=ax.transAxes)
+        return
+
+    cats = ["mahal_cluster", "bulk", "outlier"]
+    colors = {"mahal_cluster": "#2ca02c", "bulk": "#9467bd", "outlier": "#d62728"}
+
+    n_goi = int(df["in_goi"].sum())
+    n_bg = int((~df["in_goi"]).sum())
+    if n_goi < 1 or n_bg < 1:
+        ax.text(0.5, 0.5, "Empty GOI or background",
+                ha="center", va="center", transform=ax.transAxes)
+        return
+
+    goi_counts = {c: int(((df["partition"] == c) & df["in_goi"]).sum()) for c in cats}
+    bg_counts = {c: int(((df["partition"] == c) & ~df["in_goi"]).sum()) for c in cats}
+
+    goi_fracs = [goi_counts[c] / n_goi for c in cats]
+    bg_fracs = [bg_counts[c] / n_bg for c in cats]
+
+    # Draw stacked horizontal bars (top = GOI, bottom = background)
+    bottoms = {"goi": 0.0, "bg": 0.0}
+    bar_h = 0.6
+    for c, gf, bf in zip(cats, goi_fracs, bg_fracs):
+        ax.barh(1, gf, left=bottoms["goi"], height=bar_h,
+                color=colors[c], edgecolor="white", linewidth=1)
+        ax.barh(0, bf, left=bottoms["bg"], height=bar_h,
+                color=colors[c], edgecolor="white", linewidth=1)
+        # Inline percentage labels (≥4% to avoid clutter)
+        if gf > 0.04:
+            ax.text(bottoms["goi"] + gf / 2, 1, f"{gf*100:.0f}%",
+                    ha="center", va="center", fontsize=8, color="white", fontweight="bold")
+        if bf > 0.04:
+            ax.text(bottoms["bg"] + bf / 2, 0, f"{bf*100:.0f}%",
+                    ha="center", va="center", fontsize=8, color="white", fontweight="bold")
+        bottoms["goi"] += gf
+        bottoms["bg"] += bf
+
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels([f"background (n={n_bg})", f"GOI (n={n_goi})"], fontsize=9)
+    ax.set_xlim(0, 1)
+    ax.set_xlabel("Fraction of genes")
+
+    # Per-category Fisher p-values on the right
+    if partition_table is not None and not partition_table.empty:
+        for cat in cats:
+            row = partition_table[partition_table["category"] == cat]
+            if row.empty:
+                continue
+            p = row.iloc[0].get("p_adjusted", float("nan"))
+            if pd.notna(p):
+                star = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "ns"
+                ax.text(1.02, 0.5 + 0.5 * cats.index(cat) / max(1, len(cats) - 1),
+                        f"{cat}: BH-p={p:.3g} {star}",
+                        ha="left", va="center", fontsize=7,
+                        color=colors[cat], transform=ax.transAxes)
+        omn = partition_table[partition_table["category"] == "OMNIBUS"]
+        if not omn.empty:
+            v = omn.iloc[0]["odds_ratio"]
+            p = omn.iloc[0]["fisher_p"]
+            ax.set_title(f"E. Genome partition (chi-sq Cramer's V={v:.2f}, p={p:.3g})")
+        else:
+            ax.set_title("E. Genome partition: GOI vs background")
+    else:
+        ax.set_title("E. Genome partition: GOI vs background")
+
+    # Legend: colour key for the three categories
+    handles = [plt_rect(colors[c], c) for c in cats]
+    ax.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, -0.35),
+              fontsize=8, frameon=False, ncol=3)
+
+
+def plt_rect(color, label):
+    """Helper: rectangle handle for legend entries."""
+    import matplotlib.patches as mpatches
+    return mpatches.Patch(color=color, label=label)
 
 
 def _panel_mahal_biplot(ax, hgt_df, mahal_cluster_df, in_goi, rscu_gene_df):
