@@ -9,9 +9,12 @@ import pytest
 from codonpipe.modules.codon_optimization import (
     _w_values_per_family,
     build_recommendation_table,
+    build_recommendation_table_vs_genome,
     build_three_way_codon_table,
     compute_optimization_summary,
+    compute_optimization_summary_vs_genome,
     compute_per_gene_gain,
+    compute_per_gene_three_way_cai,
     compute_top_line_stats,
 )
 from codonpipe.utils.codon_tables import (
@@ -163,3 +166,82 @@ class TestPerGeneGain:
     def test_handles_missing_inputs(self):
         assert compute_per_gene_gain(None, None).empty
         assert compute_per_gene_gain(pd.DataFrame(), pd.DataFrame()).empty
+
+
+# ── Mahal-vs-genome variants ────────────────────────────────────────────────
+
+
+class TestSummaryVsGenome:
+    def test_detects_disagreement(self):
+        # Genome biased toward UUU, Mahal biased toward UUC
+        g = _biased_rscu_dict(("UUU",))
+        rp = _biased_rscu_dict(("UUC",))   # any
+        m = _biased_rscu_dict(("UUC",))
+        table = build_three_way_codon_table(g, rp, m)
+        summary_g = compute_optimization_summary_vs_genome(table)
+        phe = summary_g[summary_g["family"] == "Phe"].iloc[0]
+        assert not phe["agree"]
+        assert phe["genome_optimal_codon"] == "UUU"
+        assert phe["mahal_optimal_codon"] == "UUC"
+        assert phe["max_codon_w_shift_vs_genome"] > 0.5
+
+    def test_recommendation_uses_mahal(self):
+        g = _biased_rscu_dict(("UUU",))
+        rp = _biased_rscu_dict(("UUU",))
+        m = _biased_rscu_dict(("UUC",))
+        table = build_three_way_codon_table(g, rp, m)
+        summary_g = compute_optimization_summary_vs_genome(table)
+        rec_g = build_recommendation_table_vs_genome(summary_g, table)
+        phe = rec_g[rec_g["family"] == "Phe"].iloc[0]
+        assert phe["recommended_codon"] == "UUC"
+        assert phe["alternative_codon"] == "UUU"
+        assert "differs from genome-most-frequent" in phe["rationale"]
+
+
+class TestPerGeneThreeWayCAI:
+    def test_synthetic_genome(self, tmp_path):
+        """Build a tiny .ffn and verify three-way CAI runs end-to-end."""
+        ffn = tmp_path / "test.ffn"
+        # Two short genes, ~250 nt each (above MIN_GENE_LENGTH of 240)
+        # Simple alternating codons covering each AA family
+        seq1 = ("ATG" + "GCT" * 30 + "GCC" * 30 + "GCA" * 30 + "TAA")  # mostly Ala variants
+        seq2 = ("ATG" + "GCG" * 90 + "TAA")
+        with open(ffn, "w") as fh:
+            fh.write(f">gene1\n{seq1}\n>gene2\n{seq2}\n")
+
+        # All-uniform reference frames → every CAI should equal 1.0
+        g = _uniform_rscu_dict()
+        rp = _uniform_rscu_dict()
+        m = _uniform_rscu_dict()
+        cai = compute_per_gene_three_way_cai(ffn, g, rp, m, min_length=240)
+        assert not cai.empty
+        for col in ("cai_genome", "cai_rp", "cai_mahal",
+                    "gain_mahal_vs_genome", "gain_mahal_vs_rp", "gain_rp_vs_genome"):
+            assert col in cai.columns
+        # Uniform w means every codon has w=1.0, so CAI = 1.0 for every gene
+        assert np.allclose(cai["cai_genome"].dropna(), 1.0, atol=1e-6)
+        assert np.allclose(cai["cai_mahal"].dropna(), 1.0, atol=1e-6)
+        # Gains should be ~0
+        assert (cai["gain_mahal_vs_genome"].abs() < 1e-6).all()
+
+    def test_biased_references_give_different_cais(self, tmp_path):
+        """When references differ, the per-gene CAIs should diverge."""
+        ffn = tmp_path / "test.ffn"
+        # A gene that uses GCC (Ala) heavily
+        seq = "ATG" + "GCC" * 90 + "TAA"
+        with open(ffn, "w") as fh:
+            fh.write(f">gene1\n{seq}\n")
+
+        g = _biased_rscu_dict(("GCC",))   # genome favours GCC (matches gene)
+        rp = _biased_rscu_dict(("GCG",))   # RP favours GCG (penalises gene)
+        m = _biased_rscu_dict(("GCC",))    # Mahal favours GCC (matches gene)
+
+        cai = compute_per_gene_three_way_cai(ffn, g, rp, m, min_length=240)
+        assert not cai.empty
+        row = cai.iloc[0]
+        # Gene matches genome and Mahal; should score much higher there than RP
+        assert row["cai_genome"] > row["cai_rp"]
+        assert row["cai_mahal"] > row["cai_rp"]
+        assert row["gain_mahal_vs_rp"] > 0
+        # Gain over genome should be ~0 since both favour GCC
+        assert abs(row["gain_mahal_vs_genome"]) < 0.05
