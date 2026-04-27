@@ -39,6 +39,7 @@ import pandas as pd
 
 from codonpipe.modules.gene_set import (
     _drop_redundant_codon_per_family,
+    _resolve_path,
     aitchison_distance,
     clr_transform,
     load_sample_outputs,
@@ -360,17 +361,17 @@ def write_signatures_for_sample(
 
     loaded = load_sample_outputs(sample_dir, sample_id)
     # Pull a few extra ecology files that load_sample_outputs doesn't read
-    # (because the gene_set module doesn't need them).
+    # (because the gene_set module doesn't need them). Use the same path
+    # resolver so both layouts (role-based + flat) work transparently.
     sample_dir = Path(sample_dir)
-    bio_dir = sample_dir / "bio_ecology"
-    grodon_path = bio_dir / f"{sample_id}_grodon2_prediction.tsv"
-    grodon_df = pd.read_csv(grodon_path, sep="\t") if grodon_path.exists() else None
-    phage_path = bio_dir / f"{sample_id}_phage_mobile_elements.tsv"
-    phage_df = pd.read_csv(phage_path, sep="\t") if phage_path.exists() else None
-    strand_path = bio_dir / f"{sample_id}_strand_asymmetry.tsv"
-    strand_df = pd.read_csv(strand_path, sep="\t") if strand_path.exists() else None
-    trna_path = sample_dir / "advanced" / f"{sample_id}_trna_counts.tsv"
-    trna_df = pd.read_csv(trna_path, sep="\t") if trna_path.exists() else None
+    grodon_path = _resolve_path(sample_dir, "bio_ecology", f"{sample_id}_grodon2_prediction.tsv")
+    grodon_df = pd.read_csv(grodon_path, sep="\t") if grodon_path is not None else None
+    phage_path = _resolve_path(sample_dir, "bio_ecology", f"{sample_id}_phage_mobile_elements.tsv")
+    phage_df = pd.read_csv(phage_path, sep="\t") if phage_path is not None else None
+    strand_path = _resolve_path(sample_dir, "bio_ecology", f"{sample_id}_strand_asymmetry.tsv")
+    strand_df = pd.read_csv(strand_path, sep="\t") if strand_path is not None else None
+    trna_path = _resolve_path(sample_dir, "advanced", f"{sample_id}_trna_counts.tsv")
+    trna_df = pd.read_csv(trna_path, sep="\t") if trna_path is not None else None
 
     gene_sig = compute_gene_signature(
         rscu_gene_df=loaded["rscu_gene_df"],
