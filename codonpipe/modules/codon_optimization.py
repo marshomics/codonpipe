@@ -578,12 +578,47 @@ def compute_per_gene_three_way_cai(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _find_ffn(sample_dir: Path, sample_id: str, override: Path | None = None) -> Path | None:
+    """Locate the gene CDS .ffn file across pipeline layouts and external paths.
+
+    Search order:
+      1. Caller-provided override (e.g. via --ffn-path on the CLI).
+      2. Role-based path: <sample_dir>/annotation/prokka/<sid>.ffn
+         and legacy flat: <sample_dir>/prokka/<sid>.ffn
+         (both via _resolve_path).
+      3. Glob fallback: any *.ffn under prokka/ or annotation/prokka/.
+         Handles renamed Prokka outputs and externally-supplied .ffn files
+         that landed in the prokka subdir without the {sample_id} prefix.
+
+    Returns the first match, or None if no .ffn can be located.
+    """
+    if override is not None and Path(override).exists():
+        return Path(override)
+
+    p = _resolve_path(sample_dir, "prokka", f"{sample_id}.ffn")
+    if p is not None:
+        return p
+
+    sample_dir = Path(sample_dir)
+    candidate_dirs = [
+        sample_dir / "annotation" / "prokka",
+        sample_dir / "prokka",
+    ]
+    for d in candidate_dirs:
+        if d.is_dir():
+            ffns = sorted(d.glob("*.ffn"))
+            if ffns:
+                return ffns[0]
+    return None
+
+
 def run_codon_optimization(
     sample_dir: Path,
     sample_id: str,
     output_dir: Path,
     *,
     make_figures: bool = True,
+    ffn_path: Path | None = None,
 ) -> dict[str, Path]:
     """Run the full three-way codon-optimization comparison for one sample.
 
@@ -675,12 +710,13 @@ def run_codon_optimization(
     # 4b. Three-way per-gene CAI from .ffn (genome / RP / Mahal w-tables).
     # Yields cai_genome (no pre-computed analog in the pipeline) so we can
     # quantify gain_mahal_vs_genome alongside gain_mahal_vs_rp.
-    ffn_path = _resolve_path(sample_dir, "prokka", f"{sample_id}.ffn")
+    resolved_ffn = _find_ffn(sample_dir, sample_id, override=ffn_path)
     three_way_cai = pd.DataFrame()
-    if ffn_path is not None:
+    if resolved_ffn is not None:
         try:
+            logger.info("Three-way CAI: using .ffn at %s", resolved_ffn)
             three_way_cai = compute_per_gene_three_way_cai(
-                ffn_path, rscu_genome, rscu_rp, rscu_mahal,
+                resolved_ffn, rscu_genome, rscu_rp, rscu_mahal,
             )
             if not three_way_cai.empty:
                 # Carry forward Mahal cluster context where available
@@ -707,9 +743,15 @@ def run_codon_optimization(
         except Exception as e:
             logger.warning("Three-way per-gene CAI failed: %s", e, exc_info=True)
     else:
-        logger.info(
-            "Prokka .ffn not found; skipping three-way per-gene CAI. "
-            "Mahal-vs-genome gain figure will be skipped."
+        logger.warning(
+            "Prokka .ffn not found under %s. Tried role-based "
+            "(annotation/prokka/<sid>.ffn) and legacy flat (prokka/<sid>.ffn) "
+            "layouts plus a *.ffn glob in those directories. If the .ffn "
+            "lives outside the sample directory (e.g. you ran codonpipe "
+            "with --prokka-ffn pointing to an external path), pass it "
+            "explicitly via --ffn-path. Skipping three-way per-gene CAI "
+            "and the Mahal-vs-genome gain figure.",
+            sample_dir,
         )
 
     # 5. Figures
