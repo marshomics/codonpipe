@@ -514,10 +514,32 @@ def signatures_cmd(sample_dir: Path, sample_id: str | None, output_dir: Path | N
               help="Apply UMAP after PCA for the 2-D embedding (requires "
                    "umap-learn). Without this flag, the first two PCs are used.")
 @click.option("--include-gene-level", is_flag=True,
-              help="Also concatenate the gene-level signatures into "
+              help="Concatenate the gene-level signatures into "
                    "corpus_gene_signature.tsv. Skipped by default because "
                    "gene-level corpora are large (millions of rows for "
-                   "thousands of genomes).")
+                   "thousands of genomes). Implied by --gene-level-clustering "
+                   "and --gene-level-by-category.")
+@click.option("--gene-level-clustering", is_flag=True,
+              help="Cluster genes across the corpus by their CLR-Δ codon "
+                   "vectors. Emits corpus_gene_clusters.tsv and a four-panel "
+                   "gene-level UMAP figure with overlays for cluster, host "
+                   "genome, host phylum, and host GC3.")
+@click.option("--gene-level-by-category", default=None,
+              type=click.Choice(["KO", "COG", "COG_ID"], case_sensitive=False),
+              help="Within each functional category (KO or COG_ID), cluster "
+                   "the genes labelled with that category across the corpus. "
+                   "Answers 'do all genes of this function share a codon "
+                   "strategy, or split into ecological sub-strategies?'. "
+                   "Categories with fewer than --gene-level-min-category-size "
+                   "genes are skipped.")
+@click.option("--gene-level-min-category-size", type=int, default=10,
+              show_default=True,
+              help="Minimum genes per category for per-category clustering.")
+@click.option("--gene-level-max-genes", type=int, default=1_000_000,
+              show_default=True,
+              help="Safety cap on the gene-level corpus size for general "
+                   "clustering. Above this, --gene-level-clustering raises "
+                   "rather than running for hours.")
 @click.option("--phylogeny", "phylogeny_path", default=None,
               type=click.Path(exists=True, dir_okay=False, path_type=Path),
               help="Optional phylogeny for Mantel-test validation. Accepts "
@@ -532,6 +554,11 @@ def signatures_cmd(sample_dir: Path, sample_id: str | None, output_dir: Path | N
 @click.option("--hdbscan-min-cluster-size", type=int, default=None,
               help="Override the heuristic HDBSCAN min_cluster_size. Default "
                    "scales to ~2%% of corpus, floor 5, ceiling 50.")
+@click.option("--focus-genome", "focus_genomes", multiple=True,
+              help="Render a single-genome locator figure for this sample_id "
+                   "(repeatable). Highlights the genome on the embedding and "
+                   "shows its z-score / percentile rank on each scalar feature. "
+                   "Use to give reviewers a quick where-does-X-sit answer.")
 @click.option("--rng-seed", default=42, type=int, show_default=True,
               help="Random seed for PCA / UMAP / HDBSCAN / Mantel.")
 @click.option("-v", "--verbose", is_flag=True, help="Debug-level logging.")
@@ -541,9 +568,14 @@ def corpus_cmd(
     features: str,
     use_umap: bool,
     include_gene_level: bool,
+    gene_level_clustering: bool,
+    gene_level_by_category: str | None,
+    gene_level_min_category_size: int,
+    gene_level_max_genes: int,
     phylogeny_path: Path | None,
     metadata_path: Path | None,
     hdbscan_min_cluster_size: int | None,
+    focus_genomes: tuple[str, ...],
     rng_seed: int,
     verbose: bool,
 ):
@@ -594,9 +626,14 @@ def corpus_cmd(
             features=features,
             use_umap=use_umap,
             include_gene_level=include_gene_level,
+            gene_level_clustering=gene_level_clustering,
+            gene_level_by_category=gene_level_by_category,
+            gene_level_min_category_size=gene_level_min_category_size,
+            gene_level_max_genes=gene_level_max_genes,
             phylogeny_path=phylogeny_path,
             metadata_path=metadata_path,
             hdbscan_min_cluster_size=hdbscan_min_cluster_size,
+            focus_genomes=list(focus_genomes) if focus_genomes else None,
             rng_seed=rng_seed,
         )
     except FileNotFoundError as e:
@@ -610,6 +647,76 @@ def corpus_cmd(
         sys.exit(1)
 
     logger.info("Corpus build complete:")
+    for k, v in outputs.items():
+        logger.info("  %-25s %s", k, v)
+
+
+@main.command("codon-optimization")
+@click.argument("sample_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("-s", "--sample-id", default=None,
+              help="Sample identifier. Defaults to the directory name.")
+@click.option("-o", "--output-dir", "output_dir", default=None,
+              type=click.Path(path_type=Path),
+              help="Output directory. Defaults to <SAMPLE_DIR>/codon_optimization/.")
+@click.option("--no-figure", is_flag=True,
+              help="Skip the three figures, write only the TSV outputs.")
+@click.option("-v", "--verbose", is_flag=True, help="Debug-level logging.")
+def codon_optimization_cmd(
+    sample_dir: Path,
+    sample_id: str | None,
+    output_dir: Path | None,
+    no_figure: bool,
+    verbose: bool,
+):
+    """Compare genome / RP / Mahal-cluster codon-usage profiles for one organism.
+
+    Produces a synthesis-ready recommendation table plus three figures
+    that visualize how the three reference frames differ and quantify the
+    gain from Mahal-cluster-based codon optimization vs the classic
+    RP-based approach.
+
+    Outputs in --output-dir:
+
+    \b
+      <sid>_codon_optimization_table.tsv     per-codon w-values + optimal flags
+      <sid>_codon_optimization_summary.tsv   per-AA-family agreement
+      <sid>_codon_optimization_recommend.tsv synthesis-ready preferred codons
+      <sid>_codon_optimization_gain.tsv      per-gene cbi_rp vs cbi_mahal
+      <sid>_three_way_rscu.png/.svg          RSCU bars per codon
+      <sid>_optimization_agreement.png/.svg  per-AA RP-vs-Mahal table
+      <sid>_optimization_gain.png/.svg       per-gene CBI scatter + gain dist
+
+    Defensible reason to prefer Mahal-derived weights for codon
+    optimization: the Mahal cluster is identified by codon-usage
+    similarity rather than by RP gene annotations, so it captures the
+    organism's actual translationally-optimized cohort and excludes RP
+    annotation outliers (truncations, paralogs, modified variants) that
+    can pull the RP-based reference centroid off-target.
+
+    Example:
+
+    \b
+        codonpipe codon-optimization output_run/G0370_i3 \\
+            -o output_run/G0370_i3/codon_optimization/
+    """
+    logger = setup_logger(verbose=verbose)
+    from codonpipe.modules.codon_optimization import run_codon_optimization
+
+    sid = sample_id or sample_dir.name
+    out_dir = output_dir or (sample_dir / "codon_optimization")
+
+    try:
+        outputs = run_codon_optimization(
+            sample_dir, sid, out_dir, make_figures=not no_figure,
+        )
+    except FileNotFoundError as e:
+        logger.error("%s", e)
+        sys.exit(1)
+    except Exception as e:
+        logger.error("Codon-optimization analysis failed: %s", e, exc_info=verbose)
+        sys.exit(1)
+
+    logger.info("Codon optimization complete:")
     for k, v in outputs.items():
         logger.info("  %-25s %s", k, v)
 
