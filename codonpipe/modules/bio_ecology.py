@@ -24,6 +24,7 @@ from sklearn.decomposition import PCA
 from codonpipe.modules.rscu import count_codons, compute_rscu_from_counts
 from codonpipe.utils.codon_tables import (
     AA_CODON_GROUPS,
+    AA_CODON_GROUPS_RSCU,
     CODON_TABLE_11,
     MIN_GENE_LENGTH,
     RSCU_COLUMN_NAMES,
@@ -31,6 +32,33 @@ from codonpipe.utils.codon_tables import (
     SENSE_CODONS,
     dna_to_rna,
 )
+
+
+def _independent_rscu_columns(rscu_cols: list[str]) -> list[str]:
+    """Return RSCU columns minus one redundant codon per amino acid family.
+
+    RSCU values within an amino acid family sum to a constant (= number of
+    synonymous codons), so each family contributes one linear dependence to
+    the column space. Mahalanobis distance, covariance estimation, and
+    chi-squared p-values all assume full-rank features; using all 59 RSCU
+    columns inflates the assumed degrees of freedom by ~21 and produces
+    anti-conservative test calibration.
+
+    Strategy: for each family in AA_CODON_GROUPS_RSCU with two or more codons,
+    drop the lexicographically last codon (deterministic, doesn't depend on
+    data). The dropped codon's information is recoverable from the others as
+    sum_constraint - sum_of_others, so no biological signal is lost.
+
+    Returns the kept columns in their original RSCU_COLUMN_NAMES order.
+    """
+    cols_set = set(rscu_cols)
+    drop = set()
+    for family_name, codons in AA_CODON_GROUPS_RSCU.items():
+        family_cols = [f"{family_name}-{c}" for c in codons if f"{family_name}-{c}" in cols_set]
+        if len(family_cols) >= 2:
+            # Drop the lexicographically last column from this family.
+            drop.add(sorted(family_cols)[-1])
+    return [c for c in rscu_cols if c not in drop]
 from codonpipe.utils.io import find_gene_id_column, get_output_subdir
 from codonpipe.utils.statistics import benjamini_hochberg
 
@@ -624,13 +652,24 @@ def detect_hgt_candidates(
             "hgt_flag_fdr", "hgt_flag_adaptive", "gc3_outlier", "hgt_flag_combined",
         ])
 
-    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
-    if not rscu_cols:
+    rscu_cols_full = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
+    if not rscu_cols_full:
         logger.warning("No RSCU columns found; skipping HGT detection")
         return pd.DataFrame(columns=[
             "gene", "mahalanobis_dist", "gc3_deviation", "p_value", "p_adjusted",
             "hgt_flag_fdr", "hgt_flag_adaptive", "gc3_outlier", "hgt_flag_combined",
         ])
+
+    # Drop one redundant codon per amino acid family so the feature matrix has
+    # full column rank. Without this the chi-squared df is wrong by ~21
+    # (the number of synonymous-family sum constraints) and the Mahalanobis
+    # covariance is rank-deficient. See _independent_rscu_columns.
+    rscu_cols = _independent_rscu_columns(rscu_cols_full)
+    logger.info(
+        "HGT detection: using %d independent RSCU columns (dropped %d redundant codons "
+        "to handle compositional sum-to-1 constraints)",
+        len(rscu_cols), len(rscu_cols_full) - len(rscu_cols),
+    )
 
     # Extract RSCU matrix
     X = rscu_gene_df[rscu_cols].values.copy()
@@ -715,20 +754,20 @@ def detect_hgt_candidates(
 
     mahal_dists = np.array(mahal_dists)
 
-    # Chi-squared p-value from Mahalanobis distance (df = n_features).
-    # WARNING: These p-values are approximate. LedoitWolf shrinkage biases
-    # the covariance estimate toward the identity, inflating Mahalanobis
-    # distances for off-diagonal-heavy covariance structures and deflating
-    # them otherwise. The resulting chi-squared p-values have poorly
-    # calibrated type I error rates and should NOT be interpreted as exact.
-    # The adaptive quantile-based threshold (below) is more defensible for
-    # high-confidence HGT calls. FDR-corrected p-values are provided for
-    # ranking purposes but may be anti-conservative or conservative depending
-    # on the degree of shrinkage.
+    # Chi-squared p-value from Mahalanobis distance.
+    # df = n_features now reflects the *independent* RSCU dimensions because
+    # we dropped one codon per amino acid family before forming X. This makes
+    # the chi-squared null distribution well-defined.
+    # Caveat that remains: LedoitWolf shrinkage biases the covariance estimate
+    # toward the identity, so the chi-squared calibration is approximate
+    # (slightly conservative when shrinkage is large). The adaptive
+    # quantile-based threshold below is provided as a complementary,
+    # distribution-free flag for high-confidence HGT calls.
     p_values = 1 - stats.chi2.cdf(mahal_dists ** 2, df=n_features)
-    logger.warning(
-        "HGT chi-squared p-values are approximate due to LedoitWolf shrinkage; "
-        "use adaptive quantile threshold for high-confidence calls"
+    logger.info(
+        "HGT chi-squared p-values use df=%d independent RSCU dimensions; "
+        "LedoitWolf shrinkage may make them mildly conservative",
+        n_features,
     )
 
     # GC3 deviation from genome mean
@@ -811,15 +850,22 @@ def predict_growth_rate(
     expr_df: pd.DataFrame,
     rp_ids_file: Path | str | None = None,
 ) -> dict | None:
-    """Predict minimum doubling time from CAI of ribosomal proteins.
+    """Predict minimum doubling time from a CAI-based proxy for codon usage bias.
 
-    Uses the Vieira-Silva & Rocha (2010) empirical model:
-    ``doubling_time = exp(a + b * mean_CAI)``.
+    This is a *proxy* model, not a published growth-prediction method. The
+    formula ``doubling_time = exp(7.15 - 7.38 * mean_CAI_RP)`` borrows the
+    functional form (and coefficients) used in Vieira-Silva & Rocha (2010,
+    PLoS Genet), but their model regresses doubling time against ΔENC' (the
+    difference between ENC' of ribosomal genes and the genome), not against
+    mean CAI of ribosomal proteins. The two predictors correlate but are not
+    interchangeable, so this function should be read as a heuristic that
+    captures the same direction of effect rather than as an implementation
+    of the original calibration.
 
-    The coefficients (a=7.15, b=-7.38) were calibrated on mean CAI of
-    ribosomal proteins across ~200 prokaryotic genomes.  This function
-    uses **only** RP genes and **only** CAI to match the original
-    calibration conditions.
+    For a properly calibrated, peer-reviewed growth prediction, use the
+    gRodon2 wrapper in :mod:`codonpipe.modules.grodon` (Weissman, Hou & Fuhrman
+    2021), which the pipeline runs alongside this proxy whenever gRodon2 is
+    installed.
 
     Args:
         expr_df: Expression table with gene and CAI column.
@@ -828,18 +874,20 @@ def predict_growth_rate(
 
     Returns:
         Dict with mean_metric, predicted_doubling_time_hours, n_reference_genes,
-        growth_class, expression_metric, reference_set.
+        growth_class, expression_metric, reference_set, and a caveat string
+        flagging the proxy status.
         Returns None if no expression data or reference genes found.
     """
     if expr_df.empty:
         logger.warning("Empty expression data; cannot predict growth rate")
         return None
 
-    # Force CAI: the Vieira-Silva & Rocha coefficients were calibrated on CAI
+    # Use CAI: the proxy formula's coefficients are most defensible when paired
+    # with CAI on ribosomal proteins. Other metrics would require a separate fit.
     metric = "CAI"
     if metric not in expr_df.columns or expr_df[metric].notna().sum() == 0:
         logger.warning("CAI column not available in expression data; "
-                       "cannot run Vieira-Silva & Rocha growth rate prediction")
+                       "cannot run CAI-based growth rate proxy")
         return None
 
     # Reference set: ribosomal proteins only
@@ -870,10 +918,17 @@ def predict_growth_rate(
         logger.warning("Too few reference genes with %s values (%d); need at least 3",
                        metric, len(ref_vals_series))
         return None
+    if len(ref_vals_series) < 10:
+        logger.warning(
+            "Only %d reference genes for the CAI-based growth proxy; "
+            "bootstrap confidence intervals may be unreliable below n=10",
+            len(ref_vals_series),
+        )
 
     mean_metric = ref_vals_series.mean()
 
-    # Empirical coefficients from Vieira-Silva & Rocha (2010)
+    # Functional-form coefficients adapted from Vieira-Silva & Rocha (2010).
+    # See predict_growth_rate docstring for the disclaimer on attribution.
     a = 7.15
     b = -7.38
     predicted_doubling_time = np.exp(a + b * mean_metric)
@@ -909,10 +964,13 @@ def predict_growth_rate(
         "n_reference_genes": int(len(ref_vals_series)),
         "n_rp_genes": int(len(ref_vals_series)),  # backward compat
         "growth_class": growth_class,
+        "model": "cai_rp_proxy",
         "caveat": (
-            f"Vieira-Silva & Rocha (2010) model using CAI on "
-            f"ribosomal proteins ({len(ref_vals_series)} genes); "
-            "coefficients (a=7.15, b=-7.38) calibrated on proteobacteria."
+            f"CAI-based growth proxy using ribosomal proteins "
+            f"({len(ref_vals_series)} genes). Functional form adapted from "
+            f"Vieira-Silva & Rocha (2010), but the original paper regresses "
+            f"on ΔENC', not mean CAI; treat as heuristic. For peer-reviewed "
+            f"growth prediction, see the gRodon2 output."
         ),
     }
 
@@ -1344,25 +1402,44 @@ def compute_strand_asymmetry(
             })
 
     result_df = pd.DataFrame(rows) if rows else None
+
+    # Compute strand-imbalance flag once; used for both reporting and as an
+    # output column so downstream consumers can filter or discount these
+    # rows without re-deriving the threshold.
+    n_plus = len(plus_rscu.get(rscu_cols[0], [])) if rscu_cols else 0
+    n_minus = len(minus_rscu.get(rscu_cols[0], [])) if rscu_cols else 0
+    if n_plus > 0 and n_minus > 0:
+        imbalance_ratio = max(n_plus, n_minus) / min(n_plus, n_minus)
+    else:
+        imbalance_ratio = float("inf")
+    strand_imbalance_flag = imbalance_ratio > 3.0
+
     if result_df is not None and len(result_df) > 1:
         # Benjamini-Hochberg FDR correction across all per-codon tests
         result_df["p_adjusted"] = np.round(benjamini_hochberg(result_df["p_value"].values), 6)
         result_df["significant"] = result_df["p_adjusted"] < 0.05
+        result_df["n_plus"] = n_plus
+        result_df["n_minus"] = n_minus
+        result_df["strand_imbalance_ratio"] = round(imbalance_ratio, 3)
+        result_df["strand_imbalance_flag"] = strand_imbalance_flag
 
-        # Check for severe strand imbalance
-        n_plus = len(plus_rscu.get(rscu_cols[0], [])) if rscu_cols else 0
-        n_minus = len(minus_rscu.get(rscu_cols[0], [])) if rscu_cols else 0
-        if n_plus > 0 and n_minus > 0 and max(n_plus, n_minus) / min(n_plus, n_minus) > 3:
-            logger.warning("Severe strand imbalance: %d genes on (+) strand vs %d on (-) strand. "
-                           "Mann-Whitney results may be unreliable.", n_plus, n_minus)
+        if strand_imbalance_flag:
+            logger.warning(
+                "Severe strand imbalance: %d genes on (+) strand vs %d on (-) strand "
+                "(ratio %.2f > 3). Mann-Whitney results may be unreliable; "
+                "'strand_imbalance_flag' column flags this in the output.",
+                n_plus, n_minus, imbalance_ratio,
+            )
 
         logger.info("Strand asymmetry: %d codons analyzed (%d significant, FDR < 0.05), n_plus=%d, n_minus=%d",
                     len(result_df), result_df["significant"].sum(), n_plus, n_minus)
     elif result_df is not None:
         result_df["p_adjusted"] = result_df["p_value"]
         result_df["significant"] = result_df["p_adjusted"] < 0.05
-        n_plus = len(plus_rscu.get(rscu_cols[0], [])) if rscu_cols else 0
-        n_minus = len(minus_rscu.get(rscu_cols[0], [])) if rscu_cols else 0
+        result_df["n_plus"] = n_plus
+        result_df["n_minus"] = n_minus
+        result_df["strand_imbalance_ratio"] = round(imbalance_ratio, 3) if np.isfinite(imbalance_ratio) else None
+        result_df["strand_imbalance_flag"] = strand_imbalance_flag
         logger.info("Strand asymmetry: %d codons analyzed, n_plus=%d, n_minus=%d",
                     len(result_df), n_plus, n_minus)
     return result_df
