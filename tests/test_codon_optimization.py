@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from codonpipe.modules.codon_optimization import (
+    _find_ffn,
     _w_values_per_family,
     build_recommendation_table,
     build_recommendation_table_vs_genome,
@@ -223,6 +224,50 @@ class TestPerGeneThreeWayCAI:
         assert np.allclose(cai["cai_mahal"].dropna(), 1.0, atol=1e-6)
         # Gains should be ~0
         assert (cai["gain_mahal_vs_genome"].abs() < 1e-6).all()
+
+    def test_ffn_finder_role_based_layout(self, tmp_path):
+        """Production layout: <sample>/annotation/prokka/<sid>.ffn."""
+        sample_dir = tmp_path / "sample"
+        prokka_dir = sample_dir / "annotation" / "prokka"
+        prokka_dir.mkdir(parents=True)
+        target = prokka_dir / "S.ffn"
+        target.write_text(">g\nATG" + "GCC" * 10 + "\n")
+        found = _find_ffn(sample_dir, "S")
+        assert found is not None
+        assert found.resolve() == target.resolve()
+
+    def test_ffn_finder_legacy_flat_layout(self, tmp_path):
+        sample_dir = tmp_path / "sample"
+        prokka_dir = sample_dir / "prokka"
+        prokka_dir.mkdir(parents=True)
+        target = prokka_dir / "S.ffn"
+        target.write_text(">g\nATG\n")
+        found = _find_ffn(sample_dir, "S")
+        assert found is not None
+        assert found.resolve() == target.resolve()
+
+    def test_ffn_finder_glob_fallback(self, tmp_path):
+        """Externally-supplied .ffn dropped under prokka/ without a {sid} prefix."""
+        sample_dir = tmp_path / "sample"
+        prokka_dir = sample_dir / "prokka"
+        prokka_dir.mkdir(parents=True)
+        target = prokka_dir / "external_genes.ffn"
+        target.write_text(">g\nATG\n")
+        found = _find_ffn(sample_dir, "different_sid")
+        assert found is not None
+        assert found.resolve() == target.resolve()
+
+    def test_ffn_finder_explicit_override(self, tmp_path):
+        external = tmp_path / "external" / "genes.ffn"
+        external.parent.mkdir()
+        external.write_text(">g\nATG\n")
+        # No prokka subdir at all; only the explicit override
+        found = _find_ffn(tmp_path / "empty_sample", "S", override=external)
+        assert found is not None
+        assert found.resolve() == external.resolve()
+
+    def test_ffn_finder_returns_none_when_missing(self, tmp_path):
+        assert _find_ffn(tmp_path / "no_sample", "S") is None
 
     def test_biased_references_give_different_cais(self, tmp_path):
         """When references differ, the per-gene CAIs should diverge."""
