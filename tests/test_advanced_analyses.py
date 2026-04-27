@@ -220,11 +220,20 @@ class TestTRNA:
             _write_test_gff(gff)
             result = extract_trna_counts_from_gff(gff)
             assert not result.empty
-            assert "tRNA_copy_number" in result.columns
-            # We wrote 2 Ala(TGC), 1 Gly(GCC), 1 Leu(CAA)
-            tgc_row = result[result["anticodon"] == "TGC"]
-            assert len(tgc_row) == 1
-            assert tgc_row.iloc[0]["tRNA_copy_number"] == 2
+            # New long-format schema (one row per (anticodon, decoded codon)
+            # under dos Reis 2004 wobble decoding) preserves the original
+            # tRNA_copy_number and adds wobble_weight + effective_tRNA.
+            for col in ("tRNA_copy_number", "wobble_weight", "effective_tRNA"):
+                assert col in result.columns
+            # We wrote 2 Ala(TGC), 1 Gly(GCC), 1 Leu(CAA).
+            # TGC anticodon: 5' base T (=U in RNA) wobbles → reads codons GCA
+            # (Watson-Crick, weight 1.0) and GCG (wobble, weight 0.561).
+            tgc_rows = result[result["anticodon"] == "TGC"]
+            assert len(tgc_rows) == 2
+            # Copy number is unchanged across the rows (still 2 tRNA genes).
+            assert (tgc_rows["tRNA_copy_number"] == 2).all()
+            decoded = set(tgc_rows["codon"])
+            assert decoded == {"GCA", "GCG"}
 
     def test_trna_codon_correlation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
