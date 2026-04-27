@@ -39,6 +39,76 @@ from codonpipe.modules.rscu import count_codons, compute_rscu_from_counts
 logger = logging.getLogger("codonpipe")
 
 
+def _resolve_optimal_codons(
+    weights_df: pd.DataFrame,
+    label: str = "",
+    tie_tolerance: float = 1e-6,
+) -> dict[str, str]:
+    """Pick one optimal codon per amino acid family, handling ties defensibly.
+
+    Bennetzen & Hall (1982) CBI assumes a uniquely defined optimal codon per
+    amino acid. When two codons in a family have indistinguishable adaptation
+    weights, alphabetical tie-breaking is not biologically motivated — and
+    silently flipping the optimal codon when the reference set changes
+    by one gene undermines reproducibility.
+
+    Policy adopted here: when the top two candidates within an amino acid
+    family are within *tie_tolerance* of each other, mark that family as
+    ambiguous (exclude both codons from the optimal set, and log at WARNING).
+    Downstream CBI is then computed only on families with an unambiguous
+    optimal codon, so the user is never silently relying on an arbitrary
+    pick.
+
+    Args:
+        weights_df: DataFrame produced by compute_codon_adaptation_weights.
+            Expected columns: amino_acid, codon, weight, is_optimal.
+        label: short string for log messages ("ribosomal-vs-all" etc).
+        tie_tolerance: max abs(weight) difference at which two codons count
+            as tied. Default 1e-6 covers float-precision ties; raise it to
+            mark statistically indistinguishable codons as ambiguous.
+
+    Returns:
+        Mapping {amino_acid: optimal_codon} containing only families with an
+        unambiguous winner.
+    """
+    if weights_df.empty:
+        return {}
+
+    candidates = (
+        weights_df[weights_df["is_optimal"]]
+        .sort_values(["weight", "codon"], ascending=[False, True])
+    )
+
+    optimal_codons: dict[str, str] = {}
+    n_ambiguous = 0
+    for aa_name in candidates["amino_acid"].unique():
+        aa_rows = candidates[candidates["amino_acid"] == aa_name]
+        if aa_rows.empty:
+            continue
+        top = aa_rows.iloc[0]
+        if len(aa_rows) >= 2:
+            second = aa_rows.iloc[1]
+            if abs(top["weight"] - second["weight"]) <= tie_tolerance:
+                logger.warning(
+                    "Tied optimal codon weights for %s in %s: "
+                    "%s and %s both at weight=%.4f; excluding %s from the "
+                    "optimal set (CBI cannot reliably distinguish them).",
+                    aa_name, label or "weights",
+                    top["codon"], second["codon"], top["weight"], aa_name,
+                )
+                n_ambiguous += 1
+                continue
+        optimal_codons[aa_name] = top["codon"]
+
+    if n_ambiguous:
+        logger.info(
+            "%s: %d amino acid family(ies) had tied optimal codons; "
+            "CBI computed over the remaining %d families.",
+            label or "optimal codon resolution", n_ambiguous, len(optimal_codons),
+        )
+    return optimal_codons
+
+
 def _get_sequence_ids_from_file(ffn_path: Path) -> set[str]:
     """Extract all sequence IDs from a FASTA file."""
     ids = set()
@@ -110,6 +180,13 @@ def compute_frequency_per_thousand(
     ffn_path: Path, gene_ids: set[str] | None = None, min_length: int = MIN_GENE_LENGTH
 ) -> pd.DataFrame:
     """Compute frequency per 1000 codons from sequences.
+
+    Normalization basis: counts are divided by the *total of all 64 codons*
+    (sense codons plus the three stop codons). This follows Ikemura's
+    original 1981 codon-table convention and matches GenScript's per-thousand
+    tables. If you compare against a database that normalizes over sense
+    codons only (some modern resources do), the absolute values will differ
+    by ~1.5%; the rank ordering is unaffected.
 
     Args:
         ffn_path: Path to nucleotide CDS FASTA file.
@@ -580,25 +657,8 @@ def generate_all_codon_tables(
             outputs["adaptation_weights"] = weights_path
             logger.info("Saved adaptation weights to %s", weights_path)
 
-            # Extract optimal codons (weight > 0)
-            # Sort by weight descending, then by codon alphabetically for deterministic tiebreaker
-            optimal_sorted = (
-                weights_df[weights_df["is_optimal"]]
-                .sort_values(["weight", "codon"], ascending=[False, True])
-            )
-            # Check for ties: same amino acid with identical top weight
-            for aa_name in optimal_sorted["amino_acid"].unique():
-                aa_rows = optimal_sorted[optimal_sorted["amino_acid"] == aa_name]
-                if len(aa_rows) > 1 and aa_rows.iloc[0]["weight"] == aa_rows.iloc[1]["weight"]:
-                    logger.debug(
-                        "Tied optimal codon weights for %s (weight=%.4f); "
-                        "selecting %s (alphabetically first among ties)",
-                        aa_name, aa_rows.iloc[0]["weight"], aa_rows.iloc[0]["codon"],
-                    )
-            optimal_codons = dict(
-                optimal_sorted
-                .drop_duplicates(subset=["amino_acid"])
-                .set_index("amino_acid")["codon"]
+            optimal_codons = _resolve_optimal_codons(
+                weights_df, label="ribosomal-vs-all",
             )
 
             # Compute CBI for all genes
@@ -624,25 +684,8 @@ def generate_all_codon_tables(
             outputs["mahal_cluster_adaptation_weights"] = mahal_w_path
             logger.info("Saved Mahalanobis-cluster adaptation weights to %s", mahal_w_path)
 
-            # Extract Mahalanobis-derived optimal codons and compute CBI
-            # Sort by weight descending, then by codon alphabetically for deterministic tiebreaker
-            mahal_opt_sorted = (
-                mahal_weights_df[mahal_weights_df["is_optimal"]]
-                .sort_values(["weight", "codon"], ascending=[False, True])
-            )
-            # Check for ties: same amino acid with identical top weight
-            for aa_name in mahal_opt_sorted["amino_acid"].unique():
-                aa_rows = mahal_opt_sorted[mahal_opt_sorted["amino_acid"] == aa_name]
-                if len(aa_rows) > 1 and aa_rows.iloc[0]["weight"] == aa_rows.iloc[1]["weight"]:
-                    logger.debug(
-                        "Tied Mahal optimal codon weights for %s (weight=%.4f); "
-                        "selecting %s (alphabetically first among ties)",
-                        aa_name, aa_rows.iloc[0]["weight"], aa_rows.iloc[0]["codon"],
-                    )
-            mahal_optimal_codons = dict(
-                mahal_opt_sorted
-                .drop_duplicates(subset=["amino_acid"])
-                .set_index("amino_acid")["codon"]
+            mahal_optimal_codons = _resolve_optimal_codons(
+                mahal_weights_df, label="mahal-cluster-vs-all",
             )
 
             if mahal_optimal_codons:
