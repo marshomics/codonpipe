@@ -195,10 +195,16 @@ def _classify_by_percentile(
 ) -> pd.Series:
     """Classify a numeric series into high/medium/low using quantile thresholds.
 
-    Uses fixed quantile cutoffs (default top/bottom 10%) for stable,
-    distribution-independent tier boundaries. This avoids the problem where
-    mean ± 1 SD produces wildly different tier sizes depending on score
-    distribution shape (bimodal CAI, skewed MELP, etc.).
+    Default cutoffs are the 10th and 90th percentiles, so each tail captures
+    ~10% of genes — a working compromise between statistical power for
+    downstream pathway enrichment (hypergeometric tests need enough genes per
+    tier) and biological stringency (genes in the tail should be plausibly
+    high- or low-expression). Pass low_pctl=5.0, high_pctl=95.0 for a stricter
+    Sharp-style split.
+
+    Quantile-based cutoffs avoid the problem where mean ± 1 SD produces wildly
+    different tier sizes depending on score distribution shape (bimodal CAI,
+    skewed MELP, etc.).
 
     Args:
         series: Score values (NaN-safe).
@@ -254,9 +260,10 @@ def _combine_expression(
 
     Each metric gets its own classification column (MELP_class, CAI_class,
     Fop_class) using the same percentile scheme:
-        - high: >= 90th percentile of that metric
-        - low:  <= 10th percentile of that metric
+        - high:   >= 90th percentile of that metric
+        - low:    <= 10th percentile of that metric
         - medium: everything else
+    See _classify_by_percentile for the rationale behind 10/90.
 
     The ``expression_class`` column defaults to MELP_class (MELP outperforms
     CAI in high-GC organisms). Falls back to CAI_class if MELP is unavailable.
