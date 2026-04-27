@@ -3,6 +3,29 @@
 Computes per-gene CU bias measures that complement the native ENC implementation:
     - ENCprime (Novembre 2002): ENC corrected for background GC composition
     - MILC (Supek & Vlahovicek 2005): Measure Independent of Length and Composition
+
+Reference set / background notes (important for reproducibility):
+
+    The coRdon library is invoked without an explicit ``subsets=`` argument
+    in this wrapper, which uses the *whole-genome* codon usage as the
+    expected/background distribution for both metrics. This is coRdon's
+    default behaviour and matches the original definitions:
+
+        * ENCprime expects a per-gene null derived from genome-wide GC
+          composition (Novembre 2002 §2). Passing no subset means coRdon
+          computes E_ij from the full ORFeome's codon counts.
+        * MILC's M_a chi-squared term is taken against the genome-mean
+          synonymous frequency for each amino acid (Supek & Vlahovicek
+          2005 eq. 4) when no reference set is provided.
+
+    If you need a different reference (e.g. ribosomal-protein-only baseline
+    for ENCprime, as in some downstream comparisons), call coRdon directly
+    with ``subsets = list(rp = rp_ids)``. This wrapper deliberately keeps
+    the genome-wide background for two reasons: (1) the README and CodonPipe
+    output schema treat ENCprime/MILC as gene-intrinsic measures so they
+    must not depend on the RP set being annotated; (2) the RP-conditioned
+    measures live in the expression module (MELP, CAI, Fop) which already
+    pass ``subsets = list(rp = rp_ids)`` explicitly.
 """
 
 from __future__ import annotations
