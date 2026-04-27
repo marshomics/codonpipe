@@ -1040,9 +1040,9 @@ def analyze_gene_set(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _read_score_tsv(path: Path, score_name: str) -> pd.DataFrame | None:
+def _read_score_tsv(path: Path | None, score_name: str) -> pd.DataFrame | None:
     """Read a coRdon-flavoured TSV with 'self'/'gene'/'width' columns and rename score."""
-    if not path.exists():
+    if path is None or not Path(path).exists():
         return None
     df = pd.read_csv(path, sep="\t")
     # Rename the first numeric column that isn't gene/width to *score_name*
@@ -1056,9 +1056,9 @@ def _read_score_tsv(path: Path, score_name: str) -> pd.DataFrame | None:
     return df
 
 
-def _read_single_row_rscu(path: Path) -> dict[str, float] | None:
+def _read_single_row_rscu(path: Path | None) -> dict[str, float] | None:
     """Read a per-genome single-row RSCU TSV (median or ribosomal) into a codon dict."""
-    if not path.exists():
+    if path is None or not Path(path).exists():
         return None
     df = pd.read_csv(path, sep="\t")
     if df.empty:
@@ -1071,9 +1071,9 @@ def _read_single_row_rscu(path: Path) -> dict[str, float] | None:
     }
 
 
-def _read_codon_keyed_rscu(path: Path) -> dict[str, float] | None:
+def _read_codon_keyed_rscu(path: Path | None) -> dict[str, float] | None:
     """Read a 'codon\\tRSCU' TSV (e.g. Mahalanobis-cluster file)."""
-    if not path.exists():
+    if path is None or not Path(path).exists():
         return None
     df = pd.read_csv(path, sep="\t", header=0)
     # File has empty header on first column; make it 'codon'
@@ -1088,42 +1088,122 @@ def _read_codon_keyed_rscu(path: Path) -> dict[str, float] | None:
     return {row["codon"]: float(row["RSCU"]) for _, row in df.iterrows() if pd.notna(row["RSCU"])}
 
 
+# Mapping from leaf subdirectory name → role category used by
+# codonpipe.utils.io.get_output_subdir. Production CodonPipe runs nest leaf
+# subdirs (e.g. rscu/) under their role category (codon_usage/), but the
+# pre-refactor layout used a flat structure (rscu/ at sample-dir top level).
+# The path resolver tries the role-based layout first and falls back to flat.
+_SUBCATEGORY_TO_CATEGORY = {
+    # codon_usage role
+    "rscu": "codon_usage",
+    "cu_statistics": "codon_usage",
+    "codon_tables": "codon_usage",
+    # expression role
+    "scores": "expression",
+    "gmm_clustering": "expression",
+    "enrichment": "expression",
+    "enrichment_mahal": "expression",
+    # comparative role
+    "advanced": "comparative",
+    "bio_ecology": "comparative",
+    # annotation role
+    "prokka": "annotation",
+    "cogclassifier": "annotation",
+    "kofamscan": "annotation",
+    "ribosomal_proteins": "annotation",
+}
+
+
+def _resolve_path(sample_dir: Path, subcategory: str, filename: str) -> Path | None:
+    """Locate *filename* under *sample_dir/subcategory/*, handling both layouts.
+
+    Tries (in order):
+      1. <sample_dir>/<role_category>/<subcategory>/<filename>  (current layout)
+      2. <sample_dir>/<subcategory>/<filename>                  (legacy flat)
+
+    Returns the first match that exists, or None if neither does.
+    """
+    sample_dir = Path(sample_dir)
+    cat = _SUBCATEGORY_TO_CATEGORY.get(subcategory)
+    if cat:
+        nested = sample_dir / cat / subcategory / filename
+        if nested.exists():
+            return nested
+    flat = sample_dir / subcategory / filename
+    if flat.exists():
+        return flat
+    return None
+
+
+def _resolve_expression_tsv(sample_dir: Path, sample_id: str) -> Path | None:
+    """Expression table lives at expression/scores/ (new) or expression/ (legacy)."""
+    sample_dir = Path(sample_dir)
+    candidates = [
+        sample_dir / "expression" / "scores" / f"{sample_id}_expression.tsv",
+        sample_dir / "expression" / f"{sample_id}_expression.tsv",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
 def load_sample_outputs(sample_dir: Path, sample_id: str) -> dict:
     """Load the standard per-sample output files into a dict ready for analyze_gene_set.
 
-    Missing files are silently skipped with a warning. The keys correspond
-    one-to-one to the keyword arguments of analyze_gene_set.
+    Handles both pipeline layouts: the current role-based hierarchy
+    (codon_usage/rscu/, expression/scores/, comparative/bio_ecology/, ...) and
+    the legacy flat layout (rscu/, expression/, bio_ecology/, ...). Missing
+    files are silently skipped. Required files: rscu_all_genes.tsv and enc.tsv.
+
+    Keys correspond one-to-one to the keyword arguments of analyze_gene_set.
     """
     sample_dir = Path(sample_dir)
-    rscu_dir = sample_dir / "rscu"
-    cu_dir = sample_dir / "cu_statistics"
-    expr_dir = sample_dir / "expression"
-    bio_dir = sample_dir / "bio_ecology"
-    gmm_dir = sample_dir / "gmm_clustering"
 
-    rscu_gene_path = rscu_dir / f"{sample_id}_rscu_all_genes.tsv"
-    enc_path = rscu_dir / f"{sample_id}_enc.tsv"
-    if not rscu_gene_path.exists() or not enc_path.exists():
+    rscu_gene_path = _resolve_path(sample_dir, "rscu", f"{sample_id}_rscu_all_genes.tsv")
+    enc_path = _resolve_path(sample_dir, "rscu", f"{sample_id}_enc.tsv")
+    if rscu_gene_path is None or enc_path is None:
+        # Build a clear error showing which paths were tried so the user can
+        # debug pipeline-output layout issues quickly.
+        attempted = []
+        for sub, fname in (("rscu", f"{sample_id}_rscu_all_genes.tsv"),
+                           ("rscu", f"{sample_id}_enc.tsv")):
+            cat = _SUBCATEGORY_TO_CATEGORY.get(sub)
+            if cat:
+                attempted.append(f"  {sample_dir}/{cat}/{sub}/{fname}")
+            attempted.append(f"  {sample_dir}/{sub}/{fname}")
         raise FileNotFoundError(
-            f"Required files not found under {sample_dir}: "
-            f"need rscu/{sample_id}_rscu_all_genes.tsv and rscu/{sample_id}_enc.tsv"
+            f"Required CodonPipe outputs not found under {sample_dir}. "
+            f"Need rscu_all_genes.tsv and enc.tsv. Tried:\n" + "\n".join(attempted)
         )
 
     rscu_gene_df = pd.read_csv(rscu_gene_path, sep="\t")
     enc_df = pd.read_csv(enc_path, sep="\t")
 
-    expr_path = expr_dir / f"{sample_id}_expression.tsv"
-    expr_df = pd.read_csv(expr_path, sep="\t") if expr_path.exists() else None
+    expr_path = _resolve_expression_tsv(sample_dir, sample_id)
+    expr_df = pd.read_csv(expr_path, sep="\t") if expr_path is not None else None
 
-    encprime_df = _read_score_tsv(cu_dir / f"{sample_id}_encprime.tsv", "ENCprime")
-    milc_df = _read_score_tsv(cu_dir / f"{sample_id}_milc.tsv", "MILC")
+    encprime_df = _read_score_tsv(
+        _resolve_path(sample_dir, "cu_statistics", f"{sample_id}_encprime.tsv"),
+        "ENCprime",
+    )
+    milc_df = _read_score_tsv(
+        _resolve_path(sample_dir, "cu_statistics", f"{sample_id}_milc.tsv"),
+        "MILC",
+    )
 
-    hgt_path = bio_dir / f"{sample_id}_hgt_candidates.tsv"
-    hgt_df = pd.read_csv(hgt_path, sep="\t") if hgt_path.exists() else None
+    hgt_path = _resolve_path(sample_dir, "bio_ecology", f"{sample_id}_hgt_candidates.tsv")
+    hgt_df = pd.read_csv(hgt_path, sep="\t") if hgt_path is not None else None
 
-    rscu_genome = _read_single_row_rscu(rscu_dir / f"{sample_id}_rscu_median.tsv")
-    rscu_rp = _read_single_row_rscu(rscu_dir / f"{sample_id}_rscu_ribosomal.tsv")
-    rscu_mahal = _read_codon_keyed_rscu(gmm_dir / f"{sample_id}_gmm_cluster_rscu.tsv")
+    rscu_genome = _read_single_row_rscu(
+        _resolve_path(sample_dir, "rscu", f"{sample_id}_rscu_median.tsv")
+    )
+    rscu_rp = _read_single_row_rscu(
+        _resolve_path(sample_dir, "rscu", f"{sample_id}_rscu_ribosomal.tsv")
+    )
+    rscu_mahal = _read_codon_keyed_rscu(
+        _resolve_path(sample_dir, "gmm_clustering", f"{sample_id}_gmm_cluster_rscu.tsv")
+    )
     if rscu_mahal is not None:
         # The codon-keyed file uses bare codons; remap to RSCU column names.
         from codonpipe.utils.codon_tables import codon_to_col_name, CODON_TABLE_11
@@ -1137,9 +1217,11 @@ def load_sample_outputs(sample_dir: Path, sample_id: str) -> dict:
         rscu_mahal = remapped if remapped else rscu_mahal
 
     # Per-gene Mahal-cluster table: distance-to-cluster + in_optimized_set flag.
-    mahal_clusters_path = gmm_dir / f"{sample_id}_gmm_clusters.tsv"
+    mahal_clusters_path = _resolve_path(
+        sample_dir, "gmm_clustering", f"{sample_id}_gmm_clusters.tsv"
+    )
     mahal_cluster_df = None
-    if mahal_clusters_path.exists():
+    if mahal_clusters_path is not None:
         mahal_cluster_df = pd.read_csv(mahal_clusters_path, sep="\t")
         # Rename so it doesn't collide with hgt_df.mahalanobis_dist (which is
         # genome-centroid distance, not cluster-centroid).
@@ -1148,17 +1230,18 @@ def load_sample_outputs(sample_dir: Path, sample_id: str) -> dict:
         })
 
     # CBI tables: one keyed against RP optimal codons, one against Mahal-cluster.
-    cbi_dir = sample_dir / "codon_tables"
+    cbi_rp_path = _resolve_path(sample_dir, "codon_tables", f"{sample_id}_cbi.tsv")
     cbi_rp_df = None
-    cbi_rp_path = cbi_dir / f"{sample_id}_cbi.tsv"
-    if cbi_rp_path.exists():
+    if cbi_rp_path is not None:
         cbi_rp_df = pd.read_csv(cbi_rp_path, sep="\t")[[COL_GENE, "cbi"]].rename(
             columns={"cbi": "cbi_rp"}
         )
 
+    cbi_mahal_path = _resolve_path(
+        sample_dir, "codon_tables", f"{sample_id}_gmm_cluster_cbi.tsv"
+    )
     cbi_mahal_df = None
-    cbi_mahal_path = cbi_dir / f"{sample_id}_gmm_cluster_cbi.tsv"
-    if cbi_mahal_path.exists():
+    if cbi_mahal_path is not None:
         cbi_mahal_df = pd.read_csv(cbi_mahal_path, sep="\t")[[COL_GENE, "cbi"]].rename(
             columns={"cbi": "cbi_mahal"}
         )
