@@ -15,8 +15,14 @@ from codonpipe.modules.gene_set import (
     _clr_transform,
     _drop_redundant_codon_per_family,
     _length_matched_indices,
+    _partition_enrichment_test,
     _percentile_rank,
+    PARTITION_BULK,
+    PARTITION_MAHAL_CLUSTER,
+    PARTITION_OUTLIER,
+    PARTITION_UNKNOWN,
     analyze_gene_set,
+    assign_gene_partition,
     load_sample_outputs,
     read_goi_file,
 )
@@ -407,6 +413,119 @@ class TestAnalyzeGeneSet:
         # different from random length-matched controls).
         row = aitch[aitch["reference"] == "genome"].iloc[0]
         assert row["obs_aitchison"] >= row["perm_mean"]
+
+
+# ── Three-way partition ──────────────────────────────────────────────────────
+
+
+class TestAssignGenePartition:
+    def test_priority_cluster_over_outlier(self):
+        df = pd.DataFrame({
+            "in_optimized_set": [True, True, False, False],
+            "hgt_flag_combined": [False, True, True, False],
+        })
+        out = assign_gene_partition(df)
+        # Cluster wins even when outlier flag is also True
+        assert list(out) == [
+            PARTITION_MAHAL_CLUSTER, PARTITION_MAHAL_CLUSTER,
+            PARTITION_OUTLIER, PARTITION_BULK,
+        ]
+
+    def test_missing_columns_returns_unknown(self):
+        df = pd.DataFrame({"some_col": [1, 2, 3]})
+        out = assign_gene_partition(df)
+        assert (out == PARTITION_UNKNOWN).all()
+
+    def test_only_cluster_column(self):
+        df = pd.DataFrame({"in_optimized_set": [True, False, False]})
+        out = assign_gene_partition(df)
+        assert list(out) == [PARTITION_MAHAL_CLUSTER, PARTITION_BULK, PARTITION_BULK]
+
+    def test_only_outlier_column(self):
+        df = pd.DataFrame({"hgt_flag_combined": [True, False, False]})
+        out = assign_gene_partition(df)
+        assert list(out) == [PARTITION_OUTLIER, PARTITION_BULK, PARTITION_BULK]
+
+    def test_nan_treated_as_false(self):
+        df = pd.DataFrame({
+            "in_optimized_set": [None, True, False],
+            "hgt_flag_combined": [True, None, False],
+        })
+        out = assign_gene_partition(df)
+        # row 0: NaN+True → outlier; row 1: True+NaN → cluster; row 2: bulk
+        assert list(out) == [PARTITION_OUTLIER, PARTITION_MAHAL_CLUSTER, PARTITION_BULK]
+
+
+class TestPartitionEnrichmentTest:
+    def test_balanced_partition_no_significance(self):
+        rng = np.random.default_rng(0)
+        n = 600
+        partition = pd.Series(rng.choice(
+            [PARTITION_MAHAL_CLUSTER, PARTITION_BULK, PARTITION_OUTLIER],
+            size=n, p=[0.25, 0.65, 0.10],
+        ))
+        in_goi = pd.Series(rng.random(n) < 0.10)  # 10% GOI rate
+        out = _partition_enrichment_test(partition, in_goi)
+        assert "category" in out.columns
+        assert (out["category"] == "OMNIBUS").any()
+        # Random GOIs vs background should NOT be heavily enriched
+        omnibus = out[out["category"] == "OMNIBUS"].iloc[0]
+        assert omnibus["fisher_p"] > 0.01
+
+    def test_enriched_in_cluster_detected(self):
+        # GOI all assigned to mahal_cluster, background mostly bulk
+        partition = pd.Series(
+            [PARTITION_MAHAL_CLUSTER] * 30 + [PARTITION_BULK] * 200 + [PARTITION_OUTLIER] * 10
+        )
+        in_goi = pd.Series([True] * 30 + [False] * 210)
+        out = _partition_enrichment_test(partition, in_goi)
+        omnibus = out[out["category"] == "OMNIBUS"].iloc[0]
+        assert omnibus["fisher_p"] < 0.001
+        cluster_row = out[out["category"] == PARTITION_MAHAL_CLUSTER].iloc[0]
+        assert cluster_row["frac_goi"] == pytest.approx(1.0)
+        assert cluster_row["p_adjusted"] < 0.001
+
+    def test_empty_input_returns_empty(self):
+        out = _partition_enrichment_test(pd.Series(dtype=object), pd.Series(dtype=bool))
+        assert out.empty
+
+
+class TestPartitionInOrchestrator:
+    def test_partition_file_emitted(self, tmp_path):
+        rscu = _make_rscu_gene_df(150)
+        enc = _make_enc_df(150)
+        mahal = _make_mahal_cluster_df(150)
+        hgt = _make_hgt_df(150)
+        out = analyze_gene_set(
+            rscu_gene_df=rscu, enc_df=enc,
+            goi_ids={f"locus_{i:04d}" for i in range(0, 25)},
+            output_dir=tmp_path, sample_id="part",
+            mahal_cluster_df=mahal, hgt_df=hgt,
+            n_permutations=99, make_figure=False,
+        )
+        assert "partition" in out
+        assert out["partition"].exists()
+        df = pd.read_csv(out["partition"], sep="\t")
+        cats = set(df["category"])
+        # OMNIBUS row plus at least the three category rows
+        assert "OMNIBUS" in cats
+        assert cats - {"OMNIBUS"} <= {PARTITION_MAHAL_CLUSTER, PARTITION_BULK, PARTITION_OUTLIER}
+
+    def test_summary_has_partition_column(self, tmp_path):
+        rscu = _make_rscu_gene_df(100)
+        enc = _make_enc_df(100)
+        mahal = _make_mahal_cluster_df(100)
+        out = analyze_gene_set(
+            rscu_gene_df=rscu, enc_df=enc,
+            goi_ids={f"locus_{i:04d}" for i in range(0, 15)},
+            output_dir=tmp_path, sample_id="part2",
+            mahal_cluster_df=mahal,
+            n_permutations=99, make_figure=False,
+        )
+        s = pd.read_csv(out["summary"], sep="\t")
+        assert "partition" in s.columns
+        # Every GOI must have a partition assignment
+        assert s["partition"].notna().all()
 
 
 # ── Loader / file IO ─────────────────────────────────────────────────────────
