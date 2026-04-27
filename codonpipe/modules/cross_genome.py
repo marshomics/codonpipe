@@ -71,6 +71,7 @@ def compute_gene_signature(
     mahal_cluster_df: pd.DataFrame | None = None,
     cbi_rp_df: pd.DataFrame | None = None,
     cbi_mahal_df: pd.DataFrame | None = None,
+    annotation_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Per-gene cross-genome-comparable feature table.
 
@@ -121,6 +122,10 @@ def compute_gene_signature(
                             "in_optimized_set"]),
         (cbi_rp_df, ["cbi_rp"]),
         (cbi_mahal_df, ["cbi_mahal"]),
+        # Functional annotations (KO, COG) — used by gene-level cross-genome
+        # clustering and per-category breakdowns. Merged in unchanged.
+        (annotation_df, ["KO", "KO_definition", "COG_ID", "COG_letter",
+                         "COG_category", "COG_NAME", "product"]),
     ):
         if df is None or df.empty:
             continue
@@ -347,6 +352,95 @@ def compute_genome_signature(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _load_gene_annotations(sample_dir: Path, sample_id: str) -> pd.DataFrame | None:
+    """Build a per-gene annotation DataFrame (KO + COG) from pipeline outputs.
+
+    Tries (in order):
+      1. expression/<sid>_expression_annotated.tsv (has KO + COG already merged)
+      2. kofamscan/<sid>_kofam_parsed.tsv + cogclassifier/cog_classify.tsv
+         merged separately
+
+    Returns a DataFrame keyed by 'gene' with whatever annotation columns
+    were available, or None if nothing was found. Handles both the
+    role-based pipeline layout and the legacy flat layout via
+    _resolve_path.
+    """
+    sample_dir = Path(sample_dir)
+
+    pieces: list[pd.DataFrame] = []
+
+    # 1. Pre-merged expression_annotated TSV (often has KO + KO_definition,
+    #    sometimes COG too depending on pipeline version). Use what's there.
+    expr_ann_path = _resolve_path(
+        sample_dir, "scores", f"{sample_id}_expression_annotated.tsv"
+    )
+    if expr_ann_path is None:
+        expr_ann_path = _resolve_path(
+            sample_dir, "expression", f"{sample_id}_expression_annotated.tsv"
+        )
+    if expr_ann_path is not None:
+        try:
+            df = pd.read_csv(expr_ann_path, sep="\t")
+            keep = [c for c in (
+                COL_GENE, "KO", "KO_definition", "COG_ID", "COG_letter",
+                "COG_category", "COG_NAME", "product",
+            ) if c in df.columns]
+            if COL_GENE in keep and len(keep) > 1:
+                pieces.append(df[keep].drop_duplicates(subset=[COL_GENE]))
+        except Exception as e:
+            logger.warning("Failed to read %s: %s", expr_ann_path, e)
+
+    # 2. Raw KofamScan output — merge if expression_annotated didn't already
+    #    cover KO (it normally does, but be defensive).
+    have_ko = pieces and "KO" in pieces[0].columns
+    if not have_ko:
+        kofam_path = _resolve_path(
+            sample_dir, "kofamscan", f"{sample_id}_kofam_parsed.tsv"
+        )
+        if kofam_path is not None:
+            try:
+                kf = pd.read_csv(kofam_path, sep="\t")
+                if "gene_name" in kf.columns:
+                    kf = kf.rename(columns={"gene_name": COL_GENE})
+                keep = [COL_GENE] + [c for c in ("KO", "KO_definition") if c in kf.columns]
+                if COL_GENE in kf.columns and len(keep) > 1:
+                    pieces.append(kf[keep].drop_duplicates(subset=[COL_GENE]))
+            except Exception as e:
+                logger.warning("Failed to read KofamScan output %s: %s", kofam_path, e)
+
+    # 3. COGclassifier output — always merge if expression_annotated didn't
+    #    already include COG_ID (production expression_annotated.tsv usually
+    #    has KO but not COG, so this branch is the typical path).
+    have_cog = any("COG_ID" in p.columns for p in pieces)
+    if not have_cog:
+        cog_path = _resolve_path(sample_dir, "cogclassifier", "cog_classify.tsv")
+        if cog_path is not None:
+            try:
+                cg = pd.read_csv(cog_path, sep="\t")
+                if "QUERY_ID" in cg.columns:
+                    cg = cg.rename(columns={"QUERY_ID": COL_GENE})
+                if "COG_LETTER" in cg.columns:
+                    cg = cg.rename(columns={"COG_LETTER": "COG_letter"})
+                if "COG_DESCRIPTION" in cg.columns:
+                    cg = cg.rename(columns={"COG_DESCRIPTION": "COG_category"})
+                keep = [COL_GENE] + [c for c in (
+                    "COG_ID", "COG_letter", "COG_category", "COG_NAME"
+                ) if c in cg.columns]
+                if COL_GENE in cg.columns and len(keep) > 1:
+                    pieces.append(cg[keep].drop_duplicates(subset=[COL_GENE]))
+            except Exception as e:
+                logger.warning("Failed to read COGclassifier output %s: %s", cog_path, e)
+
+    if not pieces:
+        return None
+
+    # Outer-merge so genes annotated by only one tool still get a row
+    out = pieces[0]
+    for p in pieces[1:]:
+        out = out.merge(p, on=COL_GENE, how="outer")
+    return out
+
+
 def write_signatures_for_sample(
     sample_dir: Path,
     sample_id: str,
@@ -373,6 +467,7 @@ def write_signatures_for_sample(
     trna_path = _resolve_path(sample_dir, "advanced", f"{sample_id}_trna_counts.tsv")
     trna_df = pd.read_csv(trna_path, sep="\t") if trna_path is not None else None
 
+    annotation_df = _load_gene_annotations(sample_dir, sample_id)
     gene_sig = compute_gene_signature(
         rscu_gene_df=loaded["rscu_gene_df"],
         rscu_genome=loaded["rscu_genome"],
@@ -385,6 +480,7 @@ def write_signatures_for_sample(
         mahal_cluster_df=loaded["mahal_cluster_df"],
         cbi_rp_df=loaded["cbi_rp_df"],
         cbi_mahal_df=loaded["cbi_mahal_df"],
+        annotation_df=annotation_df,
     )
     genome_sig = compute_genome_signature(
         sample_id=sample_id,
@@ -578,6 +674,319 @@ def cluster_corpus(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Per-cluster driver analysis
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _cliffs_delta_corpus(x: np.ndarray, y: np.ndarray) -> float:
+    nx, ny = len(x), len(y)
+    if nx == 0 or ny == 0:
+        return float("nan")
+    # Vectorised — n is bounded by corpus size (typically <10k) which is fine
+    diff = x[:, None] - y[None, :]
+    return float(((diff > 0).sum() - (diff < 0).sum()) / (nx * ny))
+
+
+def compute_corpus_cluster_drivers(
+    corpus_df: pd.DataFrame,
+    feature_cols: list[str],
+    cluster_labels: np.ndarray,
+    *,
+    skip_noise: bool = True,
+) -> pd.DataFrame:
+    """Per-cluster differential feature analysis: Mann-Whitney U + Cliff's delta.
+
+    For each (cluster, feature) pair, tests whether cluster members differ
+    from the rest of the corpus (excluding HDBSCAN noise points if
+    *skip_noise* is True). Reports BH-corrected p-values globally across
+    the full (cluster × feature) test panel.
+
+    Args:
+        corpus_df: Per-genome feature matrix (one row per genome).
+        feature_cols: Numeric feature columns to test.
+        cluster_labels: 1D array of cluster ids aligned to corpus_df rows
+            (-1 = HDBSCAN noise).
+        skip_noise: When True, noise (-1) points are excluded from both the
+            in-cluster and out-of-cluster sides of every test, so noise
+            doesn't dilute the comparison.
+
+    Returns:
+        DataFrame with: cluster_id, feature, n_in, n_out, median_in,
+        median_out, U_statistic, p_value, cliffs_delta, abs_effect,
+        p_adjusted, significant.
+        Sorted by (cluster_id ascending, abs_effect descending) so the
+        top drivers per cluster appear first.
+    """
+    from scipy import stats as sp_stats
+
+    if len(corpus_df) != len(cluster_labels):
+        raise ValueError("cluster_labels length doesn't match corpus_df")
+    if not feature_cols:
+        return pd.DataFrame()
+
+    arr_labels = np.asarray(cluster_labels)
+    valid_idx = arr_labels != -1 if skip_noise else np.ones(len(arr_labels), dtype=bool)
+    n_valid_clusters = len(set(arr_labels[valid_idx])) if valid_idx.any() else 0
+    if n_valid_clusters < 2:
+        return pd.DataFrame()
+
+    rows = []
+    sub_df = corpus_df.iloc[valid_idx].reset_index(drop=True) if skip_noise else corpus_df
+    sub_labels = arr_labels[valid_idx] if skip_noise else arr_labels
+
+    for cluster_id in sorted(set(sub_labels)):
+        in_mask = sub_labels == cluster_id
+        if in_mask.sum() < 3 or (~in_mask).sum() < 3:
+            continue
+        for feature in feature_cols:
+            if feature not in sub_df.columns:
+                continue
+            x = sub_df.loc[in_mask, feature].dropna().values
+            y = sub_df.loc[~in_mask, feature].dropna().values
+            if len(x) < 3 or len(y) < 3:
+                continue
+            try:
+                u, p = sp_stats.mannwhitneyu(x, y, alternative="two-sided")
+            except ValueError:
+                continue
+            d = _cliffs_delta_corpus(x, y)
+            rows.append({
+                "cluster_id": int(cluster_id),
+                "feature": feature,
+                "n_in": int(len(x)),
+                "n_out": int(len(y)),
+                "median_in": float(np.median(x)),
+                "median_out": float(np.median(y)),
+                "U_statistic": float(u),
+                "p_value": float(p),
+                "cliffs_delta": float(d),
+                "abs_effect": float(abs(d)),
+            })
+
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    out["p_adjusted"] = benjamini_hochberg(out["p_value"].values)
+    out["significant"] = out["p_adjusted"] < 0.05
+    return out.sort_values(
+        ["cluster_id", "abs_effect"], ascending=[True, False],
+    ).reset_index(drop=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gene-level cross-genome clustering
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _gene_feature_columns(gene_df: pd.DataFrame) -> list[str]:
+    """The CLR-Δ codon vector — what we cluster genes on across genomes."""
+    return [c for c in gene_df.columns if c.startswith("delta_clr_")]
+
+
+def cluster_corpus_genes(
+    gene_corpus_df: pd.DataFrame,
+    *,
+    use_umap: bool = True,
+    n_components: int = 2,
+    pca_components: int = 20,
+    hdbscan_min_cluster_size: int | None = None,
+    rng_seed: int = 42,
+    max_genes: int = 1_000_000,
+) -> dict:
+    """Cluster genes across the entire corpus by their CLR-Δ codon vector.
+
+    Standardize → PCA → (UMAP if installed, else PCA) → HDBSCAN with KMeans
+    fallback. Operates on the per-gene `delta_clr_*` vectors which are
+    cross-genome-comparable by construction (CLR removes per-AA-family sum
+    constraints; the gene-minus-genome-mean step removes mutational
+    background).
+
+    For corpora above *max_genes*, raises ValueError. Above ~500k genes the
+    PCA + HDBSCAN chain gets slow (minutes); above ~1M memory becomes the
+    bottleneck.
+
+    Returns dict with:
+        embedding         (n_genes, 2)
+        cluster           1D array of cluster labels (-1 = HDBSCAN noise)
+        feature_cols      columns used as features
+        method_dim        'umap' or 'pca'
+        method_cluster    'hdbscan' or 'kmeans'
+        pca_explained     variance fraction per PC
+    """
+    n = len(gene_corpus_df)
+    if n > max_genes:
+        raise ValueError(
+            f"Gene-level corpus has {n:,} genes (cap = {max_genes:,}). "
+            f"Pass max_genes=N to override, or subsample upstream."
+        )
+    if n < 4:
+        raise ValueError(f"Need at least 4 genes to cluster, got {n}")
+
+    feature_cols = _gene_feature_columns(gene_corpus_df)
+    if len(feature_cols) < 5:
+        raise ValueError(
+            f"Need at least 5 delta_clr_* feature columns; found {len(feature_cols)}. "
+            f"Did the gene_signature.tsv files include CLR-Δ vectors?"
+        )
+
+    X = gene_corpus_df[feature_cols].values
+    Xz = _robust_zscore(X)
+
+    from sklearn.decomposition import PCA
+    n_pcs = min(pca_components, Xz.shape[0] - 1, Xz.shape[1])
+    pca = PCA(n_components=n_pcs, random_state=rng_seed)
+    Xpca = pca.fit_transform(Xz)
+    pca_explained = pca.explained_variance_ratio_
+
+    method_dim = "pca"
+    if use_umap:
+        try:
+            import umap
+            n_neighbors = max(15, min(50, n // 100 if n > 1000 else 15))
+            reducer = umap.UMAP(
+                n_components=n_components, n_neighbors=n_neighbors,
+                min_dist=0.1, metric="euclidean", random_state=rng_seed,
+                low_memory=True,
+            )
+            embedding = reducer.fit_transform(Xpca)
+            method_dim = "umap"
+        except ImportError:
+            logger.warning("umap-learn not available; using first 2 PCs as embedding")
+            embedding = Xpca[:, :n_components]
+    else:
+        embedding = Xpca[:, :n_components]
+
+    if hdbscan_min_cluster_size is None:
+        # Heuristic: 0.1% of corpus, floor 10, cap 200
+        hdbscan_min_cluster_size = int(np.clip(round(n * 0.001), 10, 200))
+
+    method_cluster = "hdbscan"
+    try:
+        from sklearn.cluster import HDBSCAN
+        clusterer = HDBSCAN(
+            min_cluster_size=hdbscan_min_cluster_size, n_jobs=1,
+        )
+        labels = clusterer.fit_predict(Xpca)
+        # If HDBSCAN flagged everything as noise (uniformly-distributed clusters
+        # don't have density gradients it can latch onto), fall back to KMeans.
+        if (labels == -1).all():
+            logger.info(
+                "HDBSCAN flagged all %d genes as noise; falling back to KMeans for gene-level clustering",
+                n,
+            )
+            raise RuntimeError("hdbscan_all_noise")
+    except Exception as e:
+        if "hdbscan_all_noise" not in str(e):
+            logger.warning("HDBSCAN failed (%s); falling back to KMeans (k=10)", e)
+        from sklearn.cluster import KMeans
+        k = max(2, min(10, n // 50))
+        clusterer = KMeans(n_clusters=k, random_state=rng_seed, n_init="auto")
+        labels = clusterer.fit_predict(Xpca)
+        method_cluster = "kmeans"
+
+    return {
+        "embedding": embedding,
+        "cluster": labels,
+        "feature_cols": feature_cols,
+        "method_dim": method_dim,
+        "method_cluster": method_cluster,
+        "pca_explained": pca_explained,
+    }
+
+
+def cluster_corpus_genes_by_category(
+    gene_corpus_df: pd.DataFrame,
+    category_col: str,
+    *,
+    min_category_size: int = 10,
+    rng_seed: int = 42,
+) -> pd.DataFrame:
+    """Within-category gene clustering — does each KO/COG class split?
+
+    For each category in *category_col* with at least *min_category_size*
+    genes, clusters the within-category gene subset on its CLR-Δ codon
+    vectors. Uses HDBSCAN (or KMeans fallback) per category. Categories
+    with fewer than min_category_size genes are skipped.
+
+    Returns a long-format DataFrame:
+        category, sample_id, gene, sub_cluster, n_in_category,
+        embed_dim1, embed_dim2
+
+    Plus a sentinel summary row per category with sub_cluster = "_summary"
+    (unused — kept simple; one row per gene only).
+
+    A separate summary DataFrame can be built downstream from the
+    sub_cluster value_counts.
+    """
+    if category_col not in gene_corpus_df.columns:
+        logger.warning("Category column '%s' not in gene corpus; skipping per-category clustering", category_col)
+        return pd.DataFrame()
+
+    feature_cols = _gene_feature_columns(gene_corpus_df)
+    if len(feature_cols) < 5:
+        logger.warning("Too few delta_clr columns for per-category gene clustering")
+        return pd.DataFrame()
+
+    rows = []
+    cat_counts = gene_corpus_df[category_col].value_counts(dropna=True)
+    eligible = cat_counts[cat_counts >= min_category_size].index.tolist()
+    if not eligible:
+        logger.warning(
+            "No %s categories with >= %d genes; skipping per-category clustering",
+            category_col, min_category_size,
+        )
+        return pd.DataFrame()
+    logger.info(
+        "Per-category clustering on %s: %d categories with >= %d genes "
+        "(out of %d total non-null categories)",
+        category_col, len(eligible), min_category_size, len(cat_counts),
+    )
+
+    from sklearn.decomposition import PCA
+    from sklearn.cluster import HDBSCAN, KMeans
+
+    for cat in eligible:
+        sub = gene_corpus_df[gene_corpus_df[category_col] == cat].copy()
+        n = len(sub)
+        X = sub[feature_cols].values
+        Xz = _robust_zscore(X)
+        # PCA cap before HDBSCAN; helps for tiny categories where the raw
+        # 38-d space is sparse.
+        n_pcs = min(10, n - 1, Xz.shape[1])
+        pca = PCA(n_components=n_pcs, random_state=rng_seed)
+        Xpca = pca.fit_transform(Xz)
+
+        # 2D embedding for the table — PCA only at this scale (UMAP per
+        # category would explode in cost across hundreds of categories)
+        embed = Xpca[:, :2] if Xpca.shape[1] >= 2 else \
+            np.column_stack([Xpca[:, 0], np.zeros(n)])
+
+        # HDBSCAN with a min_cluster_size scaled to the category size
+        min_cs = max(3, min(int(np.sqrt(n)), 20))
+        try:
+            clusterer = HDBSCAN(min_cluster_size=min_cs, n_jobs=1)
+            labels = clusterer.fit_predict(Xpca)
+        except Exception:
+            k = max(2, min(5, n // 5))
+            clusterer = KMeans(n_clusters=k, random_state=rng_seed, n_init="auto")
+            labels = clusterer.fit_predict(Xpca)
+
+        for i, (_, r) in enumerate(sub.iterrows()):
+            rows.append({
+                "category_col": category_col,
+                "category": cat,
+                "n_in_category": n,
+                "sample_id": r.get("sample_id", ""),
+                COL_GENE: r.get(COL_GENE, ""),
+                "sub_cluster": int(labels[i]),
+                "embed_dim1": float(embed[i, 0]),
+                "embed_dim2": float(embed[i, 1]) if embed.shape[1] > 1 else 0.0,
+            })
+
+    return pd.DataFrame(rows)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Validation: Mantel test
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -687,10 +1096,15 @@ def build_corpus(
     features: str = "geometry",
     use_umap: bool = False,
     include_gene_level: bool = False,
+    gene_level_clustering: bool = False,
+    gene_level_by_category: str | None = None,
+    gene_level_min_category_size: int = 10,
+    gene_level_max_genes: int = 1_000_000,
     phylogeny_path: Path | None = None,
     metadata_path: Path | None = None,
     hdbscan_min_cluster_size: int | None = None,
     rng_seed: int = 42,
+    focus_genomes: list[str] | None = None,
 ) -> dict[str, Path]:
     """Concatenate per-genome signatures, cluster, and validate.
 
@@ -833,8 +1247,12 @@ def build_corpus(
         val_df.to_csv(val_path, sep="\t", index=False)
         out["corpus_validation"] = val_path
 
-    # Optional gene-level corpus (much larger; off by default)
-    if include_gene_level and gene_paths:
+    # Gene-level corpus + optional clustering / per-category analyses.
+    # Loaded if any of: --include-gene-level, --gene-level-clustering,
+    # --gene-level-by-category was requested.
+    need_gene_level = include_gene_level or gene_level_clustering or gene_level_by_category
+    gene_corpus = None
+    if need_gene_level and gene_paths:
         gene_corpus = pd.concat(
             [pd.read_csv(p, sep="\t") for p in gene_paths],
             ignore_index=True, sort=False,
@@ -845,12 +1263,238 @@ def build_corpus(
         logger.info("Wrote gene-level corpus: %d genes from %d genomes",
                     len(gene_corpus), gene_corpus["sample_id"].nunique())
 
-    # Render summary figure
+    # Gene-level cross-genome clustering
+    gene_cluster_result = None
+    if gene_level_clustering and gene_corpus is not None:
+        try:
+            gene_cluster_result = cluster_corpus_genes(
+                gene_corpus,
+                use_umap=use_umap,
+                hdbscan_min_cluster_size=None,  # heuristic per-corpus
+                rng_seed=rng_seed,
+                max_genes=gene_level_max_genes,
+            )
+            gc_df = pd.DataFrame({
+                COL_GENE: gene_corpus[COL_GENE].values
+                          if COL_GENE in gene_corpus.columns else range(len(gene_corpus)),
+                "sample_id": gene_corpus["sample_id"].values,
+                "cluster": gene_cluster_result["cluster"],
+                "embed_dim1": gene_cluster_result["embedding"][:, 0],
+                "embed_dim2": gene_cluster_result["embedding"][:, 1]
+                              if gene_cluster_result["embedding"].shape[1] > 1
+                              else np.zeros(len(gene_corpus)),
+            })
+            # Carry forward common annotation columns when present
+            for c in ("KO", "KO_definition", "COG_ID", "COG_letter", "COG_category"):
+                if c in gene_corpus.columns:
+                    gc_df[c] = gene_corpus[c].values
+            gc_path = output_dir / "corpus_gene_clusters.tsv"
+            gc_df.to_csv(gc_path, sep="\t", index=False)
+            out["corpus_gene_clusters"] = gc_path
+            n_clusters_found = len(set(gene_cluster_result["cluster"])) - (
+                1 if -1 in gene_cluster_result["cluster"] else 0
+            )
+            logger.info(
+                "Gene-level clustering: %d clusters from %d genes (%s + %s)",
+                n_clusters_found, len(gene_corpus),
+                gene_cluster_result["method_dim"], gene_cluster_result["method_cluster"],
+            )
+        except ValueError as e:
+            logger.warning("Gene-level clustering skipped: %s", e)
+
+    # Per-functional-category gene clustering
+    by_cat_df = None
+    if gene_level_by_category and gene_corpus is not None:
+        cat_col = gene_level_by_category
+        # Accept friendly names
+        if cat_col.upper() == "KO":
+            cat_col = "KO"
+        elif cat_col.upper() in ("COG", "COG_ID"):
+            cat_col = "COG_ID"
+        try:
+            by_cat_df = cluster_corpus_genes_by_category(
+                gene_corpus, cat_col,
+                min_category_size=gene_level_min_category_size,
+                rng_seed=rng_seed,
+            )
+            if not by_cat_df.empty:
+                bc_path = output_dir / f"corpus_gene_clusters_by_{cat_col}.tsv"
+                by_cat_df.to_csv(bc_path, sep="\t", index=False)
+                out[f"corpus_gene_clusters_by_{cat_col}"] = bc_path
+                # Build a per-category summary: how many sub-clusters did each get?
+                summary_rows = []
+                for cat, sub in by_cat_df.groupby("category"):
+                    non_noise = [c for c in sub["sub_cluster"].unique() if c != -1]
+                    summary_rows.append({
+                        "category": cat,
+                        "n_genes": int(sub["n_in_category"].iloc[0]),
+                        "n_subclusters": int(len(non_noise)),
+                        "n_noise_genes": int((sub["sub_cluster"] == -1).sum()),
+                        "splits": int(len(non_noise) >= 2),
+                    })
+                summ_df = pd.DataFrame(summary_rows).sort_values(
+                    ["splits", "n_subclusters", "n_genes"],
+                    ascending=[False, False, False],
+                )
+                bs_path = output_dir / f"corpus_gene_clusters_by_{cat_col}_summary.tsv"
+                summ_df.to_csv(bs_path, sep="\t", index=False)
+                out[f"corpus_gene_clusters_by_{cat_col}_summary"] = bs_path
+                logger.info(
+                    "Per-%s clustering: %d categories tested, %d showed >=2 sub-clusters",
+                    cat_col, len(summ_df), int(summ_df["splits"].sum()),
+                )
+        except Exception as e:
+            logger.warning("Per-category gene clustering failed: %s", e, exc_info=True)
+
+    # Cluster-driver analysis (per-cluster differential features)
+    drivers_df = compute_corpus_cluster_drivers(
+        corpus, feature_cols, cluster_result["cluster"], skip_noise=True,
+    )
+    if not drivers_df.empty:
+        drv_path = output_dir / "corpus_cluster_drivers.tsv"
+        drivers_df.to_csv(drv_path, sep="\t", index=False)
+        out["corpus_cluster_drivers"] = drv_path
+        n_sig = int(drivers_df["significant"].sum())
+        logger.info(
+            "Cluster drivers: %d / %d (cluster × feature) tests BH-significant; see %s",
+            n_sig, len(drivers_df), drv_path,
+        )
+
+    # Render the five corpus figures
     try:
-        fig_paths = _render_corpus_figure(corpus, cluster_df, cluster_result, output_dir)
-        out.update(fig_paths)
+        from codonpipe.modules._corpus_figures import (
+            render_multi_overlay_umap,
+            render_cluster_signature_heatmap,
+            render_cluster_drivers_forest,
+            render_mantel_stratified,
+            render_focus_genome_locator,
+        )
+
+        sample_ids = list(corpus["sample_id"].values)
+        embed = cluster_result["embedding"]
+        labels = cluster_result["cluster"]
+
+        # Build the overlay frame (corpus features + any joined metadata)
+        overlay_df = corpus.copy()
+        if metadata_path is not None and Path(metadata_path).exists():
+            meta = pd.read_csv(metadata_path, sep="\t")
+            if "sample_id" in meta.columns:
+                # Don't double-add columns that already exist in corpus
+                new_cols = [c for c in meta.columns if c not in corpus.columns or c == "sample_id"]
+                if len(new_cols) > 1:
+                    overlay_df = overlay_df.merge(
+                        meta[new_cols], on="sample_id", how="left",
+                    )
+
+        # 1. Multi-overlay UMAP grid
+        png, svg = render_multi_overlay_umap(
+            output_dir, embed, sample_ids, labels, overlay_df,
+            method_dim=cluster_result["method_dim"].upper(),
+            method_cluster=cluster_result["method_cluster"].upper(),
+        )
+        if png is not None:
+            out["multi_overlay_png"] = png
+            out["multi_overlay_svg"] = svg
+
+        # 2. Cluster signature heatmap (only meaningful when geometry block has CLR-Δ)
+        png, svg = render_cluster_signature_heatmap(
+            output_dir, corpus, labels, skip_noise=True,
+        )
+        if png is not None:
+            out["cluster_signature_png"] = png
+            out["cluster_signature_svg"] = svg
+
+        # 3. Per-cluster drivers forest plot
+        if not drivers_df.empty:
+            png, svg = render_cluster_drivers_forest(
+                output_dir, drivers_df, n_per_cluster=8, significant_only=True,
+            )
+            if png is not None:
+                out["cluster_drivers_png"] = png
+                out["cluster_drivers_svg"] = svg
+
+        # 4. Mantel-stratified scatter (when phylogeny was loaded)
+        if phylogeny_path is not None and Path(phylogeny_path).exists():
+            phylo_dist = read_phylogeny_distance_matrix(Path(phylogeny_path), sample_ids)
+            if phylo_dist is not None:
+                from scipy.spatial.distance import pdist as _pdist, squareform as _sq
+                X = corpus[feature_cols].values
+                Xz = _robust_zscore(X)
+                sig_dist = _sq(_pdist(Xz, metric="euclidean"))
+                # Pick a categorical metadata column for stratification
+                strat_col = None
+                if metadata_path is not None and Path(metadata_path).exists():
+                    meta_full = pd.read_csv(metadata_path, sep="\t")
+                    for candidate in ("phylum", "class", "order", "family", "habitat"):
+                        if candidate in meta_full.columns:
+                            strat_col = candidate
+                            meta_for_mantel = meta_full
+                            break
+                else:
+                    meta_for_mantel = None
+                png, svg = render_mantel_stratified(
+                    output_dir, sample_ids, sig_dist, phylo_dist,
+                    metadata_df=meta_for_mantel if strat_col else None,
+                    group_col=strat_col or "phylum",
+                )
+                if png is not None:
+                    out["mantel_scatter_png"] = png
+                    out["mantel_scatter_svg"] = svg
+
+        # 5b. Gene-level UMAP figure
+        if gene_cluster_result is not None and gene_corpus is not None:
+            try:
+                from codonpipe.modules._corpus_figures import render_gene_level_umap
+                # Build host-metadata lookup for overlays
+                host_meta = corpus[["sample_id"]].copy()
+                for hcol in ("median_gc3", "grodon2_doubling_time_h",
+                             "frac_in_optimized_set"):
+                    if hcol in corpus.columns:
+                        host_meta[hcol] = corpus[hcol].values
+                if metadata_path is not None and Path(metadata_path).exists():
+                    meta_full = pd.read_csv(metadata_path, sep="\t")
+                    if "sample_id" in meta_full.columns:
+                        for hcol in ("phylum", "class", "habitat"):
+                            if hcol in meta_full.columns:
+                                host_meta = host_meta.merge(
+                                    meta_full[["sample_id", hcol]],
+                                    on="sample_id", how="left",
+                                )
+                png, svg = render_gene_level_umap(
+                    output_dir, gene_corpus, gene_cluster_result, host_meta,
+                )
+                if png is not None:
+                    out["gene_level_umap_png"] = png
+                    out["gene_level_umap_svg"] = svg
+            except Exception as e:
+                logger.warning("Gene-level UMAP figure failed: %s", e, exc_info=True)
+
+        # 5c. Per-category diversity figure
+        if by_cat_df is not None and not by_cat_df.empty:
+            try:
+                from codonpipe.modules._corpus_figures import render_category_diversity
+                png, svg = render_category_diversity(
+                    output_dir, by_cat_df,
+                )
+                if png is not None:
+                    out["category_diversity_png"] = png
+                    out["category_diversity_svg"] = svg
+            except Exception as e:
+                logger.warning("Category-diversity figure failed: %s", e, exc_info=True)
+
+        # 6. Focus-genome locators
+        if focus_genomes:
+            for focus_id in focus_genomes:
+                png, svg = render_focus_genome_locator(
+                    output_dir, focus_id, embed, sample_ids, labels, corpus,
+                    method_dim=cluster_result["method_dim"].upper(),
+                )
+                if png is not None:
+                    safe = focus_id.replace("/", "_").replace(" ", "_")
+                    out[f"focus_{safe}_png"] = png
+                    out[f"focus_{safe}_svg"] = svg
     except Exception as e:
-        logger.warning("Corpus figure rendering failed: %s", e)
+        logger.warning("Corpus figure rendering failed: %s", e, exc_info=True)
 
     logger.info("Corpus build complete. Outputs:")
     for k, v in out.items():
@@ -859,7 +1503,10 @@ def build_corpus(
 
 
 def _render_corpus_figure(corpus_df, cluster_df, cluster_result, output_dir) -> dict[str, Path]:
-    """3-panel corpus figure: dim-reduction scatter + per-cluster scalar boxplots + PCA scree."""
+    """DEPRECATED. Kept for backward-compat; build_corpus now calls the
+    five-figure renderers in _corpus_figures.py instead. This function
+    still produces the original 3-panel summary figure if invoked directly.
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
