@@ -638,7 +638,9 @@ def between_condition_tests(
                 metrics_df.loc[metrics_df[condition_col] == c, metric].dropna()
                 for c in conditions
             ]
-            groups = [g for g in groups if len(g) >= 3]
+            # Project-wide minimum: n>=5 per group (matches
+            # statistics.pairwise_wilcoxon and the README).
+            groups = [g for g in groups if len(g) >= 5]
             if len(groups) < 3:
                 continue
             try:
@@ -661,7 +663,9 @@ def between_condition_tests(
         for g1, g2 in itertools.combinations(conditions, 2):
             vals1 = metrics_df.loc[metrics_df[condition_col] == g1, metric].dropna()
             vals2 = metrics_df.loc[metrics_df[condition_col] == g2, metric].dropna()
-            if len(vals1) < 3 or len(vals2) < 3:
+            # n>=5 per group is the project-wide minimum (see
+            # statistics.pairwise_wilcoxon); enforced consistently here.
+            if len(vals1) < 5 or len(vals2) < 5:
                 continue
             try:
                 stat, p_val = sp_stats.mannwhitneyu(vals1, vals2, alternative="two-sided")
@@ -792,7 +796,8 @@ def between_condition_rscu_tests(
         for g1, g2 in itertools.combinations(conditions, 2):
             vals1 = metrics_df.loc[metrics_df[condition_col] == g1, codon].dropna()
             vals2 = metrics_df.loc[metrics_df[condition_col] == g2, codon].dropna()
-            if len(vals1) < 3 or len(vals2) < 3:
+            # n>=5 per group: project-wide minimum, matches the README.
+            if len(vals1) < 5 or len(vals2) < 5:
                 continue
             try:
                 stat, p_val = sp_stats.mannwhitneyu(vals1, vals2, alternative="two-sided")
@@ -822,11 +827,12 @@ def between_condition_rscu_tests(
 
     result = pd.DataFrame(rows)
 
-    # BH FDR per comparison pair
-    result["corrected_p"] = np.nan
-    for (g1, g2), grp in result.groupby(["group1", "group2"]):
-        idx = grp.index
-        result.loc[idx, "corrected_p"] = benjamini_hochberg(grp["p_value"].values)
+    # BH FDR globally across (codon × pair) combinations. Earlier versions
+    # corrected per (group1, group2) pair, which under-counted the
+    # multiple-testing burden by C(C-1)/2 when C conditions were compared.
+    # The unit of inference is "is any (codon, pair) combination significant?",
+    # so the family of tests is the full result table.
+    result["corrected_p"] = benjamini_hochberg(result["p_value"].values)
 
     result["significant"] = result["corrected_p"] < 0.05
     return result
@@ -837,11 +843,19 @@ def permanova_rscu(
     condition_col: str = "condition",
     n_perm: int = 999,
 ) -> dict:
-    """PERMANOVA on Euclidean distances of genome-level RSCU profiles.
+    """PERMANOVA on Aitchison distances of genome-level RSCU profiles.
+
+    RSCU is compositional: codon frequencies sum to a constant within each
+    amino acid family. Raw Euclidean distance ignores that constraint and is
+    sensitive to total magnitude. We instead apply a centered log-ratio (CLR)
+    transform first, then take Euclidean distance — the standard Aitchison
+    distance for compositional data (Aitchison 1986; Anderson 2001 for the
+    PERMANOVA framework). This matches the CLR default used by
+    compute_zscore_normalization elsewhere in the module.
 
     Tests whether RSCU composition differs significantly between conditions.
 
-    Returns dict with F_statistic, p_value, R2, n_perm.
+    Returns dict with F_statistic, p_value, R2, n_perm, distance ("aitchison").
     """
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in metrics_df.columns]
     if not rscu_cols or condition_col not in metrics_df.columns:
@@ -862,8 +876,18 @@ def permanova_rscu(
     if len(np.unique(conditions)) < 2:
         return {}
 
-    dist_matrix = squareform(pdist(X, metric="euclidean"))
-    n = len(X)
+    # CLR transform before pdist. RSCU values are non-negative; replace zeros
+    # with a small pseudocount so log() is finite. The pseudocount must be
+    # smaller than typical RSCU resolution (~0.01) but well above float
+    # precision; 1e-6 is the same value used in compute_zscore_normalization.
+    pseudocount = 1e-6
+    X_pos = np.where(X <= 0, pseudocount, X)
+    log_X = np.log(X_pos)
+    geo_means = log_X.mean(axis=1, keepdims=True)
+    X_clr = log_X - geo_means
+
+    dist_matrix = squareform(pdist(X_clr, metric="euclidean"))
+    n = len(X_clr)
 
     # Observed F
     f_obs = _permanova_f(dist_matrix, conditions)
@@ -901,6 +925,7 @@ def permanova_rscu(
         "n_perm": n_perm,
         "n_samples": n,
         "n_groups": len(groups),
+        "distance": "aitchison",
     }
 
 
@@ -1003,7 +1028,12 @@ def between_condition_expression_class_rscu(
         for g1, g2 in itertools.combinations(cond_list, 2):
             v1 = metrics_df.loc[metrics_df[condition_col] == g1, col].dropna()
             v2 = metrics_df.loc[metrics_df[condition_col] == g2, col].dropna()
-            if len(v1) < 3 or len(v2) < 3:
+            # Require n>=5 per group to match the project-wide minimum sample
+            # size (statistics.pairwise_wilcoxon) and the README. With n=3 vs
+            # n=3 the smallest possible two-sided exact p-value is ~0.1, so the
+            # test contributes only noise to the FDR pool; n=5 vs n=5 gives a
+            # floor of ~0.008.
+            if len(v1) < 5 or len(v2) < 5:
                 continue
             try:
                 stat, p_val = sp_stats.mannwhitneyu(v1, v2, alternative="two-sided")
@@ -1259,9 +1289,9 @@ def between_condition_strand_asymmetry_patterns(
                 if not match.empty:
                     cond_vals[sid_cond[sid]].append(match.iloc[0])
 
-            # Need ≥3 samples per condition
+            # n>=5 per group: project-wide minimum, matches the README.
             groups = [np.array(cond_vals[c]) for c in cond_list]
-            groups = [g for g in groups if len(g) >= 3]
+            groups = [g for g in groups if len(g) >= 5]
             if len(groups) < 3:
                 continue
 
@@ -1290,7 +1320,8 @@ def between_condition_strand_asymmetry_patterns(
         for g1, g2 in itertools.combinations(cond_list, 2):
             v1 = np.array(cond_vals[g1])
             v2 = np.array(cond_vals[g2])
-            if len(v1) < 3 or len(v2) < 3:
+            # n>=5 per group: project-wide minimum, matches the README.
+            if len(v1) < 5 or len(v2) < 5:
                 continue
             try:
                 stat, p_val = sp_stats.mannwhitneyu(v1, v2, alternative="two-sided")
