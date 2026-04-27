@@ -563,6 +563,69 @@ class TestLoadSampleOutputs:
             assert k in loaded
             assert loaded[k] is None
 
+    def test_role_based_layout(self, tmp_path):
+        """Production CodonPipe nests rscu/ under codon_usage/, etc."""
+        sample_dir = tmp_path / "sample_role"
+        # Create the nested structure used by current pipeline
+        rscu_dir = sample_dir / "codon_usage" / "rscu"
+        rscu_dir.mkdir(parents=True)
+        cu_stat_dir = sample_dir / "codon_usage" / "cu_statistics"
+        cu_stat_dir.mkdir(parents=True)
+        bio_dir = sample_dir / "comparative" / "bio_ecology"
+        bio_dir.mkdir(parents=True)
+        gmm_dir = sample_dir / "expression" / "gmm_clustering"
+        gmm_dir.mkdir(parents=True)
+        expr_dir = sample_dir / "expression" / "scores"
+        expr_dir.mkdir(parents=True)
+        codon_tables_dir = sample_dir / "codon_usage" / "codon_tables"
+        codon_tables_dir.mkdir(parents=True)
+
+        rscu = _make_rscu_gene_df(20)
+        enc = _make_enc_df(20)
+        rscu.to_csv(rscu_dir / "S_rscu_all_genes.tsv", sep="\t", index=False)
+        enc.to_csv(rscu_dir / "S_enc.tsv", sep="\t", index=False)
+
+        # Optional files placed in their role-based locations
+        expr = _make_expr_df(20)
+        expr.to_csv(expr_dir / "S_expression.tsv", sep="\t", index=False)
+        mahal = _make_mahal_cluster_df(20).rename(
+            columns={"mahal_cluster_distance": "mahalanobis_distance"}
+        )
+        mahal.to_csv(gmm_dir / "S_gmm_clusters.tsv", sep="\t", index=False)
+        hgt = _make_hgt_df(20)
+        hgt.to_csv(bio_dir / "S_hgt_candidates.tsv", sep="\t", index=False)
+
+        loaded = load_sample_outputs(sample_dir, "S")
+        assert loaded["rscu_gene_df"].shape[0] == 20
+        assert loaded["enc_df"].shape[0] == 20
+        assert loaded["expr_df"] is not None
+        assert loaded["expr_df"].shape[0] == 20
+        assert loaded["hgt_df"] is not None
+        assert loaded["mahal_cluster_df"] is not None
+        assert "mahal_cluster_distance" in loaded["mahal_cluster_df"].columns
+
+    def test_legacy_flat_layout(self, tmp_path):
+        """Demo / older runs used a flat sample_dir/rscu/ layout."""
+        sample_dir = tmp_path / "sample_flat"
+        rscu_dir = sample_dir / "rscu"
+        rscu_dir.mkdir(parents=True)
+        rscu = _make_rscu_gene_df(20)
+        enc = _make_enc_df(20)
+        rscu.to_csv(rscu_dir / "S_rscu_all_genes.tsv", sep="\t", index=False)
+        enc.to_csv(rscu_dir / "S_enc.tsv", sep="\t", index=False)
+        loaded = load_sample_outputs(sample_dir, "S")
+        assert loaded["rscu_gene_df"].shape[0] == 20
+
+    def test_error_message_lists_attempted_paths(self, tmp_path):
+        """When inputs are missing, the error message must show both candidate paths."""
+        with pytest.raises(FileNotFoundError) as excinfo:
+            load_sample_outputs(tmp_path, "missing_sample")
+        msg = str(excinfo.value)
+        # Must mention both layouts so the user can debug
+        assert "codon_usage/rscu/" in msg
+        assert "/rscu/" in msg
+        assert "missing_sample_rscu_all_genes.tsv" in msg
+
     def test_loads_mahal_cluster_files(self, tmp_path):
         sample_dir = tmp_path / "sample"
         (sample_dir / "rscu").mkdir(parents=True)
@@ -605,5 +668,5 @@ class TestLoadSampleOutputs:
         assert "cbi_mahal" in loaded["cbi_mahal_df"].columns
 
     def test_missing_required_files_raises(self, tmp_path):
-        with pytest.raises(FileNotFoundError, match="Required files"):
+        with pytest.raises(FileNotFoundError, match="Required CodonPipe outputs"):
             load_sample_outputs(tmp_path, "nope")
