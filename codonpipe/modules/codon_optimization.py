@@ -61,9 +61,13 @@ from codonpipe.modules.gene_set import (
 )
 from codonpipe.utils.codon_tables import (
     AA_CODON_GROUPS_RSCU,
+    CODON_TABLE_11,
     COL_GENE,
+    MIN_GENE_LENGTH,
     RSCU_COL_TO_CODON,
     RSCU_COLUMN_NAMES,
+    codon_to_col_name,
+    dna_to_rna,
 )
 
 logger = logging.getLogger("codonpipe")
@@ -367,6 +371,209 @@ def compute_per_gene_gain(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Mahal vs genome-mean comparison (analogous to Mahal vs RP)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def compute_optimization_summary_vs_genome(
+    table: pd.DataFrame,
+) -> pd.DataFrame:
+    """Per-AA-family agreement between genome-most-frequent and Mahal-optimal codon.
+
+    Same shape as compute_optimization_summary, but the comparison anchor is
+    the genome-mean RSCU instead of the RP-derived RSCU. Useful when the
+    user wants to know "how much is Mahal-style optimization actually
+    moving me away from a naive 'just match the genome' baseline?".
+
+    Returns one row per AA family with:
+        family, amino_acid, n_codons,
+        genome_optimal_codon, mahal_optimal_codon,
+        agree (bool),
+        max_codon_w_shift_vs_genome
+    where the "w" used to identify each frame's optimal codon is computed
+    as (RSCU_codon / max_RSCU_in_family) within that frame.
+    """
+    if table is None or table.empty:
+        return pd.DataFrame()
+
+    # Genome-derived w values per codon (same construction as rp_w / mahal_w)
+    rows = []
+    for family, sub in table.groupby("family"):
+        # Compute genome-w within this family
+        g_max = float(sub["genome_rscu"].max(skipna=True))
+        if g_max <= 0 or np.isnan(g_max):
+            genome_w = pd.Series(np.nan, index=sub.index)
+        else:
+            genome_w = sub["genome_rscu"] / g_max
+
+        # Optimal codons under each frame
+        g_opt_idx = sub["genome_rscu"].idxmax(skipna=True) if sub["genome_rscu"].notna().any() else None
+        m_opt_codons = sub.loc[sub["mahal_optimal"], "codon"].tolist()
+        m_opt = m_opt_codons[0] if m_opt_codons else None
+        g_opt = sub.loc[g_opt_idx, "codon"] if g_opt_idx is not None else None
+
+        agree = bool(m_opt == g_opt) if (m_opt and g_opt) else False
+        # Max within-family |Δw| between genome and Mahal frames
+        m_w = sub["mahal_w"].fillna(np.nan)
+        delta_w_vs_genome = (m_w - genome_w).abs()
+        max_shift = float(delta_w_vs_genome.max(skipna=True))
+
+        rows.append({
+            "family": family,
+            "amino_acid": sub["amino_acid"].iloc[0],
+            "n_codons": int(len(sub)),
+            "genome_optimal_codon": g_opt,
+            "mahal_optimal_codon": m_opt,
+            "agree": agree,
+            "max_codon_w_shift_vs_genome": max_shift,
+        })
+    out = pd.DataFrame(rows)
+    return out.sort_values(
+        ["agree", "max_codon_w_shift_vs_genome"], ascending=[True, False],
+    ).reset_index(drop=True)
+
+
+def build_recommendation_table_vs_genome(
+    summary: pd.DataFrame,
+    table: pd.DataFrame,
+) -> pd.DataFrame:
+    """Synthesis-recommendation table using genome-mean as the comparison anchor.
+
+    Same schema as build_recommendation_table but compares Mahal-optimal
+    against the genome-most-frequent codon instead of the RP-optimal codon.
+    """
+    if summary.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, r in summary.iterrows():
+        family = r["family"]
+        g_opt = r["genome_optimal_codon"]
+        m_opt = r["mahal_optimal_codon"]
+        rec = m_opt if pd.notna(m_opt) else g_opt
+        alt = g_opt if g_opt != m_opt else None
+        if not r["agree"]:
+            rationale = (
+                f"Mahal-optimal '{m_opt}' differs from genome-most-frequent '{g_opt}'"
+            )
+            confidence = (
+                "high" if r["max_codon_w_shift_vs_genome"] >= 0.5 else
+                "medium" if r["max_codon_w_shift_vs_genome"] >= 0.2 else
+                "low"
+            )
+        else:
+            rationale = "Mahal-optimal matches genome-most-frequent"
+            confidence = "high"
+
+        # Pull the per-codon w-values at the recommended codon
+        g_w_at_rec = float("nan")
+        m_w_at_rec = float("nan")
+        if pd.notna(rec):
+            sub = table[(table["family"] == family) & (table["codon"] == rec)]
+            if not sub.empty:
+                # Recompute genome_w for this row inline — table doesn't carry it
+                fam_sub = table[table["family"] == family]
+                g_max = float(fam_sub["genome_rscu"].max(skipna=True))
+                if g_max > 0:
+                    g_w_at_rec = float(sub.iloc[0]["genome_rscu"] / g_max)
+                m_w_at_rec = float(sub.iloc[0]["mahal_w"])
+
+        rows.append({
+            "amino_acid": r["amino_acid"],
+            "family": family,
+            "recommended_codon": rec,
+            "alternative_codon": alt,
+            "rationale": rationale,
+            "genome_w_at_recommendation": g_w_at_rec,
+            "mahal_w_at_recommendation": m_w_at_rec,
+            "confidence": confidence,
+        })
+    return pd.DataFrame(rows)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-gene CAI under all three reference frames
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def compute_per_gene_three_way_cai(
+    ffn_path: Path,
+    rscu_genome: dict[str, float],
+    rscu_rp: dict[str, float],
+    rscu_mahal: dict[str, float],
+    *,
+    min_length: int = MIN_GENE_LENGTH,
+    pseudocount: float = 1e-3,
+) -> pd.DataFrame:
+    """Per-gene CAI under three reference frames + pairwise gains.
+
+    For each gene in the .ffn file, computes three CAIs by counting codons
+    and summing log(w[codon]) weighted by codon count, where w-values are
+    derived from each frame's RSCU profile via the standard per-AA
+    relative-adaptiveness formula.
+
+    Returns DataFrame:
+        gene, n_codons, cai_genome, cai_rp, cai_mahal,
+        gain_mahal_vs_genome, gain_mahal_vs_rp, gain_rp_vs_genome
+    """
+    from Bio import SeqIO
+    from collections import Counter as _Counter
+
+    w_genome = _w_values_per_family(rscu_genome) if rscu_genome else {}
+    w_rp = _w_values_per_family(rscu_rp) if rscu_rp else {}
+    w_mahal = _w_values_per_family(rscu_mahal) if rscu_mahal else {}
+
+    def _gene_cai(counts: dict[str, int], w_dict: dict[str, float]) -> float:
+        log_sum = 0.0
+        n = 0
+        for codon, c in counts.items():
+            aa = CODON_TABLE_11.get(codon)
+            if aa in (None, "*", "Met", "Trp"):
+                continue
+            col = codon_to_col_name(codon, aa)
+            w = w_dict.get(col, np.nan)
+            if np.isnan(w):
+                continue
+            # Floor at pseudocount so log doesn't explode for never-used codons
+            w_eff = max(w, pseudocount)
+            log_sum += c * np.log(w_eff)
+            n += c
+        if n == 0:
+            return float("nan")
+        return float(np.exp(log_sum / n))
+
+    rows = []
+    for rec in SeqIO.parse(str(ffn_path), "fasta"):
+        seq = str(rec.seq)
+        if len(seq) < min_length:
+            continue
+        rna = dna_to_rna(seq)
+        counts: dict[str, int] = _Counter()
+        for i in range(0, len(rna) - 2, 3):
+            codon = rna[i:i + 3]
+            if codon in CODON_TABLE_11:
+                counts[codon] += 1
+        if not counts:
+            continue
+        cai_g = _gene_cai(counts, w_genome) if w_genome else float("nan")
+        cai_r = _gene_cai(counts, w_rp) if w_rp else float("nan")
+        cai_m = _gene_cai(counts, w_mahal) if w_mahal else float("nan")
+        rows.append({
+            COL_GENE: rec.id,
+            "n_codons": int(sum(counts.values())),
+            "cai_genome": cai_g,
+            "cai_rp": cai_r,
+            "cai_mahal": cai_m,
+        })
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["gain_mahal_vs_genome"] = df["cai_mahal"] - df["cai_genome"]
+    df["gain_mahal_vs_rp"] = df["cai_mahal"] - df["cai_rp"]
+    df["gain_rp_vs_genome"] = df["cai_rp"] - df["cai_genome"]
+    return df
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Orchestrator
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -429,11 +636,29 @@ def run_codon_optimization(
             top_line["median_abs_delta_w"], top_line["max_abs_delta_w"],
         )
 
-    # 3. Synthesis-ready recommendations
+    # 3. Synthesis-ready recommendations (RP-vs-Mahal anchor)
     rec = build_recommendation_table(summary, table)
     rec_path = output_dir / f"{sample_id}_codon_optimization_recommend.tsv"
     rec.to_csv(rec_path, sep="\t", index=False)
     out["recommendation"] = rec_path
+
+    # 3b. Mahal-vs-genome comparison (parallel set of TSVs)
+    summary_g = compute_optimization_summary_vs_genome(table)
+    if not summary_g.empty:
+        sg_path = output_dir / f"{sample_id}_codon_optimization_summary_vs_genome.tsv"
+        summary_g.to_csv(sg_path, sep="\t", index=False)
+        out["summary_vs_genome"] = sg_path
+        n_disagree = int((~summary_g["agree"]).sum())
+        logger.info(
+            "Mahal vs genome summary: %d/%d AA families agree on the optimal codon; "
+            "max within-family Δw vs genome = %.3f",
+            len(summary_g) - n_disagree, len(summary_g),
+            float(summary_g["max_codon_w_shift_vs_genome"].max(skipna=True)),
+        )
+        rec_g = build_recommendation_table_vs_genome(summary_g, table)
+        rg_path = output_dir / f"{sample_id}_codon_optimization_recommend_vs_genome.tsv"
+        rec_g.to_csv(rg_path, sep="\t", index=False)
+        out["recommendation_vs_genome"] = rg_path
 
     # 4. Per-gene gain (cbi_mahal − cbi_rp) when both CBI tables are available
     cbi_rp_df = loaded.get("cbi_rp_df")
@@ -447,13 +672,55 @@ def run_codon_optimization(
             gain.to_csv(gain_path, sep="\t", index=False)
             out["gain"] = gain_path
 
+    # 4b. Three-way per-gene CAI from .ffn (genome / RP / Mahal w-tables).
+    # Yields cai_genome (no pre-computed analog in the pipeline) so we can
+    # quantify gain_mahal_vs_genome alongside gain_mahal_vs_rp.
+    ffn_path = _resolve_path(sample_dir, "prokka", f"{sample_id}.ffn")
+    three_way_cai = pd.DataFrame()
+    if ffn_path is not None:
+        try:
+            three_way_cai = compute_per_gene_three_way_cai(
+                ffn_path, rscu_genome, rscu_rp, rscu_mahal,
+            )
+            if not three_way_cai.empty:
+                # Carry forward Mahal cluster context where available
+                mahal_df = loaded.get("mahal_cluster_df")
+                if mahal_df is not None and not mahal_df.empty:
+                    keep = [c for c in (
+                        COL_GENE, "in_optimized_set", "membership_score",
+                        "mahal_cluster_distance",
+                    ) if c in mahal_df.columns]
+                    if keep:
+                        three_way_cai = three_way_cai.merge(
+                            mahal_df[keep], on=COL_GENE, how="left",
+                        )
+                three_path = output_dir / f"{sample_id}_codon_optimization_three_way_cai.tsv"
+                three_way_cai.to_csv(three_path, sep="\t", index=False)
+                out["three_way_cai"] = three_path
+                logger.info(
+                    "Three-way per-gene CAI computed: median gain_mahal_vs_genome = %+.4f, "
+                    "median gain_mahal_vs_rp = %+.4f (n=%d genes)",
+                    float(three_way_cai["gain_mahal_vs_genome"].median(skipna=True)),
+                    float(three_way_cai["gain_mahal_vs_rp"].median(skipna=True)),
+                    len(three_way_cai),
+                )
+        except Exception as e:
+            logger.warning("Three-way per-gene CAI failed: %s", e, exc_info=True)
+    else:
+        logger.info(
+            "Prokka .ffn not found; skipping three-way per-gene CAI. "
+            "Mahal-vs-genome gain figure will be skipped."
+        )
+
     # 5. Figures
     if make_figures:
         try:
             from codonpipe.modules._codon_optimization_figures import (
                 render_three_way_rscu,
                 render_optimization_agreement,
+                render_optimization_agreement_vs_genome,
                 render_optimization_gain,
+                render_optimization_gain_vs_genome,
             )
             png, svg = render_three_way_rscu(
                 output_dir, sample_id, table, summary,
@@ -469,6 +736,16 @@ def run_codon_optimization(
                 out["agreement_png"] = png
                 out["agreement_svg"] = svg
 
+            # Mahal-vs-genome agreement table (analogous to the RP version)
+            if "summary_vs_genome" in out:
+                summary_g = pd.read_csv(out["summary_vs_genome"], sep="\t")
+                png, svg = render_optimization_agreement_vs_genome(
+                    output_dir, sample_id, summary_g, table,
+                )
+                if png is not None:
+                    out["agreement_vs_genome_png"] = png
+                    out["agreement_vs_genome_svg"] = svg
+
             if "gain" in out:
                 gain_df = pd.read_csv(out["gain"], sep="\t")
                 png, svg = render_optimization_gain(
@@ -477,6 +754,15 @@ def run_codon_optimization(
                 if png is not None:
                     out["gain_png"] = png
                     out["gain_svg"] = svg
+
+            # Mahal-vs-genome per-gene gain figure (uses three_way_cai)
+            if not three_way_cai.empty:
+                png, svg = render_optimization_gain_vs_genome(
+                    output_dir, sample_id, three_way_cai,
+                )
+                if png is not None:
+                    out["gain_vs_genome_png"] = png
+                    out["gain_vs_genome_svg"] = svg
         except Exception as e:
             logger.warning("Codon-optimization figure rendering failed: %s",
                            e, exc_info=True)
