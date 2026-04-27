@@ -348,6 +348,106 @@ def batch(
         sys.exit(1)
 
 
+@main.command("gene-set")
+@click.argument("sample_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--goi-file", required=True,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="File listing GOI Prokka locus tags, one per line. "
+                   "Lines starting with '#' are treated as comments. "
+                   "Trailing whitespace-delimited tokens after the locus tag are ignored.")
+@click.option("-s", "--sample-id", default=None,
+              help="Sample identifier. Defaults to the directory name.")
+@click.option("-o", "--output-dir", "output_dir", default=None,
+              type=click.Path(path_type=Path),
+              help="Output directory. Defaults to <SAMPLE_DIR>/gene_set/.")
+@click.option("--n-permutations", default=999, type=int, show_default=True,
+              help="Permutation count for Aitchison and HGT-flag tests.")
+@click.option("--no-length-matching", is_flag=True,
+              help="Disable length-matched permutation null (uniform random instead). "
+                   "Length matching is recommended; disable only for sensitivity analysis.")
+@click.option("--no-figure", is_flag=True,
+              help="Skip the six-panel summary figure.")
+@click.option("--rng-seed", default=42, type=int, show_default=True,
+              help="Random seed for permutation tests and bootstrap CIs.")
+@click.option("-v", "--verbose", is_flag=True, help="Debug-level logging.")
+def gene_set_cmd(
+    sample_dir: Path,
+    goi_file: Path,
+    sample_id: str | None,
+    output_dir: Path | None,
+    n_permutations: int,
+    no_length_matching: bool,
+    no_figure: bool,
+    rng_seed: int,
+    verbose: bool,
+):
+    """Compare a shortlist of genes-of-interest to the rest of the genome.
+
+    Takes the per-sample output directory produced by `codonpipe run` (or
+    `codonpipe batch`) and a GOI list of Prokka locus tags. Reports:
+
+    \b
+      - per-GOI metrics with within-genome percentile ranks
+      - Mann-Whitney + Cliff's delta on each scalar metric (CAI, MELP,
+        Fop, ENC, ENCprime, MILC, GC3, mahalanobis_dist,
+        mahal_cluster_distance, membership_score, cbi_rp, cbi_mahal)
+      - per-codon RSCU comparison vs genome / RP / Mahal-cluster references
+      - Aitchison-distance permutation test with length-matched controls
+      - one-sided HGT-flag enrichment (if hgt_candidates.tsv is present)
+      - two-sided Mahal-cluster membership-rate permutation test
+        (if gmm_clusters.tsv is present)
+      - a seven-panel summary figure (PNG + SVG) including a
+        genome-centroid vs cluster-centroid Mahalanobis biplot
+
+    Example:
+
+    \b
+        codonpipe gene-set output_run/G0370_i3 \\
+            --goi-file my_goi.txt \\
+            -o output_run/G0370_i3/gene_set/
+    """
+    logger = setup_logger(verbose=verbose)
+
+    from codonpipe.modules.gene_set import (
+        analyze_gene_set, load_sample_outputs, read_goi_file,
+    )
+
+    sid = sample_id or sample_dir.name
+    out_dir = output_dir or (sample_dir / "gene_set")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    goi_ids = read_goi_file(goi_file)
+    if not goi_ids:
+        logger.error("GOI file %s contained no usable locus tags.", goi_file)
+        sys.exit(1)
+    logger.info("Loaded %d GOI locus tags from %s", len(goi_ids), goi_file)
+
+    try:
+        loaded = load_sample_outputs(sample_dir, sid)
+    except FileNotFoundError as e:
+        logger.error("%s", e)
+        sys.exit(1)
+
+    try:
+        outputs = analyze_gene_set(
+            **loaded,
+            goi_ids=goi_ids,
+            output_dir=out_dir,
+            sample_id=sid,
+            n_permutations=n_permutations,
+            length_matched=not no_length_matching,
+            rng_seed=rng_seed,
+            make_figure=not no_figure,
+        )
+    except ValueError as e:
+        logger.error("Gene-set analysis failed: %s", e)
+        sys.exit(1)
+
+    logger.info("Gene-set analysis complete. Outputs:")
+    for kind, path in outputs.items():
+        logger.info("  %-22s %s", kind, path)
+
+
 @main.command("install-grodon")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 @click.option("--timeout", default=600, type=int, show_default=True,
