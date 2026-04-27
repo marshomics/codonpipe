@@ -295,7 +295,11 @@ Aggregate per-genome signatures across thousands of genomes, standardize, dimens
 | `-o, --output-dir` | (required) | Where to write `corpus_*.tsv` outputs and the summary figure. |
 | `--features` | `geometry` | `geometry` (CLR-Δ + Aitchison only, recommended for codon-strategy clustering) or `all` (full vector including ecology scalars). |
 | `--use-umap` | off | Apply UMAP after PCA for the 2-D embedding. Requires `umap-learn`; without this flag, the first two PCs are used. |
-| `--include-gene-level` | off | Also concatenate the gene-level signatures into `corpus_gene_signature.tsv`. Off by default because gene-level corpora can run to millions of rows for thousands of genomes. |
+| `--include-gene-level` | off | Concatenate the gene-level signatures into `corpus_gene_signature.tsv`. Off by default because gene-level corpora can run to millions of rows for thousands of genomes. Implied by `--gene-level-clustering` and `--gene-level-by-category`. |
+| `--gene-level-clustering` | off | Cluster genes across the corpus by their CLR-Δ codon vectors. Emits `corpus_gene_clusters.tsv` and a four-panel UMAP figure with overlays for cluster id, host genome, host phylum, and host GC3. Useful for finding gene "codon-strategy classes" that span multiple genomes. |
+| `--gene-level-by-category` | — | One of `KO` or `COG`. Cluster genes within each functional-category class to see whether genes of the same KO/COG share a codon strategy across the corpus or split into ecological sub-strategies. Emits `corpus_gene_clusters_by_<cat>.tsv` plus a per-category summary and a diversity bar chart. |
+| `--gene-level-min-category-size` | 10 | Minimum genes per category for per-category clustering. |
+| `--gene-level-max-genes` | 1,000,000 | Safety cap on the gene-level corpus size for general clustering. |
 | `--phylogeny` | — | Path to a Newick file (`.nwk`/`.newick`/`.tree`, requires biopython) or a precomputed pairwise distance-matrix TSV (with sample_ids as both row and column labels). When provided, runs a Mantel test of signature distance vs phylogenetic distance. |
 | `--metadata` | — | Path to a metadata TSV with a `sample_id` column. Categorical columns are tested for cluster association via chi-squared + Cramer's V. |
 | `--hdbscan-min-cluster-size` | auto | Override the heuristic. Default scales to ~2% of corpus, floored at 5, capped at 50. |
@@ -308,7 +312,15 @@ Outputs:
 - `corpus_genome_clusters.tsv` — `sample_id`, `cluster`, `embed_dim1`, `embed_dim2`, plus any metadata columns. Cluster `-1` means HDBSCAN flagged the sample as noise (not assigned to any cluster).
 - `corpus_validation.tsv` — Mantel test result (signature distance vs phylogenetic distance) and chi-squared / Cramer's V tests of cluster-vs-metadata associations. BH-corrected.
 - `corpus_gene_signature.tsv` — only if `--include-gene-level`. Stacked per-gene features across the corpus.
-- `corpus_dimension_reduction.png` / `.svg` — three-panel summary figure: 2-D embedding scatter coloured by cluster; per-cluster boxplot of a representative scalar (median GC3 by default); PCA scree.
+- `corpus_cluster_drivers.tsv` — per (cluster, feature) Mann-Whitney comparing each cluster's members against the rest of the corpus, with Cliff's delta effect sizes and BH-corrected p-values applied globally. Sorted by `(cluster_id, |effect|)` so the strongest distinguishing features per cluster appear first.
+
+The pipeline produces five publication-ready corpus figures (replacing the old single three-panel summary), each focused on one analytical question:
+
+- `corpus_multi_overlay.png` / `.svg` — same 2-D embedding overlaid with up to six different colorings: cluster id, a categorical metadata column (phylum/habitat/etc. when available), median GC3, gRodon2 doubling time, fraction of genes in the optimized cluster, and HGT candidate fraction. Acts as a built-in confounder check: if the GC3 panel shows a clean gradient that mirrors the cluster panel, your clusters are recovering GC content rather than translational selection.
+- `corpus_cluster_signature.png` / `.svg` — two stacked heatmaps. Top: cluster mean CLR-Δ codon profiles with hierarchical clustering on both axes for interpretable banding. Bottom: full genome × codon CLR-Δ matrix with rows ordered by cluster (rasterized for thousands of genomes). Together these show what each cluster prefers / avoids relative to its host genome's bulk.
+- `corpus_cluster_drivers.png` / `.svg` — per-cluster forest plot of the top BH-significant differential features, ordered by absolute Cliff's delta. Each cluster gets its own colour. Falls back to top-by-effect when no driver crosses BH-0.05.
+- `corpus_mantel_scatter.png` / `.svg` — pairwise distance scatter, signature vs phylogenetic, stratified by within-group vs between-group when a categorical metadata column (phylum, class, etc.) is available. Hexbin density for corpora >1500 pairs, individual points otherwise. Reports the overall Mantel `r` plus separate within/between trend lines so you can see whether phylogenetic signal sits at the major-clade level or persists within clades. Only emitted when `--phylogeny` is provided.
+- `corpus_focus_<sample_id>.png` / `.svg` (one per `--focus-genome`) — single-genome locator. Left: the genome highlighted on the embedding with a red star, all other genomes shown in their cluster colours. Right: violin plots of the corpus distribution for each scalar feature, with the focus genome's z-score marked as a red star and its percentile rank annotated. Pass `--focus-genome SAMPLE_ID` (repeatable) for one figure per genome.
 
 Defensible-by-default. The `geometry` feature set removes mutational background by construction — both `delta_clr_*` vectors share the host's GC composition, so subtraction cancels the GC-content axis that otherwise dominates raw RSCU clustering. Use `--phylogeny` to confirm: a low Mantel `r` between signature distance and phylogenetic distance is evidence the clustering is capturing translational ecology rather than just recovering taxonomy. A high `r` with the geometry feature set is also informative — it suggests selection signature tracks phylogeny in your dataset, which is biologically meaningful (vertical inheritance of codon-usage strategy) rather than an artefact.
 
@@ -330,6 +342,40 @@ codonpipe corpus output_run/*/signatures \\
 ```
 
 Validation strategy: with thousands of genomes, expect HDBSCAN to find anywhere from 5 to 50 clusters with the default heuristic. Inspect `corpus_validation.tsv` to see how cluster membership associates with phylum, isolation source, growth rate, etc. A defensible workflow always checks (1) Mantel `r` against phylogeny — too high (~0.95+) means the signature is mostly recovering taxonomy and you should revisit the feature set, (2) cluster enrichment against ecology metadata — clusters that align cleanly with habitat or growth-rate class are likely capturing real biology, (3) phylogenetically-controlled tests if you have a tree — Pagel's λ on each feature column tells you whether the variance is phylogenetic or trait-like.
+
+### `codonpipe codon-optimization`
+
+```
+codonpipe codon-optimization SAMPLE_DIR [OPTIONS]
+```
+
+Compares the genome / ribosomal-protein / Mahalanobis-cluster codon-usage profiles for one organism, quantifies the gain from Mahal-cluster-derived codon optimization vs the classic RP-derived approach, and emits a synthesis-ready preferred-codon table.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-s, --sample-id` | dir name | Sample identifier (defaults to the directory name). |
+| `-o, --output-dir` | `<SAMPLE_DIR>/codon_optimization/` | Output directory. |
+| `--no-figure` | off | Skip the three figures, write only the TSV outputs. |
+| `-v, --verbose` | off | Debug-level logging. |
+
+Outputs:
+
+- `<sample_id>_codon_optimization_table.tsv` — per-codon comparison: amino_acid, family, codon, codon_col, genome_rscu, rp_rscu, mahal_rscu, rp_w, mahal_w, rp_optimal, mahal_optimal, family_agree, delta_w_mahal_minus_rp, delta_rscu_mahal_minus_rp, delta_rscu_mahal_minus_genome. The full data behind every plot.
+- `<sample_id>_codon_optimization_summary.tsv` — per-AA-family summary: which codon is optimal under each scheme, do they agree, and the maximum within-family Δw shift.
+- `<sample_id>_codon_optimization_recommend.tsv` — synthesis-ready table with `recommended_codon` (Mahal-derived by default), `alternative_codon` (RP-derived when it differs), `rationale`, `confidence` (high/medium/low based on Δw magnitude), and the rp_w / mahal_w values at the recommendation. Drop into a synthesis order.
+- `<sample_id>_codon_optimization_gain.tsv` — per-gene CBI under both reference frames: cbi_rp, cbi_mahal, gain_mahal_minus_rp, gain_pct, plus Mahal-cluster membership_score and in_optimized_set when available. Quantifies which genes already match each reference better.
+- `<sample_id>_three_way_rscu.png` / `.svg` — per-codon RSCU bar chart with all three references overlaid. Bottom panel shows the per-codon Δw shift (Mahal − RP). Families where RP and Mahal disagree on the optimum are highlighted with a coloured background.
+- `<sample_id>_optimization_agreement.png` / `.svg` — compact per-AA-family table showing the RP-optimal codon vs the Mahal-optimal codon side by side, with ✓/✗ for agreement and a red bar showing the within-family max-Δw magnitude. Reads at a glance.
+- `<sample_id>_optimization_gain.png` / `.svg` — three-panel quantification of the gain: scatter of per-gene cbi_rp vs cbi_mahal coloured by membership_score with the diagonal line; histogram of the gain distribution annotated with the fraction of genes that benefit from Mahal-style optimization; bar chart of the top genes most improved.
+
+Defensible reason to prefer Mahal-derived weights for codon optimization. The Mahal cluster is identified by codon-usage similarity rather than by RP gene annotations, so it captures the organism's actual translationally-optimized cohort and excludes RP annotation outliers (truncations, paralogs, modified variants) that can pull the RP-based reference centroid off-target. When the two reference frames agree on the optimal codon for an amino acid (the common case), the recommended codon is unambiguous. When they disagree, the recommendation table flags the disagreement with a `confidence` value so the user can make the call rather than blindly defaulting to one frame. The per-gene gain figure shows whether Mahal-style optimization actually pays off in the user's organism: if the median (cbi_mahal − cbi_rp) is positive and most genes sit above the diagonal in the scatter, Mahal-derived codons match the host's optimization signal better than RP-derived codons.
+
+Example:
+
+```
+codonpipe codon-optimization output_run/G0370_i3 \
+    -o output_run/G0370_i3/codon_optimization/
+```
 
 ### `codonpipe install-grodon`
 
