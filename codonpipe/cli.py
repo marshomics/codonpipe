@@ -448,6 +448,172 @@ def gene_set_cmd(
         logger.info("  %-22s %s", kind, path)
 
 
+@main.command("signatures")
+@click.argument("sample_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("-s", "--sample-id", default=None,
+              help="Sample identifier. Defaults to the directory name.")
+@click.option("-o", "--output-dir", "output_dir", default=None,
+              type=click.Path(path_type=Path),
+              help="Output directory. Defaults to <SAMPLE_DIR>/signatures/.")
+@click.option("-v", "--verbose", is_flag=True, help="Debug-level logging.")
+def signatures_cmd(sample_dir: Path, sample_id: str | None, output_dir: Path | None, verbose: bool):
+    """Emit cross-genome-comparable gene + genome signatures for one sample.
+
+    Reads the per-sample CodonPipe output directory and writes:
+
+    \b
+      <sample_id>_gene_signature.tsv    one row per gene, with within-genome-
+                                        normalized scalars + a 38-d CLR-Δ
+                                        codon-preference vector
+      <sample_id>_genome_signature.tsv  one row per genome, with the
+                                        translational-selection geometry vector
+                                        (CLR(Mahal) − CLR(genome) + CLR(RP) −
+                                        CLR(genome) + Aitchison distances) plus
+                                        ecology summary scalars
+
+    Both files are designed to be concatenated across thousands of genomes for
+    cross-genome clustering. Run `codonpipe corpus` on a directory of these
+    signature files to do the actual cross-genome aggregation.
+
+    Example:
+
+    \b
+        codonpipe signatures output_run/G0370_i3 \\
+            -o output_run/G0370_i3/signatures/
+    """
+    logger = setup_logger(verbose=verbose)
+    from codonpipe.modules.cross_genome import write_signatures_for_sample
+
+    sid = sample_id or sample_dir.name
+    out_dir = output_dir or (sample_dir / "signatures")
+    try:
+        outputs = write_signatures_for_sample(sample_dir, sid, out_dir)
+    except FileNotFoundError as e:
+        logger.error("%s", e)
+        sys.exit(1)
+    except Exception as e:
+        logger.error("Signature build failed: %s", e, exc_info=verbose)
+        sys.exit(1)
+    logger.info("Signatures complete:")
+    for k, v in outputs.items():
+        logger.info("  %-22s %s", k, v)
+
+
+@main.command("corpus")
+@click.argument("input_dirs", nargs=-1, required=True,
+                type=click.Path(exists=True, path_type=Path))
+@click.option("-o", "--output-dir", "output_dir", required=True,
+              type=click.Path(path_type=Path),
+              help="Where to write corpus_*.tsv outputs and the summary figure.")
+@click.option("--features", default="geometry",
+              type=click.Choice(["geometry", "all"]),
+              help="Feature set for clustering: 'geometry' = CLR-Δ vectors + "
+                   "Aitchison distances only (recommended for codon-strategy "
+                   "clustering); 'all' = full vector including ecology scalars.")
+@click.option("--use-umap", is_flag=True,
+              help="Apply UMAP after PCA for the 2-D embedding (requires "
+                   "umap-learn). Without this flag, the first two PCs are used.")
+@click.option("--include-gene-level", is_flag=True,
+              help="Also concatenate the gene-level signatures into "
+                   "corpus_gene_signature.tsv. Skipped by default because "
+                   "gene-level corpora are large (millions of rows for "
+                   "thousands of genomes).")
+@click.option("--phylogeny", "phylogeny_path", default=None,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Optional phylogeny for Mantel-test validation. Accepts "
+                   "either a Newick file (.nwk/.newick/.tree, requires "
+                   "biopython) or a precomputed pairwise distance-matrix TSV "
+                   "with sample_ids as both row and column labels.")
+@click.option("--metadata", "metadata_path", default=None,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Optional metadata TSV with a sample_id column. Categorical "
+                   "columns are tested for cluster association via "
+                   "chi-squared + Cramer's V.")
+@click.option("--hdbscan-min-cluster-size", type=int, default=None,
+              help="Override the heuristic HDBSCAN min_cluster_size. Default "
+                   "scales to ~2%% of corpus, floor 5, ceiling 50.")
+@click.option("--rng-seed", default=42, type=int, show_default=True,
+              help="Random seed for PCA / UMAP / HDBSCAN / Mantel.")
+@click.option("-v", "--verbose", is_flag=True, help="Debug-level logging.")
+def corpus_cmd(
+    input_dirs: tuple[Path, ...],
+    output_dir: Path,
+    features: str,
+    use_umap: bool,
+    include_gene_level: bool,
+    phylogeny_path: Path | None,
+    metadata_path: Path | None,
+    hdbscan_min_cluster_size: int | None,
+    rng_seed: int,
+    verbose: bool,
+):
+    """Aggregate per-genome signatures into a cross-genome corpus.
+
+    Discovers `*_genome_signature.tsv` (and optionally `*_gene_signature.tsv`)
+    files under one or more input directories, standardizes the chosen feature
+    block, runs PCA (and UMAP if installed) for dimension reduction, clusters
+    with HDBSCAN (KMeans fallback), and optionally validates against a
+    phylogeny via Mantel test and against metadata via chi-squared.
+
+    Outputs in --output-dir:
+
+    \b
+      corpus_genome_signature.tsv   stacked per-genome features
+      corpus_genome_clusters.tsv    sample_id, cluster, embed_dim1, embed_dim2,
+                                    + any metadata columns
+      corpus_validation.tsv         Mantel + cluster-vs-metadata tests
+                                    (only if --phylogeny / --metadata given)
+      corpus_gene_signature.tsv     stacked per-gene features (only if
+                                    --include-gene-level)
+      corpus_dimension_reduction.png/.svg   3-panel summary figure
+
+    Defensible-by-default: 'geometry' features remove mutational background by
+    construction, so cross-genome distance reflects translational selection
+    rather than GC content. Use --phylogeny to confirm: a low Mantel r between
+    signature distance and phylogenetic distance is evidence the clustering is
+    capturing biology rather than just recovering taxonomy.
+
+    Example:
+
+    \b
+        codonpipe corpus output_run/G0370_i3/signatures \\
+                         output_run/NC_009515/signatures \\
+                         output_run/.../signatures \\
+            -o corpus_results/ \\
+            --phylogeny species_tree.nwk \\
+            --metadata genome_metadata.tsv \\
+            --use-umap
+    """
+    logger = setup_logger(verbose=verbose)
+    from codonpipe.modules.cross_genome import build_corpus
+
+    try:
+        outputs = build_corpus(
+            input_dirs=list(input_dirs),
+            output_dir=output_dir,
+            features=features,
+            use_umap=use_umap,
+            include_gene_level=include_gene_level,
+            phylogeny_path=phylogeny_path,
+            metadata_path=metadata_path,
+            hdbscan_min_cluster_size=hdbscan_min_cluster_size,
+            rng_seed=rng_seed,
+        )
+    except FileNotFoundError as e:
+        logger.error("%s", e)
+        sys.exit(1)
+    except ValueError as e:
+        logger.error("Corpus build failed: %s", e)
+        sys.exit(1)
+    except Exception as e:
+        logger.error("Corpus build failed: %s", e, exc_info=verbose)
+        sys.exit(1)
+
+    logger.info("Corpus build complete:")
+    for k, v in outputs.items():
+        logger.info("  %-25s %s", k, v)
+
+
 @main.command("install-grodon")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 @click.option("--timeout", default=600, type=int, show_default=True,
