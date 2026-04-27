@@ -241,7 +241,8 @@ Outputs written to `--output-dir`:
 - `<sample_id>_goi_aitchison_perm.tsv` — observed Aitchison distance to each reference, permutation null statistics, two-sided p-value and one-sided directional p-values.
 - `<sample_id>_goi_hgt_enrichment.tsv` — one-sided permutation test on each HGT flag's GOI rate vs length-matched controls.
 - `<sample_id>_goi_mahal_membership.tsv` — two-sided permutation test on the GOI's Mahal-cluster membership rate against length-matched controls. Reports both `p_more_in_cluster` (GOI is enriched in the optimized core) and `p_less_in_cluster` (GOI is depleted from it).
-- `<sample_id>_goi_panel.png` / `.svg` — seven-panel summary figure (A: RSCU bars vs reference sets; B: effect-size forest plot per metric; C: COA biplot with GOI highlighted; D: Wright ENC-vs-GC3 plot; E: genome-centroid Mahalanobis distance distribution; F: genome-centroid vs cluster-centroid Mahalanobis biplot, separating "unusual relative to genome" from "near the optimized core"; G: per-GOI percentile-rank heatmap with a green/grey strip marking Mahal-cluster membership). Panel F is the cleanest single-glance answer to "where do my GOIs sit relative to both reference frames at once?".
+- `<sample_id>_goi_partition.tsv` — three-way genome partition: each gene is assigned to `mahal_cluster` (in the optimized core), `bulk` (typical genome member), or `outlier` (HGT-flagged via `hgt_flag_combined`, requires unusual codon usage AND unusual GC3). Cluster membership takes precedence when both flags are set. Reports per-category Fisher's exact test (with BH FDR across the three categories) plus an omnibus chi-squared / Cramer's V test of the full 2×3 (GOI × category) table. The `partition` column is also merged into `<sample_id>_goi_summary.tsv` so each GOI row carries its category assignment without needing a join.
+- `<sample_id>_goi_panel.png` / `.svg` — seven-panel summary figure (A: RSCU bars vs reference sets; B: effect-size forest plot per metric; C: COA biplot with GOI highlighted; D: Wright ENC-vs-GC3 plot; E: three-way genome-partition stacked bar with per-category BH-corrected Fisher p-values and the omnibus chi-squared Cramer's V; F: genome-centroid vs cluster-centroid Mahalanobis biplot, separating "unusual relative to genome" from "near the optimized core"; G: per-GOI percentile-rank heatmap with a green/grey strip marking Mahal-cluster membership). When the Mahal-clustering / HGT outputs aren't available, Panel E falls back to the genome-centroid Mahalanobis distance histogram. Panel F is the cleanest single-glance answer to "where do my GOIs sit relative to both reference frames at once?".
 
 The `--goi-file` accepts annotated lines, e.g.:
 
@@ -253,6 +254,76 @@ G0370_i3_00134   # phbC
 ```
 
 Length-matched permutations bin the background by length quartile and reproduce the per-bin counts of the GOI list, since CAI, MELP, ENC, and Mahalanobis distance all have measurable length dependence. Pass `--no-length-matching` only as a sensitivity check.
+
+### `codonpipe signatures`
+
+```
+codonpipe signatures SAMPLE_DIR [OPTIONS]
+```
+
+Emit cross-genome-comparable gene + genome signature files for one sample. Designed for downstream cross-genome aggregation: every CodonPipe run produces these files (or you generate them after the fact), then `codonpipe corpus` concatenates and clusters them.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-s, --sample-id` | dir name | Sample identifier. |
+| `-o, --output-dir` | `<SAMPLE_DIR>/signatures/` | Output directory. |
+| `-v, --verbose` | off | Debug-level logging. |
+
+Outputs:
+
+- `<sample_id>_gene_signature.tsv` — one row per gene. Columns: `sample_id`, `gene`, `length`, scalar metrics (ENC, GC3, ENCprime, MILC, MELP, CAI, Fop, cbi_rp, cbi_mahal, mahalanobis_dist_genome, mahalanobis_dist_cluster, membership_score, in_optimized_set), and a 38-dimensional CLR-Δ codon-preference vector (`delta_clr_<codon>`). The CLR-Δ vector is each gene's centered-log-ratio RSCU minus the genome's mean CLR-RSCU — directly comparable across genomes because CLR removes per-AA-family sum constraints and the subtraction removes mutational background.
+- `<sample_id>_genome_signature.tsv` — single row per genome. Two blocks of features. Geometry block (cross-genome-comparable, ~80 columns): `delta_clr_mahal_<codon>` × 38 (Mahal-cluster CLR minus genome CLR), `delta_clr_rp_<codon>` × 38 (RP CLR minus genome CLR), and three Aitchison distances (`aitchison_genome_to_mahal`, `aitchison_genome_to_rp`, `aitchison_rp_to_mahal`). Ecology block (~20 scalars): median CAI/MELP/Fop/ENC/ENCprime/MILC/GC3, GC3 IQR, fraction in optimized set, gRodon2 doubling time and CIs, HGT candidate fraction, phage / mobile-element gene counts, strand-asymmetry significant codon count, tRNA gene count.
+
+The geometry block is the cleanest signature for clustering on translational selection patterns — both `delta_clr_*` vectors share the host's GC composition by construction, so cross-genome distance reflects selection rather than mutation. The ecology block adds organism-level summary scalars for "ecology-aware" clustering.
+
+### `codonpipe corpus`
+
+```
+codonpipe corpus INPUT_DIRS... -o OUTPUT_DIR [OPTIONS]
+```
+
+Aggregate per-genome signatures across thousands of genomes, standardize, dimension-reduce, cluster, and validate. Discovers `*_genome_signature.tsv` (and optionally `*_gene_signature.tsv`) files under one or more input directories.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-o, --output-dir` | (required) | Where to write `corpus_*.tsv` outputs and the summary figure. |
+| `--features` | `geometry` | `geometry` (CLR-Δ + Aitchison only, recommended for codon-strategy clustering) or `all` (full vector including ecology scalars). |
+| `--use-umap` | off | Apply UMAP after PCA for the 2-D embedding. Requires `umap-learn`; without this flag, the first two PCs are used. |
+| `--include-gene-level` | off | Also concatenate the gene-level signatures into `corpus_gene_signature.tsv`. Off by default because gene-level corpora can run to millions of rows for thousands of genomes. |
+| `--phylogeny` | — | Path to a Newick file (`.nwk`/`.newick`/`.tree`, requires biopython) or a precomputed pairwise distance-matrix TSV (with sample_ids as both row and column labels). When provided, runs a Mantel test of signature distance vs phylogenetic distance. |
+| `--metadata` | — | Path to a metadata TSV with a `sample_id` column. Categorical columns are tested for cluster association via chi-squared + Cramer's V. |
+| `--hdbscan-min-cluster-size` | auto | Override the heuristic. Default scales to ~2% of corpus, floored at 5, capped at 50. |
+| `--rng-seed` | 42 | Random seed. |
+| `-v, --verbose` | off | Debug logging. |
+
+Outputs:
+
+- `corpus_genome_signature.tsv` — stacked per-genome features (one row per genome).
+- `corpus_genome_clusters.tsv` — `sample_id`, `cluster`, `embed_dim1`, `embed_dim2`, plus any metadata columns. Cluster `-1` means HDBSCAN flagged the sample as noise (not assigned to any cluster).
+- `corpus_validation.tsv` — Mantel test result (signature distance vs phylogenetic distance) and chi-squared / Cramer's V tests of cluster-vs-metadata associations. BH-corrected.
+- `corpus_gene_signature.tsv` — only if `--include-gene-level`. Stacked per-gene features across the corpus.
+- `corpus_dimension_reduction.png` / `.svg` — three-panel summary figure: 2-D embedding scatter coloured by cluster; per-cluster boxplot of a representative scalar (median GC3 by default); PCA scree.
+
+Defensible-by-default. The `geometry` feature set removes mutational background by construction — both `delta_clr_*` vectors share the host's GC composition, so subtraction cancels the GC-content axis that otherwise dominates raw RSCU clustering. Use `--phylogeny` to confirm: a low Mantel `r` between signature distance and phylogenetic distance is evidence the clustering is capturing translational ecology rather than just recovering taxonomy. A high `r` with the geometry feature set is also informative — it suggests selection signature tracks phylogeny in your dataset, which is biologically meaningful (vertical inheritance of codon-usage strategy) rather than an artefact.
+
+Recommended workflow for thousands of genomes:
+
+```
+# 1. Generate signatures for every CodonPipe run (parallelizable per sample)
+for sample in output_run/*/; do
+    codonpipe signatures "$sample" -o "$sample/signatures"
+done
+
+# 2. Aggregate, cluster, validate
+codonpipe corpus output_run/*/signatures \\
+    -o corpus_results/ \\
+    --features geometry \\
+    --phylogeny species_tree.nwk \\
+    --metadata genome_metadata.tsv \\
+    --use-umap
+```
+
+Validation strategy: with thousands of genomes, expect HDBSCAN to find anywhere from 5 to 50 clusters with the default heuristic. Inspect `corpus_validation.tsv` to see how cluster membership associates with phylum, isolation source, growth rate, etc. A defensible workflow always checks (1) Mantel `r` against phylogeny — too high (~0.95+) means the signature is mostly recovering taxonomy and you should revisit the feature set, (2) cluster enrichment against ecology metadata — clusters that align cleanly with habitat or growth-rate class are likely capturing real biology, (3) phylogenetically-controlled tests if you have a tree — Pagel's λ on each feature column tells you whether the variance is phylogenetic or trait-like.
 
 ### `codonpipe install-grodon`
 
