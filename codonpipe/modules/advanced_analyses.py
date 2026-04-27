@@ -75,6 +75,31 @@ def compute_coa_on_rscu(
 
     # Replace NaN with 0 (genuine absence); zeros are meaningful RSCU values
     X = np.where(np.isnan(X), 0.0, X)
+
+    # Drop any rows whose total row mass is so small that they would receive
+    # an outsized 1/sqrt(row_mass) scaling in the row-coordinate computation
+    # below. With epsilon=1e-8 in the denominator, a row sum below ~1e-3
+    # would inflate that gene's coordinates by orders of magnitude relative
+    # to genuine signals. count_codons + MIN_GENE_LENGTH normally prevents
+    # this, but defensive filtering is cheap and stops a single malformed
+    # gene from dominating the projection.
+    row_total = X.sum(axis=1)
+    valid_row = row_total > 1e-3
+    n_dropped = int((~valid_row).sum())
+    if n_dropped:
+        logger.warning(
+            "COA: dropped %d gene(s) with near-zero RSCU row sums "
+            "(would otherwise dominate the row-coordinate projection)",
+            n_dropped,
+        )
+        X = X[valid_row]
+        genes = genes[valid_row]
+        if len(X) < 10:
+            logger.warning(
+                "COA: only %d genes remain after row-mass filter; skipping COA", len(X),
+            )
+            return {}
+
     # For chi-squared standardization, add small constant to avoid zero row/column sums
     epsilon = 1e-8
 
@@ -323,27 +348,64 @@ def compute_gc12_gc3(ffn_path: Path, min_length: int = 240) -> pd.DataFrame:
 # ─── PR2 (Parity Rule 2) plot ───────────────────────────────────────────────
 
 
-def compute_pr2(ffn_path: Path, min_length: int = 240) -> pd.DataFrame:
-    """Compute PR2 bias statistics: A3/(A3+T3) vs G3/(G3+C3) per gene.
+# Four-fold degenerate codon prefixes per Sueoka (1995). Only these sites
+# leave the encoded amino acid invariant under any third-position substitution,
+# so the PR2 bias statistic is a clean readout of mutational/replicative
+# asymmetry. Any 2-fold or 3-fold site mixes selection on the amino acid into
+# the third-position composition.
+_FOURFOLD_PREFIXES = frozenset({
+    "GC",  # Ala: GCU/GCC/GCA/GCG
+    "GG",  # Gly: GGU/GGC/GGA/GGG
+    "CC",  # Pro: CCU/CCC/CCA/CCG
+    "AC",  # Thr: ACU/ACC/ACA/ACG
+    "GU",  # Val: GUU/GUC/GUA/GUG
+    "UC",  # Ser4: UCU/UCC/UCA/UCG (note: AGU/AGC are 2-fold, excluded)
+    "CU",  # Leu4: CUU/CUC/CUA/CUG (note: UUA/UUG are 2-fold, excluded)
+    "CG",  # Arg4: CGU/CGC/CGA/CGG (note: AGA/AGG are 2-fold, excluded)
+})
 
-    Under no strand bias and no selection, both ratios cluster at 0.5.
-    Deviations reveal replication-associated mutational asymmetry and
+
+def compute_pr2(ffn_path: Path, min_length: int = 240) -> pd.DataFrame:
+    """Compute PR2 bias statistics at four-fold degenerate sites.
+
+    PR2 (Sueoka 1995) plots A3/(A3+T3) vs G3/(G3+C3) using only third-position
+    bases of four-fold degenerate codons (Ala, Gly, Pro, Thr, Val, Ser4, Leu4,
+    Arg4). Restricting to 4-fold sites makes the third position effectively
+    selection-free with respect to the amino acid, so any deviation from 0.5
+    is read as replication-associated mutational asymmetry rather than
     translational selection.
 
+    Earlier versions of this function counted *every* third-position base,
+    which mixed in selection effects from 2-fold (Phe, Tyr, His, Gln, Asn,
+    Lys, Asp, Glu, Cys, Ser2, Leu2, Arg2) and 3-fold (Ile) sites where
+    third-position changes can be non-synonymous.
+
     Returns:
-        DataFrame with gene, A3_ratio (A3/(A3+T3)), G3_ratio (G3/(G3+C3)), length.
+        DataFrame with gene, A3_ratio (A3/(A3+T3)), G3_ratio (G3/(G3+C3)),
+        length, n_fourfold_codons.
     """
     rows = []
     for rec in SeqIO.parse(str(ffn_path), "fasta"):
-        seq = str(rec.seq).upper()
+        seq = str(rec.seq).upper().replace("T", "U")
         if len(seq) < min_length:
             continue
 
         base3_counts = Counter()
-        for i in range(2, len(seq), 3):
-            base = seq[i]
+        n_fourfold = 0
+        # Walk codons (frame 0). Only count the 3rd base when the first two
+        # bases identify a four-fold degenerate family.
+        for i in range(0, len(seq) - 2, 3):
+            prefix = seq[i:i + 2]
+            if prefix not in _FOURFOLD_PREFIXES:
+                continue
+            base = seq[i + 2]
+            # Use DNA letters in the output to match the rest of the module's
+            # conventions (count_codons returns RNA, but PR2 reports A/T/G/C).
+            if base == "U":
+                base = "T"
             if base in "ACGT":
                 base3_counts[base] += 1
+                n_fourfold += 1
 
         a3 = base3_counts.get("A", 0)
         t3 = base3_counts.get("T", 0)
@@ -353,16 +415,20 @@ def compute_pr2(ffn_path: Path, min_length: int = 240) -> pd.DataFrame:
         at_total = a3 + t3
         gc_total = g3 + c3
 
-        if at_total > 0 and gc_total > 0:
+        # Need a meaningful number of 4-fold codons before the ratios are
+        # interpretable. ~30 fourfold codons gives a reasonable SE on each
+        # ratio for typical eubacterial gene lengths.
+        if at_total > 0 and gc_total > 0 and n_fourfold >= 30:
             rows.append({
                 COL_GENE: rec.id,
                 "A3_ratio": a3 / at_total,
                 "G3_ratio": g3 / gc_total,
                 "length": len(seq),
+                "n_fourfold_codons": n_fourfold,
             })
 
     return pd.DataFrame(rows) if rows else pd.DataFrame(
-        columns=[COL_GENE, "A3_ratio", "G3_ratio", "length"]
+        columns=[COL_GENE, "A3_ratio", "G3_ratio", "length", "n_fourfold_codons"]
     )
 
 
@@ -443,19 +509,80 @@ def compute_delta_rscu(
 
 
 # ─── tRNA gene count vs codon frequency ──────────────────────────────────────
+#
+# The wobble decoding model below follows dos Reis, Wernisch & Savva (2003)
+# / dos Reis, Savva & Wernisch (2004) for the bacterial tRNA-codon mapping.
+# Position 34 of the anticodon (5'-most, pairs with codon position 3) governs
+# which codons a single tRNA can read:
+#   * U34 reads codon3 = A (Watson-Crick) and G (wobble, weight 0.561)
+#   * C34 reads codon3 = G only (Watson-Crick, weight 1.0)
+#   * G34 reads codon3 = C (Watson-Crick) and U (wobble, weight 0.561)
+#   * A34 is universally modified to inosine (I34) in bacterial tRNAs that
+#     have an A there; I34 reads U (1.0), C (0.72), and A (0.32)
+# Restricting to direct reverse-complement (the previous behaviour) ignored
+# wobble entirely, under-counting effective tRNA pool for ~half of all codons.
+
+# 5'-most anticodon base → list of (codon-3rd-base-RNA, weight) pairs.
+# Weights are dos Reis 2004's published tAI s-values.
+_WOBBLE_DECODING: dict[str, list[tuple[str, float]]] = {
+    "U": [("A", 1.0), ("G", 0.561)],
+    "C": [("G", 1.0)],
+    "G": [("C", 1.0), ("U", 0.561)],
+    "A": [("U", 0.9999), ("C", 0.72), ("A", 0.32)],  # I34 (inosine) decoding
+}
+
+
+def _decoded_codons_with_weights(anticodon_dna: str) -> list[tuple[str, float]]:
+    """Return list of (decoded_codon_RNA, wobble_weight) for an anticodon.
+
+    The anticodon is read 5'→3' (as stored in tRNA gene annotations). The
+    codon read by base-pairing has positions 1, 2, 3 = anticodon positions
+    3, 2, 1 reverse-complemented. Position 1 of the codon (=anticodon
+    position 3) and position 2 of the codon (=anticodon position 2) follow
+    Watson-Crick pairing strictly; only position 3 of the codon (=anticodon
+    position 1, "the wobble position") can wobble.
+
+    Args:
+        anticodon_dna: 3-letter DNA anticodon (5' to 3').
+
+    Returns:
+        List of (codon_rna, weight) tuples. Empty if anticodon is invalid.
+    """
+    ac = anticodon_dna.upper().replace("T", "U")
+    if len(ac) != 3 or any(b not in "ACGU" for b in ac):
+        return []
+
+    complement = {"A": "U", "U": "A", "G": "C", "C": "G"}
+    # Codon positions 1 and 2 are Watson-Crick complements of anticodon
+    # positions 3 and 2 respectively.
+    codon_pos1 = complement[ac[2]]
+    codon_pos2 = complement[ac[1]]
+    # Codon position 3 wobbles against anticodon position 1 (5' base).
+    wobble_pairs = _WOBBLE_DECODING.get(ac[0], [])
+    return [
+        (codon_pos1 + codon_pos2 + base3, weight)
+        for base3, weight in wobble_pairs
+    ]
 
 
 def extract_trna_counts_from_gff(gff_path: Path) -> pd.DataFrame:
-    """Extract tRNA gene counts per anticodon from a GFF3 file (e.g. Prokka output).
+    """Extract tRNA gene counts and wobble-decoded codon assignments from a GFF3 file.
 
-    Parses tRNA features and extracts anticodon information. Maps anticodon
-    back to the codon it decodes (reverse complement + RNA conversion).
+    Parses tRNA features and expands each anticodon into the set of codons it
+    decodes via Watson-Crick + wobble pairing (dos Reis et al. 2004). The
+    output is in *long* format: one row per (anticodon, decoded codon) pair,
+    so a single U34-bearing tRNA contributes two rows (the Watson-Crick
+    codon at weight 1.0 and the G3 wobble codon at weight 0.561).
+
+    Inosine handling: A34 is treated as I34 (universal in bacterial 4-fold
+    decoding tRNAs), so anticodons starting with A decode three codons.
 
     Args:
         gff_path: Path to GFF3 annotation file.
 
     Returns:
-        DataFrame with anticodon, codon (RNA), amino_acid, tRNA_copy_number.
+        DataFrame with anticodon, codon (RNA), amino_acid, tRNA_copy_number,
+        wobble_weight, effective_tRNA (= tRNA_copy_number * wobble_weight).
     """
     anticodon_pattern = re.compile(r"(?:anticodon|product)=.*?([ACGT]{3})", re.IGNORECASE)
     product_aa_pattern = re.compile(r"product=tRNA-(\w{3})", re.IGNORECASE)
@@ -499,20 +626,38 @@ def extract_trna_counts_from_gff(gff_path: Path) -> pd.DataFrame:
         trna_counts, trna_aa = _parse_trna_fallback(gff_path)
 
     if not trna_counts:
-        return pd.DataFrame(columns=["anticodon", "codon", "amino_acid", "tRNA_copy_number"])
+        return pd.DataFrame(columns=[
+            "anticodon", "codon", "amino_acid", "tRNA_copy_number",
+            "wobble_weight", "effective_tRNA",
+        ])
 
     rows = []
     for anticodon_dna, count in trna_counts.items():
-        # Reverse complement the anticodon to get the codon it decodes
-        codon_dna = _reverse_complement(anticodon_dna)
-        codon_rna = dna_to_rna(codon_dna)
-        aa = trna_aa.get(anticodon_dna, CODON_TABLE_11.get(codon_rna, "?"))
-        rows.append({
-            "anticodon": anticodon_dna,
-            "codon": codon_rna,
-            "amino_acid": aa,
-            "tRNA_copy_number": count,
-        })
+        decoded = _decoded_codons_with_weights(anticodon_dna)
+        if not decoded:
+            # Couldn't parse anticodon — keep a minimal record so the gene
+            # isn't lost from downstream summaries.
+            codon_rna = dna_to_rna(_reverse_complement(anticodon_dna))
+            aa = trna_aa.get(anticodon_dna, CODON_TABLE_11.get(codon_rna, "?"))
+            rows.append({
+                "anticodon": anticodon_dna,
+                "codon": codon_rna,
+                "amino_acid": aa,
+                "tRNA_copy_number": count,
+                "wobble_weight": 1.0,
+                "effective_tRNA": float(count),
+            })
+            continue
+        for codon_rna, weight in decoded:
+            aa = trna_aa.get(anticodon_dna, CODON_TABLE_11.get(codon_rna, "?"))
+            rows.append({
+                "anticodon": anticodon_dna,
+                "codon": codon_rna,
+                "amino_acid": aa,
+                "tRNA_copy_number": count,
+                "wobble_weight": weight,
+                "effective_tRNA": count * weight,
+            })
 
     return pd.DataFrame(rows)
 
@@ -569,8 +714,18 @@ def compute_trna_codon_correlation(
     if trna_df.empty or not rscu_cols:
         return pd.DataFrame()
 
-    # Build codon -> tRNA copy number mapping (RNA codons)
-    trna_map = dict(zip(trna_df["codon"], trna_df["tRNA_copy_number"]))
+    # Aggregate effective tRNA copies per codon (sum across wobble-decoded
+    # entries). When the wobble-aware extractor was used, each tRNA may
+    # appear in trna_df once per decoded codon with effective_tRNA =
+    # tRNA_copy_number * wobble_weight; summing those yields the effective
+    # decoding capacity for each codon. For backward compatibility, fall
+    # back to the raw copy-number sum if the new column isn't present.
+    if "effective_tRNA" in trna_df.columns:
+        per_codon = trna_df.groupby("codon", as_index=False)["effective_tRNA"].sum()
+        trna_map = dict(zip(per_codon["codon"], per_codon["effective_tRNA"]))
+    else:
+        per_codon = trna_df.groupby("codon", as_index=False)["tRNA_copy_number"].sum()
+        trna_map = dict(zip(per_codon["codon"], per_codon["tRNA_copy_number"]))
 
     # Genome-wide average RSCU per codon
     genome_avg = rscu_gene_df[rscu_cols].mean()
