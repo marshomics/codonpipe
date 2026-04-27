@@ -344,6 +344,8 @@ args <- commandArgs(trailingOnly = TRUE)
 cds_fasta       <- args[1]
 output_json     <- args[2]
 he_ids_file     <- if (length(args) >= 3 && nchar(args[3]) > 0) args[3] else NULL
+mode_arg        <- if (length(args) >= 4 && nchar(args[4]) > 0) args[4] else "full"
+training_set_arg <- if (length(args) >= 5 && nchar(args[5]) > 0) args[5] else "madin"
 
 genes <- readDNAStringSet(cds_fasta)
 
@@ -359,15 +361,29 @@ if (!is.null(he_ids_file) && file.exists(he_ids_file)) {
   cat(sprintf("Using %d high-MELP gene IDs; matched %d/%d CDS\n",
               length(he_ids), sum(highly_expressed), length(genes)))
 } else {
-  # Fallback: gRodon2's own regex on FASTA headers
+  # Fallback: a Prokka-flavoured regex matching "30S ribosomal protein L?"
+  # and "50S ribosomal protein L?" while excluding methylated/hydroxylated
+  # variants. NB: this is NOT gRodon2's own regex — gRodon2 itself does not
+  # ship one. If your annotator (RAST, NCBI PGAP, custom) uses different
+  # phrasing, supply --he-ids-file to make HE gene selection explicit.
   highly_expressed <- grepl(
     "^(?!.*(methyl|hydroxy)).*0S ribosomal protein",
     names(genes),
     ignore.case = TRUE,
     perl = TRUE
   )
-  cat(sprintf("Using gRodon2 header regex; matched %d/%d CDS\n",
-              sum(highly_expressed), length(genes)))
+  matched <- sum(highly_expressed)
+  cat(sprintf("Using fallback ribosomal-protein header regex; matched %d/%d CDS\n",
+              matched, length(genes)))
+  if (matched == 0) {
+    cat(sprintf(
+      "WARNING: header regex matched zero CDS in %s. ",
+      cds_fasta
+    ))
+    cat("This usually means the FASTA was annotated by a tool whose RP ")
+    cat("naming differs from Prokka's. Pass an explicit HE gene ID file ")
+    cat("(--he-ids-file) to fix this.\n")
+  }
 }
 
 n_he <- sum(highly_expressed)
@@ -382,9 +398,14 @@ if (n_he < 1) {
   quit(save = "no", status = 0)
 }
 
-# Run gRodon2 in full mode with default (Madin) training set
+# Run gRodon2 with the chosen mode and training set.
+# - mode = "full" (default): RP-vs-genome model, validated for genome assemblies.
+# - mode = "partial": RP-only model, for cases where intergenic data is missing.
+# - mode = "metagenome_v2": metagenome-MAG model.
+# - training_set = "madin" (default): Madin et al. 2020 broad bacteria/archaea fit.
+# - training_set = "vieira": Vieira-Silva & Rocha 2010 proteobacteria fit.
 tryCatch({
-  pred <- predictGrowth(genes, highly_expressed, mode = "full", training_set = "madin")
+  pred <- predictGrowth(genes, highly_expressed, mode = mode_arg, training_set = training_set_arg)
 
   result <- list(
     status = "success",
@@ -420,13 +441,15 @@ def run_grodon(
     sample_id: str,
     rp_ids_file: Path | str | None = None,
     he_ids_file: Path | str | None = None,
+    mode: str = "full",
+    training_set: str = "madin",
 ) -> dict | None:
     """Run gRodon2 growth rate prediction on a CDS FASTA file.
 
     The full genome CDS set is always used as the background for CUBHE/CPB
     computation.  The HE gene set defaults to ribosomal protein IDs; if
     neither *rp_ids_file* nor *he_ids_file* is given, gRodon2 falls back
-    to its built-in ribosomal protein header regex.
+    to a Prokka-style ribosomal protein header regex.
 
     Args:
         ffn_path: Path to CDS nucleotide FASTA (in-frame coding sequences).
@@ -442,11 +465,34 @@ def run_grodon(
             strongly biased HE set (ribosomal proteins).  Supplying a
             larger set (e.g. hundreds of high-MELP genes) dilutes CUBHE
             and causes the model to underestimate growth rate.
+        mode: gRodon2 prediction mode. One of:
+            * "full" (default): RP-vs-genome model, validated for genome
+              assemblies.
+            * "partial": RP-only model, for cases where intergenic data is
+              missing or the genome is fragmentary.
+            * "metagenome_v2": metagenome-MAG model (Weissman 2021).
+            Pick a non-default mode only with reason; the published
+            calibrations differ between modes.
+        training_set: gRodon2 training set. One of:
+            * "madin" (default): Madin et al. 2020 broad bacteria/archaea.
+            * "vieira": Vieira-Silva & Rocha 2010 proteobacteria-only fit.
+            "madin" is the modern published default; "vieira" is provided
+            for direct comparison with older literature.
 
     Returns:
         Dict with gRodon2 results (doubling time, CI, codon stats),
         or None if gRodon2 is unavailable or the run fails.
     """
+    if mode not in {"full", "partial", "metagenome_v2"}:
+        raise ValueError(
+            f"gRodon2 mode {mode!r} is not supported. "
+            "Use 'full', 'partial', or 'metagenome_v2'."
+        )
+    if training_set not in {"madin", "vieira"}:
+        raise ValueError(
+            f"gRodon2 training_set {training_set!r} is not supported. "
+            "Use 'madin' or 'vieira'."
+        )
     if not is_grodon_available():
         return None
 
@@ -479,7 +525,8 @@ def run_grodon(
     try:
         cmd = ["Rscript", "--no-save", "--no-restore", r_script_path,
                str(ffn_path), json_out_path,
-               effective_he or ""]
+               effective_he or "",
+               mode, training_set]
         result = subprocess.run(
             cmd,
             capture_output=True,
