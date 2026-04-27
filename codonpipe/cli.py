@@ -658,13 +658,20 @@ def corpus_cmd(
 @click.option("-o", "--output-dir", "output_dir", default=None,
               type=click.Path(path_type=Path),
               help="Output directory. Defaults to <SAMPLE_DIR>/codon_optimization/.")
+@click.option("--ffn-path", "ffn_path", default=None,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Path to the gene CDS .ffn file. Use when codonpipe was "
+                   "run with an external --prokka-ffn (the file isn't copied "
+                   "into the sample directory in that case). Defaults to "
+                   "auto-discovery under <SAMPLE_DIR>/[annotation/]prokka/.")
 @click.option("--no-figure", is_flag=True,
-              help="Skip the three figures, write only the TSV outputs.")
+              help="Skip the figures, write only the TSV outputs.")
 @click.option("-v", "--verbose", is_flag=True, help="Debug-level logging.")
 def codon_optimization_cmd(
     sample_dir: Path,
     sample_id: str | None,
     output_dir: Path | None,
+    ffn_path: Path | None,
     no_figure: bool,
     verbose: bool,
 ):
@@ -707,7 +714,9 @@ def codon_optimization_cmd(
 
     try:
         outputs = run_codon_optimization(
-            sample_dir, sid, out_dir, make_figures=not no_figure,
+            sample_dir, sid, out_dir,
+            make_figures=not no_figure,
+            ffn_path=ffn_path,
         )
     except FileNotFoundError as e:
         logger.error("%s", e)
