@@ -50,7 +50,21 @@ _DEFAULT_CORE_THRESHOLD = 0.5
 # Kept for backward compatibility with pipeline calls
 _DEFAULT_MULTIPLIER_GRID = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
 
-# Weights for composite stability score
+# Weights for the composite cluster-stability score. The score combines
+# three complementary signals:
+#   - Jaccard similarity across bootstrap resamples (set overlap of the
+#     RP cluster identity) — weighted highest because identity is the
+#     primary thing we want stable.
+#   - Mean per-gene membership frequency in the RP cluster (does each
+#     RP gene reliably end up in the cluster?).
+#   - Cosine similarity of cluster mean RSCU across bootstraps (does
+#     the cluster's codon-usage signature stay constant?).
+# The 0.4 / 0.3 / 0.3 weighting is heuristic, not derived from a fit.
+# The Jaccard term is given a slight edge because it summarises the
+# binary "is this gene in / out" agreement that matters most for
+# downstream HGT calls; the other two are diagnostic of softer
+# instability modes. Tune these constants if you have a benchmark set
+# of stable vs unstable clusters and want to recalibrate.
 _W_JACCARD = 0.40
 _W_MEAN_FREQ = 0.30
 _W_COSINE = 0.30
