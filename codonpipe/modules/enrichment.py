@@ -83,6 +83,29 @@ def load_ko_pathway_map(
         return {}
 
 
+def _alias_pathway_prefixes(names: dict[str, str]) -> dict[str, str]:
+    """Add ko##### ↔ map##### aliases in-place and return the dict.
+
+    KEGG REST is internally inconsistent about pathway-ID prefixes:
+    ``/link/pathway/ko`` returns each KO once with ``path:ko#####`` and
+    once with ``path:map#####``. The codonpipe link-file parser drops
+    the ``map`` rows and keeps ``ko``. Meanwhile ``/list/pathway/ko``
+    returns names keyed on ``map#####`` even though the URL ends in
+    ``/ko``. Without aliasing, the names dict is keyed on ``map00010``
+    while enrichment looks up ``ko00010`` — every join misses and
+    pathway plots fall back to bare ko##### IDs. For any 5-digit
+    pathway ID present under one prefix, store the alternate prefix
+    pointing at the same name. Module IDs (``M#####``) are unaffected
+    because their prefix is unambiguous.
+    """
+    for key, value in list(names.items()):
+        if key.startswith("ko") and len(key) == 7 and key[2:].isdigit():
+            names.setdefault("map" + key[2:], value)
+        elif key.startswith("map") and len(key) == 8 and key[3:].isdigit():
+            names.setdefault("ko" + key[3:], value)
+    return names
+
+
 def _load_user_names_tsv(path: Path) -> dict[str, str]:
     """Parse a user-supplied 2-column TSV of ``<id>\\t<name>``.
 
@@ -90,6 +113,19 @@ def _load_user_names_tsv(path: Path) -> dict[str, str]:
     the file format is identical to what the KEGG REST API serves at
     ``/list/pathway/ko`` and ``/list/module``. Lines starting with ``#``
     and blank lines are ignored.
+
+    Pathway-ID prefix aliasing:
+        KEGG REST is internally inconsistent about pathway-ID prefixes.
+        ``/link/pathway/ko`` returns each KO once with ``path:ko#####``
+        and once with ``path:map#####``; codonpipe's link-file parser
+        drops the ``map`` rows and keeps ``ko``. ``/list/pathway/ko``
+        returns names keyed on ``map#####`` even though the URL ends
+        in ``/ko``. Without aliasing, the names dict is keyed on
+        ``map00010`` while enrichment looks up ``ko00010`` — every
+        join misses and pathway plots fall back to bare ko##### IDs.
+        For any 5-digit pathway ID that arrives under one prefix, we
+        also store the alternate prefix so callers can look up either.
+        Module IDs (``M#####``) and other identifiers are unaffected.
     """
     names: dict[str, str] = {}
     with open(path) as f:
@@ -105,7 +141,11 @@ def _load_user_names_tsv(path: Path) -> dict[str, str]:
                         key = key[len(prefix):]
                         break
                 names[key] = parts[1].strip()
-    return names
+    # Apply pathway-ID aliasing once at the end so callers always get a
+    # dict that resolves both ``ko#####`` and ``map#####`` lookups. This
+    # is a no-op for module-name TSVs (M##### keys don't match either
+    # branch).
+    return _alias_pathway_prefixes(names)
 
 
 def load_pathway_names(
@@ -148,7 +188,24 @@ def load_pathway_names(
         cached = cache_dir / "kegg_pathway_names.json"
         if cached.exists():
             with open(cached) as f:
-                return json.load(f)
+                cached_names = json.load(f)
+            # Heal stale caches written before the prefix-alias fix —
+            # if the cache only contains map##### keys, lookups for
+            # ko##### would still miss without this. Cheap to compute
+            # and the result is rewritten so future runs don't redo it.
+            healed = _alias_pathway_prefixes(dict(cached_names))
+            if len(healed) > len(cached_names):
+                try:
+                    with open(cached, "w") as f:
+                        json.dump(healed, f)
+                    logger.info(
+                        "Aliased %d ko##### ↔ map##### pathway-name "
+                        "entries in stale cache at %s",
+                        len(healed) - len(cached_names), cached,
+                    )
+                except Exception:
+                    pass
+            return healed
 
     try:
         names = _download_kegg_pathway_names()
@@ -268,7 +325,10 @@ def _download_kegg_pathway_names(max_retries: int = 3) -> dict[str, str]:
         if len(parts) >= 2:
             pid = parts[0].strip().replace("path:", "")
             names[pid] = parts[1].strip()
-    return names
+    # KEGG returns names keyed on map##### from /list/pathway/ko even
+    # though the URL ends in /ko; alias them so ko##### lookups also
+    # resolve. See _alias_pathway_prefixes for the full rationale.
+    return _alias_pathway_prefixes(names)
 
 
 # ── Hypergeometric enrichment test ───────────────────────────────────────────
