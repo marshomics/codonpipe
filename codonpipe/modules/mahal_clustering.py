@@ -535,29 +535,48 @@ def _detect_rp_subclusters(
     X_rp: np.ndarray,
     rp_gene_ids_list: list[str],
     max_k: int = _RP_SUBCLUSTER_MAX_K,
+    min_samples_per_dim: int = 8,
 ) -> list[dict]:
-    """Detect RP sub-populations via GMM+BIC on first 2 COA axes.
+    """Detect RP sub-populations via GMM+BIC on COA space.
+
+    Fits GMM in the highest dimensionality the sample size will support:
+    we require at least ``min_samples_per_dim`` RP genes per active axis
+    (with full covariance, the per-component parameter count grows as
+    ``d * (d + 3) / 2``, so this is a conservative rule of thumb that
+    keeps each component well-determined). When the RP set is too small
+    to fit a stable full-covariance GMM in the full space, we shrink to
+    the leading axes that the sample size can support, with a 2D floor
+    matching the previous behaviour. The number of dimensions actually
+    used is logged.
 
     Returns a list of sub-cluster dicts, each with keys:
-      X, gene_ids, label, n, avg_dist
-    Sorted by n (largest first).  Returns a single-element list if
-    no split is detected.
+      X, gene_ids, label, n, avg_dist, n_dims_used
+    Sorted by n (largest first). Returns a single-element list if no
+    split is detected.
     """
     n_rp = len(X_rp)
     if n_rp < _RP_SUBCLUSTER_MIN:
         return [{"X": X_rp, "gene_ids": rp_gene_ids_list, "label": 0,
-                 "n": n_rp, "avg_dist": 0.0}]
+                 "n": n_rp, "avg_dist": 0.0,
+                 "n_dims_used": int(X_rp.shape[1])}]
 
-    X_2d = X_rp[:, :2] if X_rp.shape[1] >= 2 else X_rp
+    # Choose fit dimensionality. Use as many leading axes as the sample
+    # supports, with a 2D minimum (matching the prior implementation) and
+    # a 1D fallback when even 2D would over-fit.
+    available_dims = int(X_rp.shape[1])
+    n_dims_supported = max(1, n_rp // max(min_samples_per_dim, 1))
+    n_dims_used = min(available_dims, max(2, n_dims_supported)) if available_dims >= 2 else available_dims
+    X_fit = X_rp[:, :n_dims_used]
 
     best_k, best_bic = 1, np.inf
     gmm_best = None
     for k in range(1, min(max_k + 1, n_rp)):
         try:
             gmm = GaussianMixture(n_components=k, random_state=42,
-                                  covariance_type="full", n_init=3)
-            gmm.fit(X_2d)
-            bic = gmm.bic(X_2d)
+                                  covariance_type="full", n_init=3,
+                                  reg_covar=1e-4)
+            gmm.fit(X_fit)
+            bic = gmm.bic(X_fit)
             if bic < best_bic:
                 best_bic, best_k, gmm_best = bic, k, gmm
         except Exception:
@@ -565,9 +584,10 @@ def _detect_rp_subclusters(
 
     if best_k <= 1 or gmm_best is None:
         return [{"X": X_rp, "gene_ids": rp_gene_ids_list, "label": 0,
-                 "n": n_rp, "avg_dist": 0.0}]
+                 "n": n_rp, "avg_dist": 0.0,
+                 "n_dims_used": n_dims_used}]
 
-    labels = gmm_best.predict(X_2d)
+    labels = gmm_best.predict(X_fit)
     min_members = max(3, int(_RP_SUBCLUSTER_MIN_FRAC * n_rp))
     subclusters = []
 
@@ -581,19 +601,22 @@ def _detect_rp_subclusters(
         avg_dist = float(np.mean(np.linalg.norm(X_sub - centroid_sub, axis=1)))
         sub_ids = [gid for gid, sel in zip(rp_gene_ids_list, mask) if sel]
         subclusters.append({"X": X_sub, "gene_ids": sub_ids, "label": int(lab),
-                            "n": n_sub, "avg_dist": avg_dist})
+                            "n": n_sub, "avg_dist": avg_dist,
+                            "n_dims_used": n_dims_used})
 
     if not subclusters:
         return [{"X": X_rp, "gene_ids": rp_gene_ids_list, "label": 0,
-                 "n": n_rp, "avg_dist": 0.0}]
+                 "n": n_rp, "avg_dist": 0.0,
+                 "n_dims_used": n_dims_used}]
 
     # Sort by number of RP genes (largest first)
     subclusters.sort(key=lambda s: -s["n"])
 
     logger.info(
-        "RP sub-cluster detection: BIC favours k=%d, %d qualifying sub-clusters "
-        "(sizes: %s)",
-        best_k, len(subclusters), [s["n"] for s in subclusters],
+        "RP sub-cluster detection: BIC favours k=%d in %dD (of %d available; "
+        "min_samples_per_dim=%d, n_rp=%d), %d qualifying sub-clusters (sizes: %s)",
+        best_k, n_dims_used, available_dims, min_samples_per_dim, n_rp,
+        len(subclusters), [s["n"] for s in subclusters],
     )
     return subclusters
 
@@ -1431,8 +1454,68 @@ def run_mahal_clustering(
 
     results["rp_subclusters"] = rp_fits
 
-    # Select representative: most RP genes in cluster
-    primary = max(rp_fits, key=lambda f: f["n_rp_in_cluster"])
+    # Compute each sub-cluster's cosine similarity to the canonical RP RSCU
+    # consensus. Pure RP-count selection ("the cluster with the most RP
+    # genes wins") can be fooled when HGT or paralogy creates a secondary
+    # RP-annotated cohort with non-canonical codon usage. Adding RSCU
+    # similarity as a sanity gate ensures the chosen "optimized" cluster
+    # actually looks like the host's ribosomal protein RSCU profile.
+    if rp_rscu_df is not None and not rp_rscu_df.empty:
+        rp_rscu_cols_global = [
+            c for c in RSCU_COLUMN_NAMES if c in rp_rscu_df.columns
+        ]
+        if rp_rscu_cols_global:
+            rp_consensus = rp_rscu_df[rp_rscu_cols_global].mean()
+            for fit in rp_fits:
+                cluster_rscu_series = fit.get("cluster_rscu")
+                if cluster_rscu_series is None:
+                    fit["rp_cosine_sim"] = float("nan")
+                    continue
+                shared = [
+                    c for c in rp_rscu_cols_global
+                    if c in cluster_rscu_series.index
+                ]
+                if not shared:
+                    fit["rp_cosine_sim"] = float("nan")
+                    continue
+                fit["rp_cosine_sim"] = 1.0 - cosine_dist(
+                    cluster_rscu_series[shared].fillna(0).values,
+                    rp_consensus[shared].fillna(0).values,
+                )
+        else:
+            for fit in rp_fits:
+                fit["rp_cosine_sim"] = float("nan")
+    else:
+        for fit in rp_fits:
+            fit["rp_cosine_sim"] = float("nan")
+
+    # Select representative. Prefer the sub-cluster whose RSCU is closest to
+    # the canonical RP consensus (highest cosine similarity), with a
+    # tie-breaker on RP gene count. When RSCU similarity is unavailable for
+    # all sub-clusters (no rp_rscu_df), fall back to RP-count alone.
+    def _primary_key(fit: dict) -> tuple[float, int]:
+        sim = fit.get("rp_cosine_sim", float("nan"))
+        # NaN sorts last under max() with the trick below; replace with -inf.
+        sim_val = sim if sim == sim else float("-inf")
+        return (sim_val, fit.get("n_rp_in_cluster", 0))
+
+    if any(f.get("rp_cosine_sim") == f.get("rp_cosine_sim") for f in rp_fits):
+        primary = max(rp_fits, key=_primary_key)
+        logger.info(
+            "Primary RP cluster selection: cosine similarity to RP consensus = %.3f, "
+            "n_rp_in_cluster = %d (out of %d candidates)",
+            primary.get("rp_cosine_sim", float("nan")),
+            primary.get("n_rp_in_cluster", 0),
+            len(rp_fits),
+        )
+    else:
+        primary = max(rp_fits, key=lambda f: f["n_rp_in_cluster"])
+        logger.info(
+            "Primary RP cluster selection (no RSCU consensus available): "
+            "n_rp_in_cluster = %d (out of %d candidates)",
+            primary.get("n_rp_in_cluster", 0),
+            len(rp_fits),
+        )
 
     # Unpack primary RP cluster
     centroid = primary["centroid"]
