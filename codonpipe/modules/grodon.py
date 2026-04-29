@@ -102,6 +102,39 @@ local({
 """
 
 
+def _grodon_lib_pin_path() -> Path:
+    """Path of the small text file that records the library directory the
+    install script wrote gRodon2 into. Used by :func:`is_grodon_available`
+    so that ``codonpipe install-grodon`` and a later pipeline run reach
+    the same install even when ``R_LIBS_USER`` resolves differently
+    between login and compute nodes (a common cluster pitfall).
+    """
+    return Path.home() / ".codonpipe" / "grodon_lib"
+
+
+def _persist_grodon_lib(lib_path: str) -> None:
+    """Save the resolved gRodon install lib so future probes can find it."""
+    pin = _grodon_lib_pin_path()
+    try:
+        pin.parent.mkdir(parents=True, exist_ok=True)
+        pin.write_text(lib_path.strip() + "\n")
+        logger.info("Recorded gRodon library path: %s -> %s", pin, lib_path)
+    except OSError as exc:
+        logger.warning("Could not record gRodon library path at %s: %s", pin, exc)
+
+
+def _read_pinned_grodon_lib() -> str | None:
+    """Read back the persisted gRodon install lib, if any."""
+    pin = _grodon_lib_pin_path()
+    if not pin.is_file():
+        return None
+    try:
+        text = pin.read_text().strip()
+        return text or None
+    except OSError:
+        return None
+
+
 def _r_user_lib(rscript: str) -> str | None:
     """Return R's resolved user library path.
 
@@ -246,6 +279,12 @@ def install_grodon(timeout: int = 600) -> bool:
                                         verbose=True)
             if version is not None:
                 logger.info("gRodon2 version %s is now available", version)
+                # Persist the install lib so that later pipeline runs (which
+                # may launch on a different node where R_LIBS_USER expands
+                # to a different directory) can find it without re-doing the
+                # full probe-and-fallback dance.
+                if install_lib:
+                    _persist_grodon_lib(install_lib)
                 return True
             else:
                 logger.error(
@@ -288,13 +327,36 @@ def is_grodon_available() -> bool:
         _GRODON_AVAILABLE = False
         return False
 
+    # Three-tier probe with progressively more lib hints. Tracked so the
+    # final failure log can list what was actually tried — that's the
+    # diagnostic users need on a cluster where R_LIBS_USER differs
+    # between login and compute nodes.
+    tried: list[str] = []
+
     version = _probe_grodon(rscript)
+    tried.append(".libPaths() default")
+
     if version is None:
-        # The user library may not be on R's default .libPaths() (e.g.
-        # when .Renviron is absent or R_LIBS_USER has %V placeholders).
-        # Try once more with the conventional ~/R/library path.
+        # 1. Pinned install lib written by ``codonpipe install-grodon``. This
+        #    is the most reliable hint because it records the exact path R
+        #    used at install time, regardless of how R_LIBS_USER expands now.
+        pinned = _read_pinned_grodon_lib()
+        if pinned:
+            tried.append(f"pinned ({pinned})")
+            if Path(pinned).is_dir():
+                version = _probe_grodon(rscript, extra_lib=pinned)
+            else:
+                logger.info(
+                    "gRodon2: pinned library path %s no longer exists; "
+                    "ignoring pin and continuing the probe.", pinned,
+                )
+
+    if version is None:
+        # 2. The conventional R user library, expanded via R itself so the
+        #    %p / %v / %V placeholders match how R sees them now.
         user_lib = _r_user_lib(rscript)
         if user_lib:
+            tried.append(f"R_LIBS_USER ({user_lib})")
             version = _probe_grodon(rscript, extra_lib=user_lib)
 
     if version is not None:
@@ -303,7 +365,11 @@ def is_grodon_available() -> bool:
     else:
         logger.info(
             "gRodon2: R package not loadable; predictions will be skipped. "
-            "Run 'codonpipe install-grodon' to install it."
+            "Probe tried: %s. Run 'codonpipe install-grodon' to install it; "
+            "if you have already installed it, the install path may not be "
+            "on this node's .libPaths() — re-run 'codonpipe install-grodon' "
+            "from this same environment so the install is recorded at %s.",
+            ", ".join(tried), _grodon_lib_pin_path(),
         )
         _GRODON_AVAILABLE = False
 
@@ -326,8 +392,16 @@ _R_SCRIPT = r"""
 # cluster) collapses the HE-vs-background contrast and causes the model
 # to severely underestimate growth rate.
 
-# Ensure user library is on the search path even when .Renviron is absent
+# Ensure user library is on the search path even when .Renviron is absent.
+# Two hints: the pinned path written by `codonpipe install-grodon`
+# (~/.codonpipe/grodon_lib), and the conventional R user library. The
+# pinned path wins because it records the actual install location at
+# install time — the only path we know for certain contains gRodon2.
 local({
+  pin_file <- file.path(Sys.getenv("HOME"), ".codonpipe", "grodon_lib")
+  pin <- if (file.exists(pin_file)) trimws(readLines(pin_file, warn = FALSE)[1]) else ""
+  if (nchar(pin) > 0 && dir.exists(pin)) .libPaths(c(pin, .libPaths()))
+
   user_lib <- Sys.getenv("R_LIBS_USER", unset = "")
   if (nchar(user_lib) == 0 || grepl("%", user_lib, fixed = TRUE)) {
     user_lib <- file.path(Sys.getenv("HOME"), "R", "library")
