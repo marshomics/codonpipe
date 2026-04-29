@@ -83,14 +83,67 @@ def load_ko_pathway_map(
         return {}
 
 
+def _load_user_names_tsv(path: Path) -> dict[str, str]:
+    """Parse a user-supplied 2-column TSV of ``<id>\\t<name>``.
+
+    Strips ``path:``, ``ko:``, and ``md:`` prefixes from the ID column so
+    the file format is identical to what the KEGG REST API serves at
+    ``/list/pathway/ko`` and ``/list/module``. Lines starting with ``#``
+    and blank lines are ignored.
+    """
+    names: dict[str, str] = {}
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                key = parts[0].strip()
+                for prefix in ("path:", "ko:", "md:"):
+                    if key.startswith(prefix):
+                        key = key[len(prefix):]
+                        break
+                names[key] = parts[1].strip()
+    return names
+
+
 def load_pathway_names(
     cache_dir: Path | None = None,
+    user_file: Path | None = None,
 ) -> dict[str, str]:
     """Load KEGG pathway ID -> pathway name mapping.
+
+    Resolution order:
+        1. ``user_file`` if supplied and present — a TSV from
+           ``https://rest.kegg.jp/list/pathway/ko``. This path lets a
+           user fetch the file once on a node with internet access and
+           reuse it on offline compute nodes.
+        2. JSON cache under ``cache_dir`` (``kegg_pathway_names.json``).
+        3. Fresh download from KEGG REST.
+
+    When a user file is provided, the JSON cache is refreshed from it
+    so subsequent runs in the same output directory pick up the names
+    even without re-passing the flag.
 
     Returns:
         Dict mapping pathway ID (e.g. 'ko00010') to name (e.g. 'Glycolysis').
     """
+    if user_file is not None and user_file.exists():
+        names = _load_user_names_tsv(user_file)
+        logger.info(
+            "Loaded user pathway-names map: %d pathways from %s",
+            len(names), user_file,
+        )
+        if cache_dir is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(cache_dir / "kegg_pathway_names.json", "w") as fh:
+                    json.dump(names, fh)
+            except Exception:
+                pass
+        return names
+
     if cache_dir is not None:
         cached = cache_dir / "kegg_pathway_names.json"
         if cached.exists():
@@ -338,6 +391,7 @@ def run_enrichment_analysis(
     ko_pathway_map: dict[str, set[str]] | None = None,
     pathway_names: dict[str, str] | None = None,
     kegg_ko_pathway_file: Path | None = None,
+    kegg_pathway_names_file: Path | None = None,
     fdr_threshold: float = 0.05,
     metrics: list[str] | None = None,
     output_subdir: str = "enrichment",
@@ -386,7 +440,9 @@ def run_enrichment_analysis(
         return outputs
 
     if pathway_names is None:
-        pathway_names = load_pathway_names(cache_dir=cache_dir)
+        pathway_names = load_pathway_names(
+            cache_dir=cache_dir, user_file=kegg_pathway_names_file,
+        )
 
     # Merge KO annotations onto expression data
     ko_col = _find_ko_column(kofam_df)
