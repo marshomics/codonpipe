@@ -16,14 +16,20 @@ from codonpipe.utils.statistics import benjamini_hochberg
 logger = logging.getLogger("codonpipe")
 
 
-def pairwise_wilcoxon(
+def pairwise_mannwhitneyu(
     df: pd.DataFrame,
     group_col: str,
     value_cols: list[str],
     alpha: float = 0.01,
     correction: str = "fdr_bh",
 ) -> pd.DataFrame:
-    """Perform pairwise Wilcoxon rank-sum tests between groups for each codon.
+    """Pairwise Mann-Whitney U tests between groups for each codon.
+
+    The Mann-Whitney U test is mathematically equivalent to the
+    Wilcoxon rank-sum test for two independent samples; both names
+    appear in the literature. This function operates on *independent*
+    samples (one row per gene per group) — it is NOT the Wilcoxon
+    *signed-rank* test, which requires paired observations.
 
     Args:
         df: DataFrame with group column and RSCU value columns.
@@ -42,6 +48,7 @@ def pairwise_wilcoxon(
     groups = sorted(df[group_col].dropna().unique())
     pairs = list(itertools.combinations(groups, 2))
     results = []
+    n_skipped_small = 0
 
     for col in value_cols:
         for g1, g2 in pairs:
@@ -49,6 +56,7 @@ def pairwise_wilcoxon(
             vals2 = df.loc[df[group_col] == g2, col].dropna()
 
             if len(vals1) < 5 or len(vals2) < 5:
+                n_skipped_small += 1
                 continue
 
             try:
@@ -61,9 +69,20 @@ def pairwise_wilcoxon(
                             col, len(vals1), len(vals2))
 
             # Extract amino acid from column name (format: {AA}{digits}-{codon}).
-            # Validate the expected format before extracting.
+            # Validate the expected format and warn if the heuristic falls
+            # back to using the raw column name — silently misattributing
+            # codons to amino acids would corrupt the per-AA grouping in
+            # downstream tables.
             parts = col.split("-")
-            aa = parts[0].rstrip("0123456789") if len(parts) >= 2 and parts[0] else col
+            if len(parts) >= 2 and parts[0]:
+                aa = parts[0].rstrip("0123456789")
+            else:
+                logger.warning(
+                    "Column '%s' does not match expected '{AA}{n}-{codon}' "
+                    "format; using full column name as amino-acid label",
+                    col,
+                )
+                aa = col
             results.append({
                 "codon": col,
                 "amino_acid": aa,
@@ -74,6 +93,14 @@ def pairwise_wilcoxon(
                 "statistic": stat,
                 "p_value": p_val,
             })
+
+    if n_skipped_small:
+        logger.info(
+            "Skipped %d (codon, group-pair) comparisons due to n<5 in one "
+            "of the groups; users should be aware that small-group cells "
+            "are not represented in the output table.",
+            n_skipped_small,
+        )
 
     if not results:
         return pd.DataFrame()
@@ -93,12 +120,20 @@ def pairwise_wilcoxon(
     return result_df
 
 
+# Backwards-compatible alias. The historical function name was
+# pairwise_wilcoxon; the underlying test has always been Mann-Whitney U
+# (the Wilcoxon *rank-sum* test on independent samples, which is the
+# same statistic). The alias keeps existing callers working; new code
+# should reach for ``pairwise_mannwhitneyu``.
+pairwise_wilcoxon = pairwise_mannwhitneyu
+
+
 def per_amino_acid_tests(
     df: pd.DataFrame,
     group_col: str,
     alpha: float = 0.01,
 ) -> dict[str, pd.DataFrame]:
-    """Run pairwise Wilcoxon tests for each amino acid family separately.
+    """Run pairwise Mann-Whitney U tests for each amino acid family.
 
     Args:
         df: DataFrame with RSCU values and group column.
@@ -113,7 +148,7 @@ def per_amino_acid_tests(
         present_cols = [c for c in cols if c in df.columns]
         if not present_cols:
             continue
-        aa_result = pairwise_wilcoxon(df, group_col, present_cols, alpha)
+        aa_result = pairwise_mannwhitneyu(df, group_col, present_cols, alpha)
         if not aa_result.empty:
             results[aa] = aa_result
     return results
@@ -211,9 +246,16 @@ def run_batch_statistics(
             )
             continue
 
-        logger.info("Running pairwise Wilcoxon tests grouped by '%s'", col)
+        logger.info(
+            "Running pairwise Mann-Whitney U tests (≡ Wilcoxon rank-sum on "
+            "independent samples) grouped by '%s'",
+            col,
+        )
         aa_results = per_amino_acid_tests(combined_rscu_df, col)
 
+        # Output paths keep the legacy "_wilcoxon" suffix so downstream
+        # tooling that globs for *_wilcoxon.tsv keeps working. The TSVs
+        # themselves are unchanged.
         for aa, result_df in aa_results.items():
             out_path = stats_dir / f"{col}_{aa}_wilcoxon.tsv"
             result_df.to_csv(out_path, sep="\t", index=False)
