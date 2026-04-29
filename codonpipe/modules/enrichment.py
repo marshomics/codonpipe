@@ -84,25 +84,36 @@ def load_ko_pathway_map(
 
 
 def _alias_pathway_prefixes(names: dict[str, str]) -> dict[str, str]:
-    """Add ko##### ↔ map##### aliases in-place and return the dict.
+    """Add cross-prefix aliases for KEGG pathway IDs in-place.
 
     KEGG REST is internally inconsistent about pathway-ID prefixes:
     ``/link/pathway/ko`` returns each KO once with ``path:ko#####`` and
     once with ``path:map#####``. The codonpipe link-file parser drops
     the ``map`` rows and keeps ``ko``. Meanwhile ``/list/pathway/ko``
-    returns names keyed on ``map#####`` even though the URL ends in
-    ``/ko``. Without aliasing, the names dict is keyed on ``map00010``
-    while enrichment looks up ``ko00010`` — every join misses and
-    pathway plots fall back to bare ko##### IDs. For any 5-digit
-    pathway ID present under one prefix, store the alternate prefix
-    pointing at the same name. Module IDs (``M#####``) are unaffected
-    because their prefix is unambiguous.
+    can return names keyed on ``map#####`` (older format) or on bare
+    five-digit numerics (newer format), even though the URL ends in
+    ``/ko``. Without aliasing, the names dict and the link map don't
+    share keys — every join misses and pathway plots fall back to
+    bare ko##### IDs.
+
+    Strategy: for any key recognisable as a pathway ID, populate all
+    three aliases (``ko#####``, ``map#####``, bare digits ``#####``)
+    pointing at the same name. Module IDs (``M#####``) and other
+    identifiers are unaffected because their format does not match
+    any of the three pathway-ID shapes.
     """
     for key, value in list(names.items()):
+        digits = None
         if key.startswith("ko") and len(key) == 7 and key[2:].isdigit():
-            names.setdefault("map" + key[2:], value)
+            digits = key[2:]
         elif key.startswith("map") and len(key) == 8 and key[3:].isdigit():
-            names.setdefault("ko" + key[3:], value)
+            digits = key[3:]
+        elif len(key) == 5 and key.isdigit():
+            digits = key
+        if digits is not None:
+            names.setdefault("ko" + digits, value)
+            names.setdefault("map" + digits, value)
+            names.setdefault(digits, value)
     return names
 
 
@@ -383,6 +394,40 @@ def hypergeometric_enrichment(
     pathways_to_test = [pw for pw in test_pathway_kos if pw in bg_pathway_kos]
     if not pathways_to_test:
         return pd.DataFrame()
+
+    # Diagnostic: how many of the pathway IDs we'll be testing actually
+    # resolve to a name in the supplied dict? Anything less than ~95% of
+    # tested pathways means the names file used different ID formatting
+    # than the link file (the classic cause: ko##### vs map##### vs
+    # bare digits). Show three sample missing IDs and three sample names
+    # so the user can compare formats and fix the mismatch upstream.
+    if pathway_names:
+        resolved = sum(1 for pw in pathways_to_test if pathway_names.get(pw))
+        n_test = len(pathways_to_test)
+        if resolved < n_test * 0.5:
+            sample_missing = [
+                pw for pw in pathways_to_test if not pathway_names.get(pw)
+            ][:3]
+            sample_have = list(pathway_names.keys())[:3]
+            logger.warning(
+                "Pathway-name coverage: %d/%d tested pathway IDs resolved "
+                "to a name (%.0f%%). The names dict likely uses a "
+                "different ID prefix than the link file. Example missing "
+                "lookups: %s. Example keys present in names dict: %s.",
+                resolved, n_test, 100 * resolved / n_test,
+                sample_missing, sample_have,
+            )
+        else:
+            logger.info(
+                "Pathway-name coverage: %d/%d tested pathway IDs resolved "
+                "to a name (%.0f%%)",
+                resolved, n_test, 100 * resolved / n_test,
+            )
+    else:
+        logger.warning(
+            "No pathway-names dict supplied to enrichment; pathway plots "
+            "will fall back to bare ko##### IDs",
+        )
 
     # Population sizes: use all genes, not just those with pathway annotations
     M = len(background_kos)
