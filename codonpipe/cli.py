@@ -11,6 +11,59 @@ from codonpipe import __version__
 from codonpipe.utils.logging import setup_logger
 
 
+# Lower bound on GSEA permutations. Below 100, the smallest possible
+# empirical p-value (1/(N+1)) is too coarse to support FDR correction.
+# 1000 is the published default (Subramanian 2005).
+_GSEA_MIN_PERMUTATIONS = 100
+
+
+def _validate_clustering_params(
+    mahal_min_k: int,
+    mahal_max_k: int,
+    stability_core_threshold: float,
+    gsea_permutations: int,
+    stability_bootstraps: int,
+) -> None:
+    """Validate CLI parameters that the pipeline assumes are well-formed.
+
+    Catches scientifically invalid configurations at the CLI boundary
+    rather than letting them propagate into the analysis layer where
+    the failure modes are opaque (silently empty cluster, p=0 from
+    too-few permutations, etc.).
+
+    Raises:
+        click.BadParameter: with a message identifying the offending flag.
+    """
+    if mahal_min_k < 1:
+        raise click.BadParameter(
+            f"--mahal-min-k must be >= 1 (got {mahal_min_k})",
+            param_hint="--mahal-min-k",
+        )
+    if mahal_max_k < mahal_min_k:
+        raise click.BadParameter(
+            f"--mahal-max-k ({mahal_max_k}) must be >= --mahal-min-k ({mahal_min_k})",
+            param_hint="--mahal-max-k",
+        )
+    if not (0.0 <= stability_core_threshold <= 1.0):
+        raise click.BadParameter(
+            f"--stability-core-threshold must be in [0, 1] (got {stability_core_threshold})",
+            param_hint="--stability-core-threshold",
+        )
+    if gsea_permutations < _GSEA_MIN_PERMUTATIONS:
+        raise click.BadParameter(
+            f"--gsea-permutations must be >= {_GSEA_MIN_PERMUTATIONS} "
+            f"(got {gsea_permutations}); below this threshold the empirical "
+            f"p-values are too coarse for FDR correction.",
+            param_hint="--gsea-permutations",
+        )
+    if stability_bootstraps < 20:
+        raise click.BadParameter(
+            f"--stability-bootstraps must be >= 20 (got {stability_bootstraps}); "
+            f"fewer replicates produce unstable membership-frequency estimates.",
+            param_hint="--stability-bootstraps",
+        )
+
+
 @click.group()
 @click.version_option(__version__, prog_name="codonpipe")
 def main():
@@ -92,7 +145,16 @@ def main():
                    "bootstrap boundary method. 0.5 = majority-rule consensus; "
                    "0.9 = high-confidence subset.")
 @click.option("--kegg-ko-pathway", type=click.Path(exists=True, path_type=Path), default=None,
-              help="KO-to-pathway mapping TSV for offline enrichment (auto-downloaded from KEGG if omitted).")
+              help="KO-to-pathway mapping TSV (used by Step 7 hypergeometric "
+                   "enrichment AND by Step 9 GSEA pathway gene-sets). "
+                   "Auto-downloaded from KEGG if omitted. NOTE: this flag only "
+                   "covers KO→pathway; KEGG modules are a separate map and "
+                   "still trigger a network call unless --kegg-ko-module is "
+                   "also supplied.")
+@click.option("--kegg-ko-module", type=click.Path(exists=True, path_type=Path), default=None,
+              help="KO-to-module mapping TSV for offline GSEA module gene-sets "
+                   "(auto-downloaded from KEGG if omitted). Pass this together "
+                   "with --kegg-ko-pathway for a fully offline run.")
 @click.option("--force", is_flag=True, help="Overwrite existing outputs.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 @click.option("--log-file", type=click.Path(path_type=Path), default=None,
@@ -126,6 +188,7 @@ def run(
     stability_bootstraps: int,
     stability_core_threshold: float,
     kegg_ko_pathway: Path | None,
+    kegg_ko_module: Path | None,
     force: bool,
     verbose: bool,
     log_file: Path | None,
@@ -143,6 +206,14 @@ def run(
     if (prokka_faa is None) != (prokka_ffn is None):
         logger.error("--prokka-faa and --prokka-ffn must be provided together (got only one)")
         sys.exit(1)
+
+    _validate_clustering_params(
+        mahal_min_k=mahal_min_k,
+        mahal_max_k=mahal_max_k,
+        stability_core_threshold=stability_core_threshold,
+        gsea_permutations=gsea_permutations,
+        stability_bootstraps=stability_bootstraps,
+    )
 
     from codonpipe.pipeline import run_single_genome
 
@@ -192,6 +263,7 @@ def run(
             stability_bootstraps=stability_bootstraps,
             stability_core_threshold=stability_core_threshold,
             kegg_ko_pathway=kegg_ko_pathway,
+            kegg_ko_module=kegg_ko_module,
             gff_file=gff_file,
             force=force,
         )
@@ -255,7 +327,11 @@ def run(
                    "bootstrap boundary method. 0.5 = majority-rule consensus; "
                    "0.9 = high-confidence subset.")
 @click.option("--kegg-ko-pathway", type=click.Path(exists=True, path_type=Path), default=None,
-              help="KO-to-pathway mapping TSV for offline enrichment.")
+              help="KO-to-pathway mapping TSV for offline enrichment "
+                   "(KO→pathway only — pair with --kegg-ko-module for a fully "
+                   "offline GSEA run).")
+@click.option("--kegg-ko-module", type=click.Path(exists=True, path_type=Path), default=None,
+              help="KO-to-module mapping TSV for offline GSEA module gene-sets.")
 @click.option("--gff", "gff_file", type=click.Path(exists=True, path_type=Path), default=None,
               help="GFF3 annotation file for tRNA extraction (overrides per-sample auto-detection).")
 @click.option("--force", is_flag=True, help="Overwrite existing outputs.")
@@ -285,6 +361,7 @@ def batch(
     stability_bootstraps: int,
     stability_core_threshold: float,
     kegg_ko_pathway: Path | None,
+    kegg_ko_module: Path | None,
     gff_file: Path | None,
     skip_gsea: bool,
     gsea_permutations: int,
@@ -320,6 +397,14 @@ def batch(
         /data/genome2.fasta  sample_B                                               Bacteroidetes
     """
     logger = setup_logger(log_file=log_file, verbose=verbose)
+
+    _validate_clustering_params(
+        mahal_min_k=mahal_min_k,
+        mahal_max_k=mahal_max_k,
+        stability_core_threshold=stability_core_threshold,
+        gsea_permutations=gsea_permutations,
+        stability_bootstraps=stability_bootstraps,
+    )
 
     from codonpipe.pipeline import run_batch
 
@@ -357,6 +442,7 @@ def batch(
             stability_bootstraps=stability_bootstraps,
             stability_core_threshold=stability_core_threshold,
             kegg_ko_pathway=kegg_ko_pathway,
+            kegg_ko_module=kegg_ko_module,
             gff_file=gff_file,
             force=force,
             skip_gsea=skip_gsea,
