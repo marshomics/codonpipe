@@ -1,3 +1,16 @@
+# Ribosomal-protein COG accessions used by CodonPipe to extract
+# ribosomal-protein genes from COGclassifier output.
+#
+# Curated from the bacterial + archaeal ribosomal protein COG sets:
+# - bacterial small-subunit RPs (S1-S22) and large-subunit RPs (L1-L36)
+# - archaeal-specific RPs and a small number of accessory RP-associated
+#   COGs
+#
+# Lines beginning with "#" are treated as comments. Blank lines are
+# ignored. One COG accession per line. Override with the --cogs-file
+# CLI flag if your reference set differs.
+#
+# Last reviewed: 2026-04-28 (CodonPipe v0.1.x)
 COG0806
 COG3028
 COG1188
