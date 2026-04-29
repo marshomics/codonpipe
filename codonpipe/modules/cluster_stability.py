@@ -119,8 +119,25 @@ def _bootstrap_rp_reference(
     n_axes: int,
     multiplier: float,
     seed: int = 0,
-) -> set[str]:
+) -> tuple[set[str], float]:
     """One bootstrap replicate using chi-squared threshold.
+
+    Returns (cluster_gene_ids, oob_recovery_rate).
+
+    The bootstrap leaves on average ~37% of RP genes out-of-bag (OOB)
+    because the resample is taken with replacement. Those OOB genes
+    are an honest hold-out: the centroid that classifies them was fit
+    without seeing them. ``oob_recovery_rate`` is the fraction of OOB
+    RP genes that the bootstrap centroid still places inside the
+    chi-squared cluster boundary. A high recovery rate means the RP
+    cluster is *predictively* stable; a low rate means the cluster
+    fits its training resample well but doesn't generalise to held-out
+    RP genes.
+
+    This complements the existing across-replicate Jaccard similarity,
+    which measures internal consistency (do replicates agree on which
+    genome-wide genes go where) but does not test whether held-out RP
+    members would be recovered.
 
     The multiplier parameter is accepted for backward compatibility but
     ignored — the threshold is always chi-squared based.
@@ -137,7 +154,20 @@ def _bootstrap_rp_reference(
     distances = _compute_mahalanobis_distances(X, centroid, cov_inv)
     threshold = _chi2_threshold(n_axes, _CLUSTER_CHI2_P)
     opt_mask = distances <= threshold
-    return {gid for gid, inside in zip(gene_ids, opt_mask) if inside}
+
+    # Out-of-bag recovery: which RP indices were NEVER drawn this round?
+    in_bag = set(int(i) for i in boot_rp_idx)
+    oob_rp_indices = [int(i) for i in rp_indices if int(i) not in in_bag]
+    if oob_rp_indices:
+        oob_inside = sum(1 for i in oob_rp_indices if opt_mask[i])
+        oob_recovery = oob_inside / len(oob_rp_indices)
+    else:
+        # Pathological: every RP gene was sampled at least once. Treat
+        # as 1.0 by convention (no held-out evidence to disagree with).
+        oob_recovery = float("nan")
+
+    cluster = {gid for gid, inside in zip(gene_ids, opt_mask) if inside}
+    return cluster, oob_recovery
 
 
 def _jaccard(a: set, b: set) -> float:
@@ -220,22 +250,31 @@ def run_stability_analysis(
     # helper still spawns child rngs for any callee that asks for one.
     from codonpipe.utils._parallel import parallel_perm
 
-    def _boot_iter(rng: np.random.Generator, idx: int) -> set[str]:
+    def _boot_iter(rng: np.random.Generator, idx: int) -> tuple[set[str], float]:
         # _bootstrap_rp_reference takes a deterministic ``seed`` integer.
         # Pass ``idx`` so the per-iteration seed is identical to the
         # serial code's loop variable — reproducibility against pre-
-        # parallelisation runs is preserved exactly.
+        # parallelisation runs is preserved exactly. Returns (cluster,
+        # oob_recovery) so the outer loop can report predictive
+        # stability alongside internal consistency.
         return _bootstrap_rp_reference(
             X, coa_gene_ids, rp_indices, n_axes,
             multiplier=0.0,  # unused, chi-squared threshold
             seed=idx,
         )
 
-    boot_clusters: list[set[str]] = parallel_perm(
+    boot_results: list[tuple[set[str], float]] = parallel_perm(
         n_bootstraps,
         _boot_iter,
         master_seed=0,  # individual seeds come from idx; master unused
         desc="cluster-stability-bootstrap",
+    )
+    boot_clusters: list[set[str]] = [r[0] for r in boot_results]
+    oob_recoveries = np.array(
+        [r[1] for r in boot_results if not np.isnan(r[1])]
+    )
+    mean_oob_recovery = (
+        float(oob_recoveries.mean()) if oob_recoveries.size else float("nan")
     )
 
     # ── Per-gene membership frequency ──────────────────────────────
@@ -302,6 +341,15 @@ def run_stability_analysis(
         "multiplier": round(effective_mult, 2),
         "mean_jaccard": round(mean_jaccard, 4),
         "mean_core_freq": round(mean_core_freq, 4),
+        # Predictive (hold-out) stability: across replicates, what fraction
+        # of out-of-bag RP genes does the bootstrap centroid still place
+        # inside the cluster? High mean_jaccard with low mean_oob_recovery
+        # would mean replicates agree with each other but generalise
+        # poorly to held-out RP genes — a sign of overfitting to the
+        # specific RP set.
+        "mean_oob_recovery": (
+            round(mean_oob_recovery, 4) if not np.isnan(mean_oob_recovery) else None
+        ),
         "n_core_genes": n_core,
         "mean_cluster_size": round(mean_size, 1),
         "std_cluster_size": round(std_size, 1),
@@ -314,8 +362,11 @@ def run_stability_analysis(
     metrics_df = pd.DataFrame([metrics_row])
 
     logger.info(
-        "Stability: Jaccard=%.3f, core=%d genes (%.0f%% RP coverage), composite=%.3f",
-        mean_jaccard, n_core, rp_coverage * 100, composite,
+        "Stability: Jaccard=%.3f, OOB recovery=%.3f, core=%d genes "
+        "(%.0f%% RP coverage), composite=%.3f",
+        mean_jaccard,
+        mean_oob_recovery if not np.isnan(mean_oob_recovery) else 0.0,
+        n_core, rp_coverage * 100, composite,
     )
 
     results["recommended_multiplier"] = round(effective_mult, 2)
