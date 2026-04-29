@@ -575,7 +575,27 @@ def _all_feature_columns(df: pd.DataFrame) -> list[str]:
 
 
 def _robust_zscore(mat: np.ndarray) -> np.ndarray:
-    """Median/MAD standardization. Returns z-scored matrix, ignoring all-NaN columns."""
+    """Median/MAD standardization. Returns z-scored matrix, ignoring all-NaN columns.
+
+    Note on layered standardization (CLR + z-score):
+        Cross-genome features in this module are typically already CLR-Δ
+        vectors — per-gene CLR(RSCU) minus genome-mean CLR — so each
+        feature is centred at the genome mean by construction. Re-scoring
+        with median/MAD here is *intentional* and serves a different
+        purpose: it rescales each CLR-Δ feature to a comparable spread
+        across the corpus so that downstream Euclidean distance,
+        PCA, and HDBSCAN are not dominated by the noisiest few codons.
+        The CLR centring removes compositional dependence; the
+        median/MAD step removes per-codon scale heterogeneity. The two
+        operations commute (both are linear) and neither re-introduces
+        the constraint the other removed.
+
+        If you ever feed *raw* RSCU here instead of CLR-Δ, the layering
+        argument no longer applies and you should CLR-transform first.
+        Pass-through assertion is intentionally light because some
+        callers do legitimately use other features (genome-level
+        scalars, ecology summaries) where neither transform is correct.
+    """
     out = mat.astype(float).copy()
     for j in range(out.shape[1]):
         col = out[:, j]
@@ -1007,6 +1027,20 @@ def mantel_test(
 
     Both inputs must be square symmetric matrices of the same size, with
     sample order aligned (row i of dist_a corresponds to row i of dist_b).
+
+    Phylogenetic non-independence caveat:
+        The Mantel permutation test treats samples as exchangeable. If
+        the corpus contains closely related organisms, a positive
+        Mantel correlation may simply reflect shared ancestry rather
+        than a current ecological or selective association. For any
+        publication-grade claim that a codon-usage pattern is causally
+        linked to a covariate (habitat, oxygen tolerance, temperature),
+        follow up with a phylogenetic comparative method that accounts
+        for branch-length-weighted covariance — phylogenetic
+        independent contrasts (PIC; Felsenstein 1985) or PGLS (Grafen
+        1989; phylolm in R via rpy2) are the standard choices. The
+        Mantel result here is appropriate for exploratory ranking, not
+        as a sole evidence base for adaptive interpretations.
 
     Returns dict with r, p_value, n_perm.
     """
