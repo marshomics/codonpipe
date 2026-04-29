@@ -1,4 +1,13 @@
-"""Codon and amino acid reference tables for CodonPipe."""
+"""Codon and amino acid reference tables for CodonPipe.
+
+SCOPE: hardcoded to NCBI translation table 11 (bacterial / archaeal /
+plant plastid standard code). Mitochondrial, ciliate, and other
+alternative genetic codes are NOT supported. Adding alternative codes
+would require parameterising every consumer of CODON_TABLE_11 / SENSE_CODONS
+/ AA_CODON_GROUPS, which is not currently in scope. CodonPipe is a
+microbial-genome pipeline; for organisms outside this scope, do not
+use this table.
+"""
 
 from __future__ import annotations
 
