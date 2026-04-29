@@ -629,6 +629,70 @@ def _find_ffn(sample_dir: Path, sample_id: str, override: Path | None = None) ->
     return None
 
 
+def _load_kofam_annotations(sample_dir: Path, sample_id: str) -> pd.DataFrame:
+    """Best-effort lookup of (gene -> KO + KO_definition) for a sample.
+
+    Returns a DataFrame with at minimum ``gene`` and (when found)
+    ``KO`` and ``KO_definition`` columns. The figure renderers use
+    ``KO_definition`` for human-readable labels and fall back to the
+    gene id when no annotation is present, so an empty return is safe.
+
+    Search order, preferring already-merged sources so we don't re-parse
+    the raw kofam tsv when the pipeline has already done so:
+      1. expression/scores/<sid>_expression_annotated.tsv (merged)
+      2. expression/<sid>_expression_annotated.tsv (legacy flat)
+      3. annotation/kofamscan/<sid>_kofam_parsed.tsv (parser output)
+      4. kofamscan/<sid>_kofam_parsed.tsv (legacy flat)
+    """
+    sample_dir = Path(sample_dir)
+    candidates = [
+        sample_dir / "expression" / "scores" / f"{sample_id}_expression_annotated.tsv",
+        sample_dir / "expression" / f"{sample_id}_expression_annotated.tsv",
+        sample_dir / "annotation" / "kofamscan" / f"{sample_id}_kofam_parsed.tsv",
+        sample_dir / "kofamscan" / f"{sample_id}_kofam_parsed.tsv",
+    ]
+    for path in candidates:
+        if path.is_file():
+            try:
+                df = pd.read_csv(path, sep="\t")
+            except Exception as exc:
+                logger.debug("Could not read %s: %s", path, exc)
+                continue
+            cols = {c.lower(): c for c in df.columns}
+            # The kofam_parsed file uses "gene_name"; the expression file
+            # uses "gene". Normalise to "gene" so callers can merge.
+            gene_col = cols.get("gene") or cols.get("gene_name")
+            if gene_col is None:
+                continue
+            keep_cols = [gene_col]
+            if "KO" in df.columns:
+                keep_cols.append("KO")
+            if "KO_definition" in df.columns:
+                keep_cols.append("KO_definition")
+            if len(keep_cols) <= 1:
+                # File had a gene column but no KO at all — nothing useful.
+                continue
+            ann = df[keep_cols].rename(columns={gene_col: "gene"})
+            # Deduplicate on gene; keep the first KO_definition per gene.
+            ann = ann.drop_duplicates(subset="gene", keep="first")
+            logger.debug("Loaded %d gene→KO_definition annotations from %s",
+                         len(ann), path)
+            return ann
+    return pd.DataFrame(columns=["gene", "KO", "KO_definition"])
+
+
+def _merge_kofam_into(df: pd.DataFrame, kofam_ann: pd.DataFrame) -> pd.DataFrame:
+    """Left-merge KO + KO_definition onto df; idempotent and safe when
+    either side is empty or the columns are already present.
+    """
+    if df is None or df.empty or kofam_ann is None or kofam_ann.empty:
+        return df
+    cols_to_add = [c for c in ("KO", "KO_definition") if c in kofam_ann.columns and c not in df.columns]
+    if not cols_to_add:
+        return df
+    return df.merge(kofam_ann[["gene"] + cols_to_add], on="gene", how="left")
+
+
 def run_codon_optimization(
     sample_dir: Path,
     sample_id: str,
@@ -664,6 +728,14 @@ def run_codon_optimization(
         )
 
     out: dict[str, Path] = {}
+
+    # Per-gene annotations from the parsed KofamScan output. Used to
+    # label the per-gene figures with KO_definition (a human-readable
+    # description like "30S ribosomal protein S12") instead of the bare
+    # locus tag. The downstream gain / three-way-CAI tables also gain
+    # KO and KO_definition columns so the TSVs are inspectable without
+    # cross-joining other files.
+    kofam_ann = _load_kofam_annotations(sample_dir, sample_id)
 
     # 1. Three-way per-codon table
     table = build_three_way_codon_table(rscu_genome, rscu_rp, rscu_mahal)
@@ -720,6 +792,7 @@ def run_codon_optimization(
         mahal_df = loaded.get("mahal_cluster_df")
         gain = compute_per_gene_gain(cbi_rp_df, cbi_mahal_df, mahal_df)
         if not gain.empty:
+            gain = _merge_kofam_into(gain, kofam_ann)
             gain_path = output_dir / f"{sample_id}_codon_optimization_gain.tsv"
             gain.to_csv(gain_path, sep="\t", index=False)
             out["gain"] = gain_path
@@ -747,6 +820,7 @@ def run_codon_optimization(
                         three_way_cai = three_way_cai.merge(
                             mahal_df[keep], on=COL_GENE, how="left",
                         )
+                three_way_cai = _merge_kofam_into(three_way_cai, kofam_ann)
                 three_path = output_dir / f"{sample_id}_codon_optimization_three_way_cai.tsv"
                 three_way_cai.to_csv(three_path, sep="\t", index=False)
                 out["three_way_cai"] = three_path
