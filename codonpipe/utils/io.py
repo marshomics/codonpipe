@@ -101,18 +101,52 @@ def load_batch_table(table_path: Path) -> pd.DataFrame:
 
     logger = logging.getLogger("codonpipe")
 
-    # Auto-detect delimiter by sniffing the header line for tabs.
-    # Falls back to extension heuristic, then comma.
-    table_path = Path(table_path)
-    with open(table_path) as fh:
-        header_line = fh.readline()
-    sep = "\t" if "\t" in header_line else ","
+    # Auto-detect delimiter. Try csv.Sniffer first (handles tab, comma,
+    # semicolon, pipe correctly even when a header field contains the
+    # would-be delimiter), then fall back to a tab-vs-comma heuristic.
+    import csv as _csv
+
+    table_path = Path(table_path).resolve()
+    table_dir = table_path.parent
+    sep = ","
+    try:
+        with open(table_path) as fh:
+            sample = fh.read(4096)
+        if sample.strip():
+            try:
+                dialect = _csv.Sniffer().sniff(sample, delimiters="\t,;|")
+                sep = dialect.delimiter
+            except _csv.Error:
+                # Fall back to the legacy tab-or-comma heuristic. This is
+                # what the older code did and is robust for normal TSV/CSV.
+                first_line = sample.splitlines()[0] if sample.splitlines() else ""
+                sep = "\t" if "\t" in first_line else ","
+    except OSError as exc:
+        raise FileNotFoundError(f"Could not read batch table {table_path}: {exc}")
     df = pd.read_csv(table_path, sep=sep, dtype=str)
 
     if "genome_path" not in df.columns:
         raise ValueError(
             f"Batch table must have a 'genome_path' column. Found: {list(df.columns)}"
         )
+
+    def _resolve_relative(val: str) -> str:
+        """Anchor relative paths to the batch-table directory.
+
+        Without this, relative paths in a manifest only work when the user
+        happens to run the pipeline from the manifest's directory. Anchoring
+        makes manifests portable.
+        """
+        s = str(val or "").strip()
+        if not s:
+            return ""
+        p = Path(s)
+        if not p.is_absolute():
+            p = table_dir / p
+        return str(p)
+
+    # Anchor genome_path against the batch-table directory before validation.
+    df["genome_path"] = df["genome_path"].apply(_resolve_relative)
 
     # Validate genome paths exist
     missing = []
@@ -129,11 +163,15 @@ def load_batch_table(table_path: Path) -> pd.DataFrame:
     if "sample_id" not in df.columns:
         df["sample_id"] = df["genome_path"].apply(lambda x: Path(x).stem)
 
-    # Validate pre-existing Prokka and GFF file paths if columns are present
+    # Validate pre-existing Prokka and GFF file paths if columns are present.
+    # These columns are also anchored against the batch-table directory.
     prokka_cols = {"prokka_faa", "prokka_ffn", "prokka_gff", "gff_path", "kofam_results"}
     present_prokka_cols = prokka_cols & set(df.columns)
 
     if present_prokka_cols:
+        for col in present_prokka_cols:
+            df[col] = df[col].apply(_resolve_relative)
+
         missing_prokka = []
         for idx, row in df.iterrows():
             sid = row.get("sample_id", f"row {idx}")
