@@ -72,6 +72,19 @@ def run_kofamscan(
 def parse_kofamscan(result_file: Path) -> pd.DataFrame:
     """Parse KofamScan detail-tsv output into a DataFrame.
 
+    Multi-domain reduction:
+        Genes with multiple significant KO hits (typical for fusion
+        proteins or multi-functional enzymes) are reduced to a single
+        row keyed on the highest-scoring KO. This is pragmatic but
+        lossy — a kinase fused to a phosphatase will keep only the
+        higher-scoring activity. Downstream pathway / GSEA analyses
+        will therefore underestimate enrichment for the discarded KO.
+        If your downstream analysis depends on the full multi-KO
+        mapping, parse the raw detail-tsv instead of using this
+        function. The number of dropped per-gene secondary hits is
+        logged at INFO level so you can decide if it materially
+        affects your results.
+
     Returns DataFrame with columns:
         gene_name, KO, thrshld, score, E_value, KO_definition
     """
@@ -107,18 +120,30 @@ def parse_kofamscan(result_file: Path) -> pd.DataFrame:
         logger.warning("No significant KofamScan hits found in %s", result_file)
         df = pd.DataFrame(columns=["gene_name", "KO", "thrshld", "score", "E_value", "KO_definition"])
 
-    # Keep best hit per gene (highest score)
+    # Keep best hit per gene (highest score). Non-numeric scores sort
+    # last under na_position="last", so the deduplication preference is
+    # always for genuinely scored rows over coerce-failed ones.
+    n_dropped_secondary = 0
     if not df.empty:
         df["score"] = pd.to_numeric(df["score"], errors="coerce")
         n_bad_scores = df["score"].isna().sum()
         if n_bad_scores > 0:
             logger.warning(
-                "%d/%d KofamScan hits had non-numeric scores in %s",
+                "%d/%d KofamScan hits had non-numeric scores in %s "
+                "(coerced to NaN; treated as worst-scoring during "
+                "deduplication)",
                 n_bad_scores, len(df), result_file,
             )
+        n_before = len(df)
         df = df.sort_values("score", ascending=False, na_position="last").drop_duplicates("gene_name", keep="first")
+        n_dropped_secondary = n_before - len(df)
 
-    logger.info("Parsed %d significant KO annotations from %s", len(df), result_file)
+    logger.info(
+        "Parsed %d significant KO annotations from %s "
+        "(dropped %d secondary multi-domain hits — see parse_kofamscan "
+        "docstring for the trade-off)",
+        len(df), result_file, n_dropped_secondary,
+    )
     return df
 
 
