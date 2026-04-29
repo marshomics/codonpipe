@@ -645,9 +645,15 @@ def cluster_corpus(
     else:
         embedding = Xpca[:, :n_components]
 
-    # HDBSCAN with KMeans fallback
+    # HDBSCAN with KMeans fallback. The default min_cluster_size is a
+    # heuristic — 2% of corpus size, floored at 5, capped at 50. The 2%
+    # value has no published anchor; it was chosen to (1) avoid spurious
+    # micro-clusters when the corpus is large and (2) avoid merging
+    # genuinely distinct ecological groups when the corpus is small.
+    # Override via ``--hdbscan-min-cluster-size`` for any publication-
+    # grade clustering, and check robustness by sweeping a small grid
+    # (e.g. 5, 10, 25, 50) and reporting cluster stability.
     if hdbscan_min_cluster_size is None:
-        # Heuristic: ~2% of corpus, floor 5, ceiling 50
         hdbscan_min_cluster_size = int(np.clip(round(n * 0.02), 5, 50))
 
     method_cluster = "hdbscan"
