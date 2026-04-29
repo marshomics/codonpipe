@@ -188,10 +188,18 @@ codonpipe run GENOME -o OUTPUT_DIR [OPTIONS]
 | `--kofam-results` | — | Pre-computed KofamScan detail-tsv |
 | `--skip-expression` | off | Skip R-based analyses (MELP/CAI/Fop/ENCprime/MILC) |
 | `--skip-codon-optimization` | off | Skip Step 12 (codon-optimization comparison). Output normally goes to `<sample_dir>/codon_optimization/`. |
+| `--skip-mahal` | off | Skip Mahalanobis clustering of codon usage |
+| `--mahal-distance-multiplier` | 2.0 | Mahalanobis cluster radius (× median RP distance) under the chi-squared boundary method |
+| `--cluster-boundary-method` | `chi2` | How to define the optimised cluster's gene set: `chi2` (parametric 95th-percentile threshold; deterministic) or `bootstrap` (membership frequency ≥ `--stability-core-threshold` over `--stability-bootstraps` resamples; robust to RP-cohort sub-structure). Selecting `bootstrap` auto-enables `--run-stability`. |
+| `--run-stability` | off | Run bootstrap stability analysis. Acts as a diagnostic under `--cluster-boundary-method=chi2`; required and auto-enabled under `bootstrap`. |
+| `--stability-bootstraps` | 100 | Number of bootstrap replicates for the stability analysis |
+| `--stability-core-threshold` | 0.5 | Membership-frequency threshold for `--cluster-boundary-method=bootstrap`. 0.5 = majority-rule consensus, 0.9 = high-confidence subset |
 | `--kegg-ko-pathway` | auto-downloaded | KO-to-pathway mapping TSV |
 | `--force` | off | Overwrite existing outputs |
 | `-v, --verbose` | off | Debug-level logging |
 | `--log-file` | — | Write log to file |
+
+The previous `--stability-multipliers` and `--auto-select-multiplier` options have been removed — the multiplier-grid sweep mechanism they drove had a known degeneracy (the argmax over reproducibility selects trivial tight or trivial wide radii rather than the biological elbow) and was no longer wired to anything in the current architecture. Use `--cluster-boundary-method` to choose between the chi-squared threshold and the bootstrap membership-frequency threshold instead; tune `--mahal-distance-multiplier` if you want a tighter or looser chi-squared cluster.
 
 ### `codonpipe batch`
 
