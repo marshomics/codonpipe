@@ -119,8 +119,14 @@ def extract_ribosomal_proteins(
 
     # Parse COGclassifier results
     cog_df = pd.read_csv(cog_result_tsv, sep="\t")
+    logger.debug(
+        "COGclassifier output columns for %s: %s",
+        sample_id, list(cog_df.columns),
+    )
 
-    # Identify the COG ID column (COGclassifier output varies)
+    # Identify the COG ID column (COGclassifier output varies between
+    # versions). Log the matched column at INFO level so silent format
+    # drift is visible in run logs without re-running with --verbose.
     cog_col = None
     for candidate in ["COG_ID", "COG", "cog_id", "COG_id", "best_hit_cog"]:
         if candidate in cog_df.columns:
@@ -133,11 +139,22 @@ def extract_ribosomal_proteins(
             if sample_vals.str.match(r"^COG\d+$").any():
                 cog_col = col
                 break
+        if cog_col is not None:
+            logger.warning(
+                "COGclassifier column with COG IDs found via fallback regex "
+                "match (column '%s'); upstream tool format may have changed. "
+                "Available columns: %s",
+                cog_col, list(cog_df.columns),
+            )
     if cog_col is None:
         raise ValueError(
             f"Cannot find COG ID column in {cog_result_tsv}. "
             f"Columns: {list(cog_df.columns)}"
         )
+    logger.info(
+        "COGclassifier: using column '%s' as COG ID for %s",
+        cog_col, sample_id,
+    )
 
     # Find query/protein ID column
     query_col = find_gene_id_column(cog_df, fallback_to_first=True)
@@ -212,4 +229,16 @@ def _extract_seqs(fasta_in: Path, fasta_out: Path, ids: set[str], include: bool)
             if keep:
                 SeqIO.write(rec, out, "fasta")
                 count += 1
+    if include and ids and count == 0:
+        # Silent zero-write almost always means a FASTA-header / ID-format
+        # mismatch (e.g., "cds-WP_123" vs "WP_123") between Prokka and
+        # COGclassifier. Warn loudly so the pipeline doesn't proceed
+        # with an empty RP set.
+        logger.warning(
+            "Wrote 0 sequences from %s — none of the %d requested IDs "
+            "matched any FASTA record. This usually indicates a "
+            "header-format mismatch (e.g., locus tag prefix) between "
+            "the FASTA and the COGclassifier output.",
+            fasta_in, len(ids),
+        )
     return count
