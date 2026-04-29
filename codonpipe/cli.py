@@ -663,83 +663,17 @@ def corpus_cmd(
         logger.info("  %-25s %s", k, v)
 
 
-@main.command("codon-optimization")
-@click.argument("sample_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("-s", "--sample-id", default=None,
-              help="Sample identifier. Defaults to the directory name.")
-@click.option("-o", "--output-dir", "output_dir", default=None,
-              type=click.Path(path_type=Path),
-              help="Output directory. Defaults to <SAMPLE_DIR>/codon_optimization/.")
-@click.option("--ffn-path", "ffn_path", default=None,
-              type=click.Path(exists=True, dir_okay=False, path_type=Path),
-              help="Path to the gene CDS .ffn file. Use when codonpipe was "
-                   "run with an external --prokka-ffn (the file isn't copied "
-                   "into the sample directory in that case). Defaults to "
-                   "auto-discovery under <SAMPLE_DIR>/[annotation/]prokka/.")
-@click.option("--no-figure", is_flag=True,
-              help="Skip the figures, write only the TSV outputs.")
-@click.option("-v", "--verbose", is_flag=True, help="Debug-level logging.")
-def codon_optimization_cmd(
-    sample_dir: Path,
-    sample_id: str | None,
-    output_dir: Path | None,
-    ffn_path: Path | None,
-    no_figure: bool,
-    verbose: bool,
-):
-    """Compare genome / RP / Mahal-cluster codon-usage profiles for one organism.
-
-    Produces a synthesis-ready recommendation table plus three figures
-    that visualize how the three reference frames differ and quantify the
-    gain from Mahal-cluster-based codon optimization vs the classic
-    RP-based approach.
-
-    Outputs in --output-dir:
-
-    \b
-      <sid>_codon_optimization_table.tsv     per-codon w-values + optimal flags
-      <sid>_codon_optimization_summary.tsv   per-AA-family agreement
-      <sid>_codon_optimization_recommend.tsv synthesis-ready preferred codons
-      <sid>_codon_optimization_gain.tsv      per-gene cbi_rp vs cbi_mahal
-      <sid>_three_way_rscu.png/.svg          RSCU bars per codon
-      <sid>_optimization_agreement.png/.svg  per-AA RP-vs-Mahal table
-      <sid>_optimization_gain.png/.svg       per-gene CBI scatter + gain dist
-
-    Defensible reason to prefer Mahal-derived weights for codon
-    optimization: the Mahal cluster is identified by codon-usage
-    similarity rather than by RP gene annotations, so it captures the
-    organism's actual translationally-optimized cohort and excludes RP
-    annotation outliers (truncations, paralogs, modified variants) that
-    can pull the RP-based reference centroid off-target.
-
-    Example:
-
-    \b
-        codonpipe codon-optimization output_run/G0370_i3 \\
-            -o output_run/G0370_i3/codon_optimization/
-    """
-    logger = setup_logger(verbose=verbose)
-    from codonpipe.modules.codon_optimization import run_codon_optimization
-
-    sid = sample_id or sample_dir.name
-    out_dir = output_dir or (sample_dir / "codon_optimization")
-
-    try:
-        outputs = run_codon_optimization(
-            sample_dir, sid, out_dir,
-            make_figures=not no_figure,
-            ffn_path=ffn_path,
-        )
-    except FileNotFoundError as e:
-        logger.error("%s", e)
-        sys.exit(1)
-    except Exception as e:
-        logger.error("Codon-optimization analysis failed: %s", e, exc_info=verbose)
-        sys.exit(1)
-
-    logger.info("Codon optimization complete:")
-    for k, v in outputs.items():
-        logger.info("  %-25s %s", k, v)
+# NOTE: the standalone ``codonpipe codon-optimization`` subcommand has been
+# removed. The codon-optimization analysis (genome / RP / Mahal-cluster
+# three-way comparison, synthesis-ready preferred-codon table, per-gene CAI
+# under all three reference frames, and the publication figures) now runs
+# automatically as Step 12 of the per-genome pipeline whenever ``codonpipe
+# run`` or ``codonpipe batch`` is invoked. Output goes to
+# ``<sample_dir>/codon_optimization/`` exactly as before. To opt out of
+# Step 12 (e.g. when iterating on upstream steps), pass
+# ``--skip-codon-optimization`` on either ``run`` or ``batch``. The
+# underlying ``codonpipe.modules.codon_optimization`` module is unchanged
+# and can still be imported directly by external code.
 
 
 @main.command("install-grodon")
