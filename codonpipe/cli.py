@@ -54,6 +54,12 @@ def main():
               help="Skip pre-ranked Gene Set Enrichment Analysis.")
 @click.option("--gsea-permutations", type=int, default=1000, show_default=True,
               help="Number of permutations for GSEA p-value estimation.")
+@click.option("--skip-codon-optimization", is_flag=True,
+              help="Skip the codon-optimization comparison step (genome / RP "
+                   "/ Mahal-cluster reference frames). Step 12 of the "
+                   "13-step per-genome pipeline; output goes to "
+                   "<sample_dir>/codon_optimization/. Skipping doesn't "
+                   "affect any other step.")
 @click.option("--mahal-min-k", type=int, default=2, show_default=True,
               help="Minimum number of Mahalanobis clustering components to test.")
 @click.option("--mahal-max-k", type=int, default=8, show_default=True,
@@ -101,6 +107,7 @@ def run(
     skip_mahal: bool,
     skip_gsea: bool,
     gsea_permutations: int,
+    skip_codon_optimization: bool,
     mahal_min_k: int,
     mahal_max_k: int,
     mahal_distance_multiplier: float,
@@ -168,6 +175,7 @@ def run(
             skip_mahal=skip_mahal,
             skip_gsea=skip_gsea,
             gsea_permutations=gsea_permutations,
+            skip_codon_optimization=skip_codon_optimization,
             mahal_min_k=mahal_min_k,
             mahal_max_k=mahal_max_k,
             mahal_distance_multiplier=mahal_distance_multiplier,
@@ -214,6 +222,8 @@ def run(
 @click.option("--skip-gsea", is_flag=True, help="Skip pre-ranked Gene Set Enrichment Analysis.")
 @click.option("--gsea-permutations", type=int, default=1000, show_default=True,
               help="Number of permutations for GSEA p-value estimation.")
+@click.option("--skip-codon-optimization", is_flag=True,
+              help="Skip the codon-optimization comparison step (Step 12).")
 @click.option("--mahal-min-k", type=int, default=2, show_default=True,
               help="Minimum number of Mahalanobis clustering components to test.")
 @click.option("--mahal-max-k", type=int, default=8, show_default=True,
@@ -267,6 +277,7 @@ def batch(
     gff_file: Path | None,
     skip_gsea: bool,
     gsea_permutations: int,
+    skip_codon_optimization: bool,
     force: bool,
     verbose: bool,
     log_file: Path | None,
@@ -341,6 +352,7 @@ def batch(
             force=force,
             skip_gsea=skip_gsea,
             gsea_permutations=gsea_permutations,
+            skip_codon_optimization=skip_codon_optimization,
         )
         logger.info("Batch analysis complete. %d output files.", len(outputs))
     except Exception as e:
