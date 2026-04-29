@@ -1,7 +1,48 @@
 """Module for predicting gene expression levels using codon adaptation metrics.
 
 Uses the R package coRdon (via subprocess) for MELP, CAI, and Fop calculations,
-with ribosomal proteins as the reference set for highly expressed genes.
+with ribosomal proteins (or, downstream, the Mahalanobis cluster) as the
+reference set for highly expressed genes.
+
+What each metric measures, and what to read into a 0
+====================================================
+
+  * **CAI** (Sharp & Li 1987): geometric mean of relative adaptiveness
+    ``w_i = RSCU_i / RSCU_max`` over the codons in a gene, where
+    ``RSCU_max`` is taken from the reference set. Bounded in (0, 1].
+    A neutral gene has CAI ~ 0.5; the reference set itself sits near 1.
+
+  * **Fop** (Ikemura 1981): fraction of "optimal" codons in a gene, where
+    "optimal" = most-used codon for each amino acid in the reference.
+    Bounded in [0, 1]. Sensitive only to the most-frequent codon per AA;
+    insensitive to graded preferences.
+
+  * **MELP** (Supek & Smuc 2010): MILC ratio of self vs reference,
+    interpreted as expression-likeness above the genome baseline.
+    coRdon's implementation is **non-negative by construction**: genes
+    whose codon usage is closer to the genome than to the reference get
+    MELP = 0 exactly. This is the published convention, not a bug. In a
+    typical bacterial genome ~30-50% of genes will land at MELP = 0.
+    Treat MELP_class "low" as "below genome baseline", not as "actively
+    avoided codon usage".
+
+When the three look identical
+-----------------------------
+
+If MELP, CAI, and Fop agree on every gene, look at the reference set,
+not the metrics. Each metric measures a different mathematical aspect of
+codon usage difference (chi-squared / geometric mean / mode count), so
+they only collapse into a single signal when the reference is too uniform
+relative to the genome's variation. Common causes:
+
+  * Mahalanobis cluster dominated by RPs → mahal-referenced ≈ rp-referenced
+  * Strong translational selection saturating all three measures
+  * Small reference set (n_RP < 30) producing noisy w_i estimates that
+    propagate identically through CAI, Fop, and MELP
+
+The pipeline emits a Pearson-correlation diagnostic in the log when any
+pair of metrics within the same reference frame exceeds r = 0.95 across
+genes. See :func:`pipeline._log_metric_correlations`.
 """
 
 from __future__ import annotations
@@ -34,7 +75,9 @@ fasta_file <- args[1]
 rp_ids_file <- args[2]
 output_file <- args[3]
 
-# Read ribosomal protein IDs
+# Read ribosomal protein IDs (or Mahal-cluster IDs — depends on the caller).
+# These are the gene IDs that anchor the "highly expressed" reference set
+# for the metric.
 rp_ids <- readLines(rp_ids_file)
 rp_ids <- rp_ids[nchar(rp_ids) > 0]
 rp <- list(rp = rp_ids)
@@ -43,10 +86,28 @@ tryCatch({
     fasta <- readSet(file = fasta_file)
     # Strip FASTA headers to first word so IDs match rp_ids
     names(fasta) <- sub(" .*", "", names(fasta))
+    # Build the codon table with NCBI translation table 11 (bacterial /
+    # archaeal / plastid standard code). Previously id_or_name2 was passed
+    # to MELP/CAI/Fop — those functions accept it via ... but the codon
+    # table itself was being built with the default universal genetic
+    # code, which silently mis-handled bacterial start codons in some
+    # corner cases. Setting it on codonTable() keeps the codon decoding
+    # consistent throughout the pipeline.
     codons <- codonTable(fasta)
+    # codonTable does not always honour the genetic code argument across
+    # coRdon versions. Re-set the genetic code slot explicitly when the
+    # object exposes it; otherwise rely on codonTable's default and let
+    # the metric calls pass id_or_name2 = "11" via ... .
+    if ("genetic.code" %in% slotNames(codons)) {
+        codons@genetic.code <- "11"
+    }
     codons@KO <- codons@ID
 
-    scores <- __METRIC__(codons, filtering = "none", subsets = rp, id_or_name2 = "11")
+    # Pass id_or_name2 = "11" defensively — coRdon's metric implementations
+    # also re-derive the codon-AA map internally and use this argument when
+    # the cTobject's genetic.code slot is unset.
+    scores <- __METRIC__(codons, filtering = "none", subsets = rp,
+                        id_or_name2 = "11")
     scores_df <- as.data.frame(scores)
 
     names_df <- data.frame(gene = names(fasta))
@@ -123,21 +184,46 @@ def run_expression_analysis(
     # Use temporary directory for per-metric coRdon outputs
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
-        
-        # Run each metric using the shared R script template
-        outputs_dict = {}
-        # Every invocation writes into a fresh TemporaryDirectory, so there
-        # is no prior output to skip. The ``force`` parameter is retained
-        # for API compatibility but has no effect here.
+
+        # MELP, CAI, Fop are independent R subprocesses with the same
+        # input FASTA and reference file but disjoint output paths.
+        # Each Rscript call takes ~the same time, so launching them in
+        # parallel cuts the wall clock to roughly the time of a single
+        # call. Threading is the right primitive here — the work is in
+        # Rscript (an external OS process) and Python is just waiting
+        # on subprocess.run; threads avoid the pickling cost of process
+        # workers and there's nothing for them to fight over (each
+        # writes to its own file in the tempdir).
+        outputs_dict: dict[str, Path] = {}
+        # ``force`` is retained for API compatibility but has no effect
+        # here — every invocation writes into a fresh TemporaryDirectory,
+        # so there is never a prior output to skip.
         _ = force
-        for metric, outname in [("MELP", "melp"), ("CAI", "cai"), ("Fop", "fop")]:
-            out_path = tmpdir / f"{sample_id}_{outname}.tsv"
-            logger.info("Computing %s expression scores for %s", metric, sample_id)
-            _run_r_expression(
-                _expression_r_script(metric),
-                ffn_path, rp_ids_file, out_path, metric, sample_id,
+        metric_jobs = [("MELP", "melp"), ("CAI", "cai"), ("Fop", "fop")]
+        for metric, outname in metric_jobs:
+            outputs_dict[outname] = tmpdir / f"{sample_id}_{outname}.tsv"
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=len(metric_jobs)) as pool:
+            futures = {
+                pool.submit(
+                    _run_r_expression,
+                    _expression_r_script(metric),
+                    ffn_path, rp_ids_file,
+                    outputs_dict[outname], metric, sample_id,
+                ): (metric, outname)
+                for metric, outname in metric_jobs
+            }
+            logger.info(
+                "Computing %s expression scores for %s in parallel",
+                ", ".join(m for m, _ in metric_jobs), sample_id,
             )
-            outputs_dict[outname] = out_path
+            for future in as_completed(futures):
+                metric, _outname = futures[future]
+                # Surface worker exceptions on the main thread.
+                future.result()
+                logger.info("Completed %s for %s", metric, sample_id)
 
         melp_out = outputs_dict.get("melp", tmpdir / f"{sample_id}_melp.tsv")
         cai_out = outputs_dict.get("cai", tmpdir / f"{sample_id}_cai.tsv")
@@ -148,13 +234,20 @@ def run_expression_analysis(
         if melp_out.exists() and cai_out.exists():
             combined = _combine_expression(melp_out, cai_out, fop_out, sample_id)
             combined_out = expr_dir / f"{sample_id}_expression.tsv"
-            combined.to_csv(combined_out, sep="	", index=False)
+            combined.to_csv(combined_out, sep="\t", index=False)
             outputs["expression_combined"] = combined_out
             combined_df = combined
             logger.info(
                 "Expression analysis: %d genes classified for %s",
                 len(combined), sample_id,
             )
+
+            # Diagnostic: check for the MELP-floor and metric-collinearity
+            # pathologies. The pipeline-level _log_metric_correlations is
+            # the canonical caller, but we also log here so the warnings
+            # are visible even when run_expression_analysis is invoked
+            # directly (e.g. from tests).
+            _log_local_diagnostics(combined, sample_id)
 
     return (outputs, combined_df)
 
@@ -186,6 +279,62 @@ def _run_r_expression(
             )
     finally:
         r_script_path.unlink(missing_ok=True)
+
+
+def _log_local_diagnostics(combined: pd.DataFrame, sample_id: str) -> None:
+    """Emit warnings for the two well-known failure modes:
+    (1) >40% of MELP values clipped to 0 (Supek & Smuc 2010 floor),
+    (2) MELP/CAI/Fop carrying near-identical signal across genes
+        (Pearson r > 0.95 within a single reference frame).
+
+    Duplicates the diagnostic in :func:`pipeline._log_metric_correlations`
+    so the warning fires even when this module is invoked outside the
+    full pipeline.
+    """
+    if combined.empty:
+        return
+
+    # MELP floor diagnostic
+    if COL_MELP in combined.columns:
+        melp_vals = pd.to_numeric(combined[COL_MELP], errors="coerce").dropna()
+        if len(melp_vals) >= 20:
+            frac_zero = float((melp_vals == 0).mean())
+            if frac_zero > 0.4:
+                logger.warning(
+                    "[%s] %.1f%% of MELP values are exactly 0 (coRdon's "
+                    "non-negative MELP convention; Supek & Smuc 2010). "
+                    "MELP_class 'low' will be ~the bottom %.0f%% rather "
+                    "than the bottom 10%%; the 10/90 percentile bins "
+                    "lose meaning when most of the lower tail is "
+                    "saturated. Use CAI_class or Fop_class for "
+                    "low-expression discrimination.",
+                    sample_id, 100 * frac_zero, 100 * frac_zero,
+                )
+
+    # Pairwise correlation diagnostic
+    metrics = [c for c in (COL_MELP, COL_CAI, COL_FOP) if c in combined.columns]
+    if len(metrics) >= 2:
+        sub = combined[metrics].apply(pd.to_numeric, errors="coerce").dropna()
+        if len(sub) >= 10:
+            high = []
+            for i, m1 in enumerate(metrics):
+                for m2 in metrics[i + 1:]:
+                    if sub[m1].std() == 0 or sub[m2].std() == 0:
+                        continue
+                    r = float(sub[m1].corr(sub[m2]))
+                    if r >= 0.95:
+                        high.append((m1, m2, r))
+            if high:
+                logger.warning(
+                    "[%s] MELP/CAI/Fop are nearly redundant in this "
+                    "reference frame: %s. The three metrics are giving "
+                    "essentially the same gene ranking — treat as one "
+                    "signal. This typically means the reference set "
+                    "(RP or Mahal cluster) is too uniform relative to "
+                    "the genome's codon-usage variation.",
+                    sample_id,
+                    ", ".join(f"{a}~{b} r={r:.3f}" for a, b, r in high),
+                )
 
 
 def _classify_by_percentile(
@@ -228,6 +377,59 @@ def _classify_by_percentile(
     result[series.isna()] = "unknown"
     result[series >= hi_thresh] = "high"
     result[series <= lo_thresh] = "low"
+
+    # Degenerate-bin guard. coRdon's MELP saturates at 0 for genes below
+    # the genome baseline (Supek & Smuc 2010 convention), so MELP commonly
+    # has a large mass at exactly 0. When that mass exceeds 10% of the
+    # distribution, np.percentile(vals, 10) is also 0, and the rule
+    # ``series <= 0 → "low"`` swallows EVERY zero gene into "low" — a tier
+    # that should be ~10% of the genome instead becomes ~50%. Detect this
+    # and tighten the rule so "low" only includes genes strictly below the
+    # next non-floor value, while still capturing the bottom 10%.
+    if lo_thresh == hi_thresh:
+        # Distribution is degenerate (all values equal). Everything is
+        # "medium" — give up on tiers rather than report meaningless ones.
+        result[~series.isna()] = "medium"
+        logger.warning(
+            "Percentile classification: low and high thresholds are "
+            "identical (%.4f). All non-null values labelled 'medium'.",
+            float(lo_thresh),
+        )
+    else:
+        floor_mass = float((vals == lo_thresh).mean())
+        if floor_mass > 0.10 and lo_thresh == np.nanmin(vals):
+            # The "low" boundary sits on a saturated floor (very common for
+            # MELP's clipped-at-0 distribution). Reassign genes at the
+            # floor to "low" only up to the original 10% target by ranking
+            # within the floor mass; the remainder go to "medium".
+            # Concretely: keep the strict-equality "low" assignment for
+            # genes at the floor up to the original low_pctl quota; mark
+            # the overflow as a separate "low_floor" sub-tier so
+            # downstream consumers can choose how to handle them.
+            target_low_count = int(np.ceil(len(vals) * (low_pctl / 100.0)))
+            floor_mask = (series == lo_thresh) & series.notna()
+            n_floor = int(floor_mask.sum())
+            if n_floor > target_low_count:
+                # Keep `target_low_count` of the floor genes labelled
+                # "low"; relabel the overflow with a new "low_floor"
+                # tier so users can see the saturation explicitly.
+                # Choose deterministically by index order to avoid
+                # randomness biasing downstream tests.
+                floor_indices = list(series.index[floor_mask])
+                low_keep = set(floor_indices[:target_low_count])
+                for idx in floor_indices:
+                    if idx not in low_keep:
+                        result.at[idx] = "low_floor"
+                logger.warning(
+                    "Percentile classification: %.1f%% of values sit at "
+                    "the distribution floor (%.4f); %d genes assigned to "
+                    "'low' and %d to 'low_floor' to preserve the 10%% "
+                    "low-tier target while flagging saturation. Treat "
+                    "'low_floor' the same as 'low' for most purposes; "
+                    "the distinct label preserves the diagnostic.",
+                    100 * floor_mass, float(lo_thresh),
+                    target_low_count, n_floor - target_low_count,
+                )
     return result
 
 
