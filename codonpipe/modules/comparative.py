@@ -694,14 +694,16 @@ def between_condition_tests(
 
     result = pd.DataFrame(rows)
 
-    # BH FDR correction (within each test type)
-    result["corrected_p"] = np.nan
-    for test_type in result["test"].unique():
-        mask = result["test"] == test_type
-        pvals = result.loc[mask, "p_value"].values
-        if len(pvals) == 0:
-            continue
-        result.loc[mask, "corrected_p"] = benjamini_hochberg(pvals)
+    # BH FDR correction across the full panel of (metric × test type × pair).
+    # The unit of inference is "any significant condition difference?" — the
+    # multiple-testing burden is set by the number of comparisons in the panel,
+    # not by the number of test families. Per-test-type correction would
+    # under-correct.
+    pvals = result["p_value"].values
+    if len(pvals) > 0:
+        result["corrected_p"] = benjamini_hochberg(pvals)
+    else:
+        result["corrected_p"] = np.nan
 
     result["significant"] = result["corrected_p"] < 0.05
     return result
@@ -854,6 +856,16 @@ def permanova_rscu(
     compute_zscore_normalization elsewhere in the module.
 
     Tests whether RSCU composition differs significantly between conditions.
+
+    INTERPRETATION CAVEAT (Anderson 2006). PERMANOVA is sensitive to both
+    location shifts (different group means) and dispersion shifts (different
+    within-group spreads). A significant p-value does NOT distinguish
+    "groups have different mean RSCU" from "groups have different RSCU
+    variability". For confirmatory location claims, follow up with a
+    PERMDISP / betadisper-style dispersion test on the same Aitchison
+    distances; if dispersion differs, frame the PERMANOVA result as
+    "RSCU composition differs in either location or dispersion" rather
+    than as a pure mean-comparison.
 
     Returns dict with F_statistic, p_value, R2, n_perm, distance ("aitchison").
     """
