@@ -83,7 +83,7 @@ sample_A and sample_C use existing Prokka files; sample_B runs Prokka from scrat
 
 The delimiter is auto-detected (tabs preferred, commas accepted).
 
-## Per-genome pipeline (11 steps)
+## Per-genome pipeline (13 steps)
 
 Every genome, whether processed via `run` or `batch`, goes through these steps:
 
@@ -96,8 +96,10 @@ Every genome, whether processed via `run` or `batch`, goes through these steps:
 7. **Pathway enrichment** via hypergeometric test for KEGG pathways over-represented in high- and low-expression gene sets, with Benjamini-Hochberg FDR correction
 8. **Advanced analyses**: correspondence analysis (COA) on codon usage, S-value adaptation to the ribosomal reference set, GC12-vs-GC3 neutrality analysis, PR2 (purine/pyrimidine ratio), delta-RSCU distance from the genome average, tRNA-codon co-adaptation correlation (if GFF provided), COG enrichment in high/low bias genes, gene length vs codon bias, and ENC-ENCprime difference
 9. **Biological/ecological analyses**: HGT candidate detection via Mahalanobis distance on RSCU profiles (using the 38 independent codon dimensions, since the full 59-codon space is rank-deficient by ~21 due to per-AA-family sum constraints), growth rate prediction via two complementary models (a CAI-based proxy and gRodon2 if installed; see caveats below), translational selection analysis (Fop gradient, positional effects across 5'/middle/3' gene regions), phage and mobile element detection, strand asymmetry, and operon co-adaptation
-10. **Codon usage tables** in six formats: RSCU, absolute counts, per-thousand frequencies, W values (relative adaptiveness), adaptation weights, and CBI (Codon Bias Index)
-11. **Publication-ready plots** at 300 DPI in PNG and SVG (editable in Adobe Illustrator)
+10. **Bio/ecology analyses** — see step 9 above; a single block in the codebase.
+11. **Codon usage tables** in six formats: RSCU, absolute counts, per-thousand frequencies, W values (relative adaptiveness), adaptation weights, and CBI (Codon Bias Index).
+12. **Codon-optimization comparison** — three-way comparison of genome / RP / Mahal-cluster reference frames. Emits a synthesis-ready preferred-codon table (Mahal-default with RP and genome alternates), per-AA agreement summaries (RP-vs-Mahal and genome-vs-Mahal), per-gene CAI under all three frames computed from the `.ffn` file, and five publication-ready figures. Output goes to a dedicated `codon_optimization/` subfolder. Skipped automatically when any reference is unavailable (e.g. when `--skip-mahal` is set), or explicitly with `--skip-codon-optimization`.
+13. **Publication-ready plots** at 300 DPI in PNG and SVG (editable in Adobe Illustrator).
 
 Steps 5 and 6 require R with coRdon. Pass `--skip-expression` to skip them.
 
@@ -185,6 +187,7 @@ codonpipe run GENOME -o OUTPUT_DIR [OPTIONS]
 | `--skip-kofamscan` | off | Skip KofamScan step |
 | `--kofam-results` | — | Pre-computed KofamScan detail-tsv |
 | `--skip-expression` | off | Skip R-based analyses (MELP/CAI/Fop/ENCprime/MILC) |
+| `--skip-codon-optimization` | off | Skip Step 12 (codon-optimization comparison). Output normally goes to `<sample_dir>/codon_optimization/`. |
 | `--kegg-ko-pathway` | auto-downloaded | KO-to-pathway mapping TSV |
 | `--force` | off | Overwrite existing outputs |
 | `-v, --verbose` | off | Debug-level logging |
