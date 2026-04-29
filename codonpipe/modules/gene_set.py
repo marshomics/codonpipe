@@ -449,15 +449,42 @@ def _aitchison_perm_test(
             continue
         obs = float(np.linalg.norm(_clr_transform(goi_mean) - _clr_transform(ref_arr)))
 
-        perm_d = np.empty(n_perm)
         n_goi = len(goi_rscu)
-        for i in range(n_perm):
-            if use_lm:
-                idx = _length_matched_indices(bg_lengths, goi_lengths, rng)
+        ref_clr = _clr_transform(ref_arr)
+        # Snapshot the local arrays so the worker doesn't need to pickle
+        # the enclosing function's closure (and so each parallel worker
+        # gets a clean view of the same matrices).
+        bg_X_local = bg_X
+        bg_lengths_local = bg_lengths
+        goi_lengths_local = goi_lengths
+        use_lm_local = use_lm
+
+        from codonpipe.utils._parallel import parallel_perm
+
+        def _aitchison_iter(rng_local: np.random.Generator, _idx: int) -> float:
+            if use_lm_local:
+                idx = _length_matched_indices(
+                    bg_lengths_local, goi_lengths_local, rng_local
+                )
             else:
-                idx = rng.choice(len(bg_X), size=n_goi, replace=False)
-            sampled_mean = bg_X[idx].mean(axis=0)
-            perm_d[i] = float(np.linalg.norm(_clr_transform(sampled_mean) - _clr_transform(ref_arr)))
+                idx = rng_local.choice(len(bg_X_local), size=n_goi, replace=False)
+            sampled_mean = bg_X_local[idx].mean(axis=0)
+            return float(np.linalg.norm(_clr_transform(sampled_mean) - ref_clr))
+
+        # Use the seed from the outer rng so a serial run with the same
+        # seed produces the same overall set of permutations (the
+        # ordering may differ, but the multi-set of permuted distances
+        # is identical because SeedSequence.spawn is deterministic).
+        master_seed = int(rng.integers(0, 2**31 - 1))
+        perm_d = np.array(
+            parallel_perm(
+                n_perm,
+                _aitchison_iter,
+                master_seed=master_seed,
+                desc=f"aitchison-perm-{label}",
+            ),
+            dtype=float,
+        )
 
         # One-sided (right-tail): GOI more divergent from reference than random
         p_more = (np.sum(perm_d >= obs) + 1) / (n_perm + 1)
@@ -522,13 +549,35 @@ def _hgt_flag_enrichment(
     obs_rate = float(goi_flags.mean())
     bg_rate = float(bg_flags.mean())
 
-    perm_rates = np.empty(n_perm)
-    for i in range(n_perm):
-        if use_lm:
-            idx = _length_matched_indices(bg_lengths, goi_lengths, rng)
+    bg_flags_local = bg_flags
+    bg_lengths_local = bg_lengths
+    goi_lengths_local = goi_lengths
+    n_goi_flags = len(goi_flags)
+    use_lm_local = use_lm
+
+    from codonpipe.utils._parallel import parallel_perm
+
+    def _hgt_perm_iter(rng_local: np.random.Generator, _idx: int) -> float:
+        if use_lm_local:
+            idx = _length_matched_indices(
+                bg_lengths_local, goi_lengths_local, rng_local
+            )
         else:
-            idx = rng.choice(len(bg_flags), size=len(goi_flags), replace=False)
-        perm_rates[i] = bg_flags[idx].mean()
+            idx = rng_local.choice(
+                len(bg_flags_local), size=n_goi_flags, replace=False
+            )
+        return float(bg_flags_local[idx].mean())
+
+    master_seed = int(rng.integers(0, 2**31 - 1))
+    perm_rates = np.array(
+        parallel_perm(
+            n_perm,
+            _hgt_perm_iter,
+            master_seed=master_seed,
+            desc=f"hgt-flag-perm-{flag_col}",
+        ),
+        dtype=float,
+    )
     p_value = (np.sum(perm_rates >= obs_rate) + 1) / (n_perm + 1)
     return {
         "flag": flag_col,
@@ -973,17 +1022,41 @@ def analyze_gene_set(
             obs_rate = float(goi_in.mean())
             bg_rate = float(bg_in.mean())
             use_lm = length_matched
-            perm_rates = np.empty(n_permutations)
+
+            from codonpipe.utils._parallel import parallel_perm
+
+            bg_in_local = bg_in
+            n_goi_in = len(goi_in)
             if use_lm:
                 bg_lengths = bj["length"].values
                 goi_lengths = gj["length"].values
-                for i in range(n_permutations):
-                    idx = _length_matched_indices(bg_lengths, goi_lengths, rng)
-                    perm_rates[i] = bg_in[idx].mean()
+
+                def _mahal_membership_iter(
+                    rng_local: np.random.Generator, _idx: int,
+                ) -> float:
+                    idx = _length_matched_indices(
+                        bg_lengths, goi_lengths, rng_local
+                    )
+                    return float(bg_in_local[idx].mean())
             else:
-                for i in range(n_permutations):
-                    idx = rng.choice(len(bg_in), size=len(goi_in), replace=False)
-                    perm_rates[i] = bg_in[idx].mean()
+                def _mahal_membership_iter(
+                    rng_local: np.random.Generator, _idx: int,
+                ) -> float:
+                    idx = rng_local.choice(
+                        len(bg_in_local), size=n_goi_in, replace=False
+                    )
+                    return float(bg_in_local[idx].mean())
+
+            master_seed = int(rng.integers(0, 2**31 - 1))
+            perm_rates = np.array(
+                parallel_perm(
+                    n_permutations,
+                    _mahal_membership_iter,
+                    master_seed=master_seed,
+                    desc="mahal-membership-perm",
+                ),
+                dtype=float,
+            )
             p_more = (np.sum(perm_rates >= obs_rate) + 1) / (n_permutations + 1)
             p_less = (np.sum(perm_rates <= obs_rate) + 1) / (n_permutations + 1)
             p_two = float(min(1.0, 2 * min(p_more, p_less)))
