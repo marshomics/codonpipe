@@ -615,6 +615,7 @@ def detect_hgt_candidates(
     sensitivity: str = "moderate",
     expected_hgt_frac: float = 0.05,
     reference_rscu: dict[str, float] | pd.Series | None = None,
+    gc3_outlier_sd: float = 2.0,
 ) -> pd.DataFrame:
     """Detect horizontal gene transfer (HGT) candidates via Mahalanobis distance.
 
@@ -625,6 +626,20 @@ def detect_hgt_candidates(
     When ``reference_rscu`` is provided (e.g. Mahalanobis cluster RSCU), distances are
     measured from that reference instead of the genome mean, making HGT calls
     relative to the translationally optimised gene pool.
+
+    Three flag columns are reported. Their relationship matters for any
+    interpretation:
+
+      - ``hgt_flag_fdr`` — Mahalanobis chi-squared p-value with BH FDR. The
+        statistically formal call. Use this for confirmatory claims.
+      - ``hgt_flag_adaptive`` — top ``expected_hgt_frac`` quantile by raw
+        Mahalanobis distance. Useful for rank-based exploratory selection
+        when the FDR call is too sparse.
+      - ``hgt_flag_combined`` — ``hgt_flag_fdr OR gc3_outlier``. This is a
+        *discovery* flag in the spirit of Lawrence & Ochman (1997, 1998),
+        which combines codon-usage and GC3 signals; it inflates the false
+        positive rate vs. either component alone, so prefer ``hgt_flag_fdr``
+        for confirmatory work and use ``hgt_flag_combined`` for screening.
 
     Args:
         rscu_gene_df: Per-gene RSCU table (from compute_rscu_per_gene).
@@ -639,6 +654,10 @@ def detect_hgt_candidates(
             RSCU column names). When provided, Mahalanobis distance is computed
             from this reference instead of the genome mean. Typically the Mahalanobis
             cluster RSCU from concatenated pooling.
+        gc3_outlier_sd: GC3 outlier threshold in genome-mean SD units. Default
+            2.0 follows the convention used by Lawrence & Ochman (1997, 1998)
+            and successor literature; under normality this flags ~5% of genes.
+            Use 2.5 or 3.0 for more conservative calls.
 
     Returns:
         DataFrame with columns: gene, mahalanobis_dist, gc3_deviation, p_value,
@@ -801,16 +820,19 @@ def detect_hgt_candidates(
                 expected_hgt_frac, adaptive_cutoff, hgt_flags_adaptive.sum(), len(genes))
 
     # ── GC3 outlier flag (#7) ─────────────────────────────────────────
-    # Flag genes whose GC3 deviates > 2 SD from the genome mean
+    # Flag genes whose GC3 deviates beyond ``gc3_outlier_sd`` SD from the
+    # genome mean. Default 2.0 follows Lawrence & Ochman (1997, 1998) and
+    # related literature; under normality this flags ~5% of genes (use 2.5
+    # or 3.0 for more conservative calls).
     gc3_valid = gc3_deviations[~np.isnan(gc3_deviations)]
     if len(gc3_valid) > 5:
         gc3_sd = np.std(gc3_valid)
-        gc3_outlier = np.abs(gc3_deviations) > 2 * gc3_sd
+        gc3_outlier = np.abs(gc3_deviations) > gc3_outlier_sd * gc3_sd
     else:
         gc3_outlier = np.full(len(gc3_deviations), False)
     gc3_outlier = np.where(np.isnan(gc3_deviations), False, gc3_outlier)
-    logger.info("GC3 outlier flag: %d/%d genes beyond 2 SD",
-                gc3_outlier.sum(), len(genes))
+    logger.info("GC3 outlier flag: %d/%d genes beyond %.1f SD",
+                gc3_outlier.sum(), len(genes), gc3_outlier_sd)
 
     # ── Combined flag: FDR OR GC3 outlier ─────────────────────────────
     hgt_combined = hgt_flags_fdr | gc3_outlier
@@ -850,22 +872,31 @@ def predict_growth_rate(
     expr_df: pd.DataFrame,
     rp_ids_file: Path | str | None = None,
 ) -> dict | None:
-    """Predict minimum doubling time from a CAI-based proxy for codon usage bias.
+    """Heuristic doubling-time *direction* from RP-CAI (NOT a calibrated prediction).
 
-    This is a *proxy* model, not a published growth-prediction method. The
-    formula ``doubling_time = exp(7.15 - 7.38 * mean_CAI_RP)`` borrows the
-    functional form (and coefficients) used in Vieira-Silva & Rocha (2010,
-    PLoS Genet), but their model regresses doubling time against ΔENC' (the
-    difference between ENC' of ribosomal genes and the genome), not against
-    mean CAI of ribosomal proteins. The two predictors correlate but are not
-    interchangeable, so this function should be read as a heuristic that
-    captures the same direction of effect rather than as an implementation
-    of the original calibration.
+    Functional form ``doubling_time = exp(a + b * mean_CAI_RP)`` with
+    ``(a, b) = (7.15, -7.38)`` adapted from Vieira-Silva & Rocha (2010,
+    PLoS Genet). Their model regresses doubling time against ΔENC' (the
+    ENC' gap between ribosomal genes and the genome), NOT against mean
+    RP-CAI. The two predictors correlate but are not interchangeable, so
+    the absolute hour value here is not a calibrated prediction. Treat
+    this output as a *direction-of-effect proxy*: organisms with higher
+    RP-CAI will sit lower in the rank ordering, but the absolute doubling
+    time is not validated.
+
+    Because the coefficients were transplanted from a different model,
+    no formal confidence interval can be reported (a bootstrap CI around
+    a misspecified mean does not have nominal coverage). The function
+    instead reports the bootstrap *spread of mean RP-CAI* as
+    ``rp_cai_mean_lower``/``rp_cai_mean_upper`` (sampling variation in
+    the predictor only) and a "proxy_doubling_time_hours" point estimate
+    suitable for ordering organisms — not for clinical or quantitative
+    use.
 
     For a properly calibrated, peer-reviewed growth prediction, use the
-    gRodon2 wrapper in :mod:`codonpipe.modules.grodon` (Weissman, Hou & Fuhrman
-    2021), which the pipeline runs alongside this proxy whenever gRodon2 is
-    installed.
+    gRodon2 wrapper in :mod:`codonpipe.modules.grodon` (Weissman, Hou
+    & Fuhrman 2021) which the pipeline runs alongside this proxy whenever
+    gRodon2 is installed; gRodon2 should be preferred whenever available.
 
     Args:
         expr_df: Expression table with gene and CAI column.
@@ -873,9 +904,10 @@ def predict_growth_rate(
                      Falls back to heuristic name matching if not provided.
 
     Returns:
-        Dict with mean_metric, predicted_doubling_time_hours, n_reference_genes,
-        growth_class, expression_metric, reference_set, and a caveat string
-        flagging the proxy status.
+        Dict with mean_metric, proxy_doubling_time_hours, the bootstrap
+        spread on RP-CAI (mean only — not a CI on doubling time),
+        n_reference_genes, growth_class_proxy, expression_metric,
+        reference_set, and a caveat string flagging the proxy status.
         Returns None if no expression data or reference genes found.
     """
     if expr_df.empty:
@@ -904,7 +936,8 @@ def predict_growth_rate(
             gene_names.str.contains("ribosomal|rp", na=False), "gene"
         ])
     ref_label = "ribosomal_proteins"
-    logger.info("Growth rate prediction using CAI on ribosomal proteins (%d genes)",
+    logger.info("Growth rate proxy (direction only) using RP-CAI (%d genes); "
+                "use gRodon2 for calibrated predictions",
                 len(ref_genes))
 
     if not ref_genes:
@@ -918,12 +951,6 @@ def predict_growth_rate(
         logger.warning("Too few reference genes with %s values (%d); need at least 3",
                        metric, len(ref_vals_series))
         return None
-    if len(ref_vals_series) < 10:
-        logger.warning(
-            "Only %d reference genes for the CAI-based growth proxy; "
-            "bootstrap confidence intervals may be unreliable below n=10",
-            len(ref_vals_series),
-        )
 
     mean_metric = ref_vals_series.mean()
 
@@ -933,18 +960,30 @@ def predict_growth_rate(
     b = -7.38
     predicted_doubling_time = np.exp(a + b * mean_metric)
 
-    # Bootstrap 95% CI on the predicted doubling time
+    # Bootstrap the *predictor* (mean RP-CAI), not the prediction.
+    # This characterizes the sampling spread of the predictor; it does NOT
+    # produce a CI on doubling time (the calibration error from transplanting
+    # the model is unknown and dominates the predictor variance for any
+    # reasonable RP set size).
     rng = np.random.default_rng(42)
     n_boot = 1000
     ref_vals = ref_vals_series.values
-    boot_dts = np.empty(n_boot)
-    for i in range(n_boot):
-        boot_sample = rng.choice(ref_vals, size=len(ref_vals), replace=True)
-        boot_dts[i] = np.exp(a + b * boot_sample.mean())
-    ci_lower = float(np.percentile(boot_dts, 2.5))
-    ci_upper = float(np.percentile(boot_dts, 97.5))
+    if len(ref_vals) >= 10:
+        boot_means = np.empty(n_boot)
+        for i in range(n_boot):
+            boot_means[i] = rng.choice(ref_vals, size=len(ref_vals), replace=True).mean()
+        rp_cai_mean_lower = float(np.percentile(boot_means, 2.5))
+        rp_cai_mean_upper = float(np.percentile(boot_means, 97.5))
+    else:
+        rp_cai_mean_lower = float("nan")
+        rp_cai_mean_upper = float("nan")
+        logger.warning(
+            "Skipping bootstrap on RP-CAI (n=%d < 10); too few reference "
+            "genes for a stable spread estimate.",
+            len(ref_vals),
+        )
 
-    # Growth class
+    # Growth class — relative ordering only.
     if predicted_doubling_time < 2.0:
         growth_class = "fast"
     elif predicted_doubling_time <= 8.0:
@@ -956,21 +995,33 @@ def predict_growth_rate(
         "expression_metric": metric,
         "reference_set": ref_label,
         "mean_metric": float(mean_metric),
-        # Backward compatibility aliases
-        "mean_metric_rp": float(mean_metric),
-        "predicted_doubling_time_hours": float(predicted_doubling_time),
-        "ci_lower_hours": ci_lower,
-        "ci_upper_hours": ci_upper,
+        "mean_metric_rp": float(mean_metric),  # backward compat
+        "rp_cai_mean_lower": rp_cai_mean_lower,
+        "rp_cai_mean_upper": rp_cai_mean_upper,
+        "proxy_doubling_time_hours": float(predicted_doubling_time),
+        "predicted_doubling_time_hours": float(predicted_doubling_time),  # backward compat
+        # NOTE: the next two are deprecated aliases preserved for downstream
+        # tables only. They are NOT 95% CIs on the doubling-time prediction;
+        # they reflect bootstrap spread of mean RP-CAI plugged into the
+        # transplanted formula. Read them only as a relative-stability
+        # indicator on the predictor, not as a calibrated interval.
+        "ci_lower_hours_DEPRECATED": float(np.exp(a + b * rp_cai_mean_upper))
+            if rp_cai_mean_upper == rp_cai_mean_upper else float("nan"),  # NaN-safe
+        "ci_upper_hours_DEPRECATED": float(np.exp(a + b * rp_cai_mean_lower))
+            if rp_cai_mean_lower == rp_cai_mean_lower else float("nan"),
         "n_reference_genes": int(len(ref_vals_series)),
         "n_rp_genes": int(len(ref_vals_series)),  # backward compat
-        "growth_class": growth_class,
-        "model": "cai_rp_proxy",
+        "growth_class_proxy": growth_class,
+        "growth_class": growth_class,  # backward compat
+        "model": "cai_rp_direction_proxy",
+        "is_calibrated": False,
         "caveat": (
-            f"CAI-based growth proxy using ribosomal proteins "
-            f"({len(ref_vals_series)} genes). Functional form adapted from "
-            f"Vieira-Silva & Rocha (2010), but the original paper regresses "
-            f"on ΔENC', not mean CAI; treat as heuristic. For peer-reviewed "
-            f"growth prediction, see the gRodon2 output."
+            f"DIRECTION-ONLY PROXY ({len(ref_vals_series)} RP genes). "
+            f"Functional form adapted from Vieira-Silva & Rocha (2010), "
+            f"but the original paper fits on ΔENC', not RP-CAI. The "
+            f"absolute hour value is NOT calibrated; use only for relative "
+            f"ranking across organisms. Use gRodon2 (run alongside, when "
+            f"installed) for any quantitative claim."
         ),
     }
 
@@ -1149,17 +1200,28 @@ def quantify_translational_selection(
 
     # --- C. Within-gene codon position effects ---
     # Reuse cached sequences from initial parse instead of re-reading the FASTA.
+    # Region size is defined in *codons*, not nucleotides, so the 5'/3'/middle
+    # regions cover comparable codon counts across genes of different lengths.
+    # The previous nt-based definition made short genes' 5' region a much
+    # larger fraction of total codons than for long genes, which broke
+    # cross-gene comparability. Default: 20% of codons, with a 30-codon
+    # floor and a 200-codon ceiling so very long and very short genes
+    # both stay in a useful regime.
     pos_rows = []
     merged_gene_set = set(merged["gene"].values)
+    region_codons_min = 30
+    region_codons_max = 200
     for gene_id, seq in _gene_seqs.items():
         if len(seq) < 300:
             continue
         if gene_id not in merged_gene_set:
             continue
 
-        # Use 20% of gene length for terminal regions, minimum 90 nt, rounded to codon boundary
         seq_upper = seq.upper()
-        region_nt = max(90, (len(seq_upper) // 5 // 3) * 3)
+        n_codons = len(seq_upper) // 3
+        region_codons = max(region_codons_min,
+                            min(region_codons_max, n_codons // 5))
+        region_nt = region_codons * 3
 
         # 5' region
         seq_5p = seq_upper[:region_nt]
@@ -1187,6 +1249,7 @@ def quantify_translational_selection(
             "fop_middle": round(fop_mid, 4) if not np.isnan(fop_mid) else np.nan,
             "fop_3prime": round(fop_3p, 4) if not np.isnan(fop_3p) else np.nan,
             "length": len(seq),
+            "region_codons": region_codons,
         })
 
     position_effects_df = pd.DataFrame(pos_rows)
@@ -1194,9 +1257,20 @@ def quantify_translational_selection(
     logger.info("Translational selection: identified %d optimal codons, %d genes with position data",
                 len(optimal_df), len(position_effects_df))
 
+    # Promote the Spearman summary stashed on .attrs (which to_csv would
+    # silently drop) into a small DataFrame so callers can persist it.
+    spearman_summary_df = pd.DataFrame()
+    if hasattr(fop_gradient_df, "attrs") and "spearman_rho" in fop_gradient_df.attrs:
+        spearman_summary_df = pd.DataFrame([{
+            "expression_metric": fop_gradient_df.attrs.get("expression_metric"),
+            "spearman_rho": fop_gradient_df.attrs.get("spearman_rho"),
+            "spearman_p": fop_gradient_df.attrs.get("spearman_p"),
+        }])
+
     return {
         "optimal_codons": optimal_df,
         "fop_gradient": fop_gradient_df,
+        "fop_gradient_correlation": spearman_summary_df,
         "position_effects": position_effects_df,
     }
 
@@ -1211,34 +1285,73 @@ def _compute_fop_from_counts(codon_counts: Counter, optimal_df: pd.DataFrame) ->
     return opt_count / total_count if total_count > 0 else np.nan
 
 
+_DEFAULT_PHAGE_KOS: frozenset[str] = frozenset({
+    # Transposases (selected; not exhaustive)
+    "K07483", "K07497", "K07504", "K07505", "K07506", "K07507",
+    # Phage head / structural proteins (selected)
+    "K10999", "K11005", "K11006",
+    # Phage integrase
+    "K10998",
+})
+
+
 def detect_phage_mobile_elements(
     hgt_df: pd.DataFrame,
     cog_result_tsv: Path | str | None = None,
     kofam_df: pd.DataFrame | None = None,
+    phage_kos: set[str] | frozenset[str] | None = None,
 ) -> pd.DataFrame:
-    """Detect phage and mobile element genes via COG/KOFam annotation of HGT candidates.
+    """Annotation-based screen for phage / mobile-element candidate genes.
 
-    Flags genes with COG category "X" (Mobilome) or "L" + HGT signal.
-    If KOFam available, also flags transposases and phage-related KOs.
+    HEURISTIC ONLY. This is *not* a virus-prediction tool. Flags rely on:
+    (a) COG category "X" (Mobilome), (b) COG "L" combined with the HGT
+    flag from :func:`detect_hgt_candidates`, and (c) keyword matches to
+    a small KEGG Orthology list. The KO list is defensible for picking
+    up canonical transposases and a handful of phage structural genes,
+    but it is far from a complete virus-finding strategy.
+
+    For any rigorous claim about prophage content or mobilome burden,
+    run a dedicated tool (PHASTER, VirSorter2, VIBRANT, geNomad, or
+    DeepVirFinder) and cross-reference. The output of this function
+    should be read as "annotation-flagged candidate mobilome genes",
+    not "phage genes detected".
 
     Args:
         hgt_df: HGT candidate DataFrame (from detect_hgt_candidates).
         cog_result_tsv: Path to COGclassifier result.tsv.
         kofam_df: Optional KOFam annotation DataFrame with gene and KO columns.
+        phage_kos: Override the default KO set. Pass a curated list from
+            a domain-specific reference if working with non-bacterial
+            genomes or if you need richer phage coverage.
 
     Returns:
-        DataFrame with columns: gene, mahalanobis_dist, gc3_deviation, hgt_flag,
-        cog_category, cog_description, is_mobilome, is_phage_related, (ko if kofam_df given).
+        DataFrame with columns: gene, mahalanobis_dist, gc3_deviation,
+        hgt_flag, cog_category, cog_description, is_mobilome,
+        is_phage_related, detection_method (which heuristic flagged the
+        gene: "cog_X" / "cog_L_with_hgt" / "ko_match" / a combination,
+        or empty), and (ko if kofam_df given).
     """
     if hgt_df.empty:
         logger.info("SKIPPED: phage/mobile element detection (no HGT candidates)")
         return pd.DataFrame()
+
+    if phage_kos is None:
+        phage_kos = _DEFAULT_PHAGE_KOS
+    logger.warning(
+        "detect_phage_mobile_elements: keyword-only screen (COG X/L + %d KO ids). "
+        "This is NOT a virus prediction tool. For confirmatory claims about "
+        "prophage / mobile-element content, run PHASTER, VirSorter2, VIBRANT, "
+        "or geNomad and reconcile with these annotation flags.",
+        len(phage_kos),
+    )
 
     result = hgt_df[["gene", "mahalanobis_dist", "gc3_deviation", "hgt_flag"]].copy()
     result["cog_category"] = None
     result["cog_description"] = None
     result["is_mobilome"] = False
     result["is_phage_related"] = False
+    # Track which heuristic flagged each gene so users can audit hits.
+    result["detection_method"] = ""
 
     # COG annotations
     if cog_result_tsv is not None:
@@ -1284,10 +1397,16 @@ def detect_phage_mobile_elements(
                     cog_slim.rename(columns={"cog_cat": "cog_category"}),
                     on="gene", how="left", suffixes=("", "_cog"),
                 )
-                result["is_mobilome"] = result["is_mobilome"] | (result["cog_category"] == "X")
-                result["is_phage_related"] = result["is_phage_related"] | (
-                    (result["cog_category"] == "L") & result["hgt_flag"]
-                )
+                cog_x_mask = result["cog_category"] == "X"
+                cog_l_hgt_mask = (result["cog_category"] == "L") & result["hgt_flag"]
+                result["is_mobilome"] = result["is_mobilome"] | cog_x_mask
+                result["is_phage_related"] = result["is_phage_related"] | cog_l_hgt_mask
+                result.loc[cog_x_mask, "detection_method"] = result.loc[
+                    cog_x_mask, "detection_method"
+                ].apply(lambda s: (s + ";cog_X").lstrip(";"))
+                result.loc[cog_l_hgt_mask, "detection_method"] = result.loc[
+                    cog_l_hgt_mask, "detection_method"
+                ].apply(lambda s: (s + ";cog_L_with_hgt").lstrip(";"))
 
             except Exception as e:
                 logger.warning("Error reading COG file: %s", e)
@@ -1295,18 +1414,11 @@ def detect_phage_mobile_elements(
     # KOFam phage/transposase annotations
     if kofam_df is not None and not kofam_df.empty:
         if "gene" in kofam_df.columns and "KO" in kofam_df.columns:
-            phage_kos = {
-                "K07483", "K07497", "K07504", "K07505", "K07506", "K07507",  # Transposases
-                "K10999", "K11005", "K11006",  # Phage head proteins
-                "K10998",  # Phage integrase
-            }
-            ko_map = {}
+            ko_map: dict[str, list[str]] = {}
             for _, row in kofam_df.iterrows():
                 gene = row["gene"]
                 ko = str(row["KO"]).strip()
-                if gene not in ko_map:
-                    ko_map[gene] = []
-                ko_map[gene].append(ko)
+                ko_map.setdefault(gene, []).append(ko)
 
             for idx, row in result.iterrows():
                 gene = row["gene"]
@@ -1314,10 +1426,18 @@ def detect_phage_mobile_elements(
                     kos = ko_map[gene]
                     if any(k in phage_kos for k in kos):
                         result.at[idx, "is_phage_related"] = True
+                        existing = result.at[idx, "detection_method"]
+                        result.at[idx, "detection_method"] = (
+                            (existing + ";ko_match").lstrip(";")
+                        )
                     result.at[idx, "ko"] = ";".join(kos[:3])  # Top 3 KOs
 
-    logger.info("Phage/mobile element detection: flagged %d/%d genes as mobilome/phage-related",
-                result["is_mobilome"].sum() + result["is_phage_related"].sum(), len(result))
+    logger.info(
+        "Phage/mobile element annotation screen: flagged %d/%d genes "
+        "(annotation-based heuristic — not a virus prediction)",
+        int((result["is_mobilome"] | result["is_phage_related"]).sum()),
+        len(result),
+    )
 
     return result
 
@@ -1449,15 +1569,30 @@ def compute_operon_codon_coadaptation(
     rscu_gene_df: pd.DataFrame,
     gff_path: Path | None = None,
 ) -> pd.DataFrame | None:
-    """Detect codon coadaptation in operons via RSCU distance between adjacent genes.
+    """Codon-usage similarity between adjacent same-strand genes.
+
+    HEURISTIC. Adjacent same-strand genes are NOT necessarily in the
+    same operon. Real operon inference needs synteny conservation, the
+    presence of a shared promoter, the absence of an internal terminator,
+    and ideally experimental support (RNA-seq operon mapping). This
+    function reports a codon-usage similarity statistic between
+    consecutive same-strand genes and a permutation null built from
+    randomly shuffled gene pairs. The output column historically named
+    ``same_operon_prediction`` is preserved for backward compatibility
+    but should be read as ``adjacent_pair_more_similar_than_chance``;
+    a duplicate column with that more honest name is added so users
+    don't conflate "RSCU-similar neighbour" with "co-transcribed
+    operon".
 
     Args:
         rscu_gene_df: Per-gene RSCU table.
         gff_path: Path to GFF3 annotation (for gene order and strand).
 
     Returns:
-        DataFrame with gene1, gene2, strand, distance_bp (intergenic), rscu_distance,
-        same_operon_prediction. Returns None if no GFF available.
+        DataFrame with gene1, gene2, strand, intergenic_bp, rscu_distance,
+        empirical_p, fdr, same_operon_prediction (backward-compat),
+        adjacent_pair_more_similar_than_chance (preferred). Returns None
+        if no GFF available.
     """
     if gff_path is None:
         logger.warning("No GFF path provided; cannot compute operon coadaptation")
@@ -1578,11 +1713,18 @@ def compute_operon_codon_coadaptation(
         result_df["fdr"] = fdr_result
 
         result_df["same_operon_prediction"] = result_df["fdr"] < 0.05
+        # Honest alias: this flag means "this adjacent same-strand pair
+        # has codon usage closer than the random-pair baseline at FDR<0.05".
+        # That is suggestive of co-regulation but is NOT a real operon call.
+        result_df["adjacent_pair_more_similar_than_chance"] = (
+            result_df["same_operon_prediction"]
+        )
         result_df["random_baseline_median"] = median_random
     else:
         result_df["empirical_p"] = np.nan
         result_df["fdr"] = np.nan
         result_df["same_operon_prediction"] = False
+        result_df["adjacent_pair_more_similar_than_chance"] = False
         result_df["random_baseline_median"] = np.nan
 
     logger.info("Operon coadaptation: analyzed %d gene pairs", len(result_df))
