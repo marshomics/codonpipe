@@ -34,6 +34,7 @@ import logging
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from codonpipe.utils.codon_tables import MIN_GENE_LENGTH
@@ -141,8 +142,66 @@ def run_cu_statistics(
                 min_length=min_length,
             )
         outputs[outname] = out_path
+        # Sanity-check the coRdon output. ENCprime should sit roughly in
+        # [20, 61] (Wright-style bounds; small over-shoots are possible
+        # under shrinkage). MILC is positive; values much larger than ~5
+        # indicate either a numerical pathology or an unexpected reference
+        # set. We log warnings — not errors — so a single off-bound gene
+        # doesn't kill the run, but reproducibility issues are visible.
+        _validate_cu_statistic_output(out_path, metric)
 
     return outputs
+
+
+_VALID_RANGES = {
+    "ENCprime": (20.0, 61.5),  # small over-bound tolerance for shrinkage
+    "MILC": (0.0, 5.0),        # MILC is unbounded above but >5 is unusual
+}
+
+
+def _validate_cu_statistic_output(out_path: Path, metric: str) -> None:
+    """Range-check the CU statistic table emitted by coRdon.
+
+    Logs warnings for NaN/Inf and out-of-range values. Does not raise,
+    so users can still inspect the table even when coRdon misbehaves
+    (e.g. version drift). Pin coRdon in environment.yml to keep results
+    stable across machines.
+    """
+    try:
+        df = pd.read_csv(out_path, sep="\t")
+    except Exception as exc:
+        logger.warning("Could not read %s output for validation (%s)", metric, exc)
+        return
+
+    # The first non-(gene,width) column holds the metric values.
+    candidate_cols = [c for c in df.columns if c not in ("gene", "width")]
+    if not candidate_cols:
+        logger.warning("%s output at %s has no metric column to validate.",
+                       metric, out_path)
+        return
+    metric_col = candidate_cols[0]
+    values = pd.to_numeric(df[metric_col], errors="coerce")
+
+    n_nan = int(values.isna().sum())
+    n_inf = int(np.isinf(values.fillna(0).values).sum())
+    if n_nan or n_inf:
+        logger.warning(
+            "%s output: %d NaN and %d Inf values out of %d rows in column %r. "
+            "Check coRdon installation and gene-length filter.",
+            metric, n_nan, n_inf, len(values), metric_col,
+        )
+
+    lo, hi = _VALID_RANGES.get(metric, (None, None))
+    if lo is not None and hi is not None:
+        finite = values.replace([float("inf"), float("-inf")], pd.NA).dropna()
+        out_of_range = ((finite < lo) | (finite > hi)).sum()
+        if out_of_range:
+            logger.warning(
+                "%s output: %d/%d genes outside expected range [%.2f, %.2f]. "
+                "If many genes are out of range, suspect a coRdon version "
+                "mismatch or an unexpected background set.",
+                metric, int(out_of_range), len(finite), lo, hi,
+            )
 
 
 def _run_r_statistic(
