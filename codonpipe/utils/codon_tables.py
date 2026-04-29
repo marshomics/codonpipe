@@ -123,6 +123,57 @@ for _aa, _codons in AA_CODON_GROUPS.items():
 MIN_GENE_LENGTH = 240
 
 
+# ── Pseudocount defaults ──────────────────────────────────────────────────
+# CodonPipe uses several different pseudocount magnitudes depending on
+# the operation. Documenting them once makes it easy to audit and to
+# tune for unusual inputs (very small genomes, single-cell data, etc.).
+# The values are not interchangeable — each is sized to the dynamic
+# range of the quantity it protects.
+#
+#   PSEUDOCOUNT_COA = 1e-8
+#       Added to row/column sums in correspondence-analysis grand-total
+#       normalisation. Below the float64 round-off floor of typical
+#       RSCU sums (~ a few hundred), so it never perturbs ratios — its
+#       only role is to keep ``row_sums``, ``col_sums`` and ``grand_total``
+#       from hitting exact zero on degenerate inputs.
+#
+#   PSEUDOCOUNT_CLR = 1e-6
+#       Added to RSCU/raw-count entries before the centred log-ratio
+#       transform (``log(x + eps)``). RSCU values are bounded above by
+#       ~6 and the smallest meaningful value is ~0.01; 1e-6 is two
+#       orders of magnitude below that, small enough to not bias
+#       observed ratios but large enough to keep ``log(0)`` from
+#       propagating ``-inf`` through the matrix.
+#
+#   PSEUDOCOUNT_LOGFC = 1e-4
+#       Added to RSCU values before computing log2 fold-changes
+#       between conditions. Coarser than PSEUDOCOUNT_CLR because the
+#       log2 fold-change is reported in plots and tables — at 1e-6
+#       the implied LFC for a 0-vs-1 codon would be ~20 log2 units,
+#       which dominates volcano plots; at 1e-4 it caps at ~14 log2
+#       units, still very large but visually scannable.
+#
+#   PSEUDOCOUNT_CAI = 1e-3
+#       Floor on the relative-adaptiveness weight ``w_i`` before the
+#       geometric mean in CAI computation. Sharp & Li (1987)
+#       originally suggest setting w to 0.5 for unobserved codons
+#       in the reference; using a much smaller floor here is more
+#       conservative (rare codons hurt CAI more) and matches
+#       Carbone et al. (2003) practice.
+#
+#   PSEUDOCOUNT_WEIGHT = 0.01
+#       Used inside ``log((rscu_ref + p) / (rscu_all + p))`` for the
+#       three-way codon-adaptation weight comparison. Sized to be
+#       small relative to typical RSCU values (~0.1 to 6) so that
+#       observed ratios are preserved, while still bounding the log
+#       term for codons absent from one of the reference sets.
+PSEUDOCOUNT_COA = 1e-8
+PSEUDOCOUNT_CLR = 1e-6
+PSEUDOCOUNT_LOGFC = 1e-4
+PSEUDOCOUNT_CAI = 1e-3
+PSEUDOCOUNT_WEIGHT = 0.01
+
+
 # ── Canonical column names shared across modules ──────────────────────────
 # Defining these once prevents silent breakage when modules are updated
 # independently.  Import these constants instead of hardcoding strings.
