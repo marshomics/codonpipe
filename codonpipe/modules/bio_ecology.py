@@ -1672,15 +1672,37 @@ def compute_operon_codon_coadaptation(
 
     # Permutation baseline: shuffle gene order many times and collect
     # pairwise distances to build a null distribution for comparison.
-    rng = np.random.RandomState(42)
-    random_genes = list(rscu_map.keys())
-    random_dists = []
+    # Each shuffle is independent, so this parallelises naturally; we
+    # snapshot the inputs into local arrays first so each worker pickles
+    # a stable view rather than re-deriving from rscu_map every call.
+    from codonpipe.utils._parallel import parallel_perm
+
     n_permutations = 1000
-    for _ in range(n_permutations):
-        rng.shuffle(random_genes)
-        for i in range(min(len(random_genes) - 1, len(result_df))):
-            g1, g2 = random_genes[i], random_genes[i + 1]
-            random_dists.append(euclidean(rscu_map[g1], rscu_map[g2]))
+    n_pair_per_perm = min(len(rscu_map) - 1, len(result_df))
+    gene_keys = list(rscu_map.keys())
+    rscu_matrix = np.asarray([rscu_map[g] for g in gene_keys])
+    n_genes_total = len(gene_keys)
+
+    def _operon_perm_iter(
+        rng_local: np.random.Generator, _idx: int,
+    ) -> np.ndarray:
+        # Sample a permutation of gene indices and take the first
+        # ``n_pair_per_perm`` adjacent pair distances. This matches the
+        # serial implementation's "shuffle then take adjacent pairs"
+        # exactly when the shuffle is over a permutation of indices.
+        order = rng_local.permutation(n_genes_total)
+        first = order[:n_pair_per_perm]
+        second = order[1:n_pair_per_perm + 1]
+        diff = rscu_matrix[first] - rscu_matrix[second]
+        return np.sqrt(np.sum(diff * diff, axis=1))
+
+    perm_chunks = parallel_perm(
+        n_permutations,
+        _operon_perm_iter,
+        master_seed=42,
+        desc="operon-coadaptation-perm",
+    )
+    random_dists = np.concatenate(perm_chunks).tolist() if perm_chunks else []
 
     if random_dists:
         random_dists_arr = np.array(random_dists)
