@@ -270,6 +270,8 @@ def compute_top_line_stats(
 def build_recommendation_table(
     summary: pd.DataFrame,
     table: pd.DataFrame,
+    high_confidence_w_shift: float = 0.5,
+    medium_confidence_w_shift: float = 0.2,
 ) -> pd.DataFrame:
     """Per-AA-family synthesis recommendation table.
 
@@ -278,11 +280,26 @@ def build_recommendation_table(
              confidence
 
     'recommended_codon' is the Mahal-cluster-derived optimal codon when RP
-    and Mahal agree, or when their w-values are close (Δ<=0.1). When they
-    disagree by a larger margin, 'recommended_codon' still uses the Mahal
-    pick but 'alternative_codon' surfaces the RP-optimal as a fallback,
-    and 'confidence' notes the disagreement so the user sees the choice
+    and Mahal agree, or when their w-values are close. When they disagree
+    by a larger margin, 'recommended_codon' still uses the Mahal pick but
+    'alternative_codon' surfaces the RP-optimal as a fallback, and
+    'confidence' notes the disagreement so the user sees the choice
     explicitly.
+
+    Confidence thresholds (w-shift = max within-family Δw between RP and
+    Mahal). The defaults (0.5 / 0.2) are heuristic, not derived from a
+    significance test:
+
+      - 0.5 corresponds to a >50% within-family relative-adaptiveness
+        gap, which is large enough that the two reference frames pick
+        meaningfully different codons.
+      - 0.2 corresponds to a ~20% gap, which we treat as medium.
+      - Below 0.2, the two frames are close enough that either codon
+        is defensible.
+
+    Override these thresholds by passing ``high_confidence_w_shift`` or
+    ``medium_confidence_w_shift`` if your organism has unusually weak
+    or unusually strong selection.
     """
     if summary.empty:
         return pd.DataFrame()
@@ -297,8 +314,8 @@ def build_recommendation_table(
         if not r["agree"]:
             rationale = f"Mahal-optimal '{m_opt}' differs from RP-optimal '{rp_opt}'"
             confidence = (
-                "high" if r["max_codon_w_shift"] >= 0.5 else
-                "medium" if r["max_codon_w_shift"] >= 0.2 else
+                "high" if r["max_codon_w_shift"] >= high_confidence_w_shift else
+                "medium" if r["max_codon_w_shift"] >= medium_confidence_w_shift else
                 "low"
             )
         else:
