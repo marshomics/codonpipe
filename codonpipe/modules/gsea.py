@@ -547,8 +547,34 @@ def load_ko_module_map(
 
 def load_module_names(
     cache_dir: Path | None = None,
+    user_file: Path | None = None,
 ) -> dict[str, str]:
-    """Load module ID → name mapping with caching."""
+    """Load module ID → name mapping with caching.
+
+    Resolution order matches :func:`enrichment.load_pathway_names`:
+        1. ``user_file`` if supplied (TSV from
+           ``https://rest.kegg.jp/list/module``).
+        2. JSON cache under ``cache_dir``.
+        3. Fresh download from KEGG REST.
+    """
+    if user_file is not None and user_file.exists():
+        # Reuse the enrichment-module helper to keep TSV parsing
+        # consistent across both name files.
+        from codonpipe.modules.enrichment import _load_user_names_tsv
+        names = _load_user_names_tsv(user_file)
+        logger.info(
+            "Loaded user module-names map: %d modules from %s",
+            len(names), user_file,
+        )
+        if cache_dir is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(cache_dir / "kegg_module_names.json", "w") as fh:
+                    json.dump(names, fh)
+            except Exception:
+                pass
+        return names
+
     cache_path = None
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -585,6 +611,7 @@ def run_gsea_analysis(
     max_size: int = _MAX_GENE_SET_SIZE,
     cache_dir: Path | None = None,
     ko_module_user_file: Path | None = None,
+    module_names_user_file: Path | None = None,
 ) -> dict[str, pd.DataFrame | Path]:
     """Run GSEA on a single genome using multiple gene-set sources.
 
@@ -595,12 +622,16 @@ def run_gsea_analysis(
         output_dir: Base output directory for this sample.
         sample_id: Sample identifier.
         ko_pathway_map: KO→pathway mapping (reused from enrichment module).
-        pathway_names: Pathway ID→name mapping.
+        pathway_names: Pathway ID→name mapping. If supplied here, the
+            module-level network calls for pathway names are skipped.
         cog_result_path: Path to COGclassifier result TSV.
         n_perm: Number of permutations.
         min_size: Minimum gene set size.
         max_size: Maximum gene set size.
         cache_dir: Directory for KEGG API cache.
+        ko_module_user_file: Optional pre-fetched KO→module TSV (offline).
+        module_names_user_file: Optional pre-fetched module ID → name TSV
+            (``https://rest.kegg.jp/list/module``) for offline runs.
 
     Returns:
         Dict with keys like "gsea_modules", "gsea_pathways", "gsea_cog"
@@ -656,7 +687,9 @@ def run_gsea_analysis(
             ko_mod_map = load_ko_module_map(
                 user_file=ko_module_user_file, cache_dir=cache_dir,
             )
-            mod_names = load_module_names(cache_dir=cache_dir)
+            mod_names = load_module_names(
+                cache_dir=cache_dir, user_file=module_names_user_file,
+            )
 
             if ko_mod_map:
                 mod_gene_sets, mod_display = build_gene_sets_from_kofam(
