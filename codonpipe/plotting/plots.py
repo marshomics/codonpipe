@@ -31,6 +31,45 @@ from codonpipe.utils.codon_tables import AMINO_ACID_FAMILIES, RSCU_COLUMN_NAMES,
 logger = logging.getLogger("codonpipe")
 
 
+def _gene_labels_with_definition(
+    df: pd.DataFrame,
+    *,
+    gene_col: str = "gene",
+    definition_col: str = "KO_definition",
+    max_chars: int = 55,
+) -> list[str]:
+    """Build per-row labels for plots that index by gene id.
+
+    When ``df`` carries a ``KO_definition`` column (typically merged from
+    the KofamScan-annotated expression table), each row is labelled with
+    the human-readable description followed by the locus tag in
+    parentheses, e.g. ``"30S ribosomal protein S12 (GUT184460_00009)"``.
+    Rows without a KO assignment fall back to the bare locus tag, so the
+    helper is safe to call on any frame that has at least the ``gene``
+    column.
+
+    Long descriptions are truncated to ``max_chars`` with an ellipsis to
+    keep narrow tick areas readable. The helper mirrors the equivalent
+    in ``_codon_optimization_figures._gene_labels`` so the two label
+    styles are identical across the codon-optimization gain panels and
+    the rare-codon-burden / inefficiency panels.
+    """
+    has_def = definition_col in df.columns
+    out: list[str] = []
+    for _, row in df.iterrows():
+        gid = str(row.get(gene_col, "")).strip() or "(unknown)"
+        definition = str(row.get(definition_col, "")).strip() if has_def else ""
+        if definition and definition.lower() not in ("nan", "none", '""', "''"):
+            label = definition.strip('"').strip("'")
+            if len(label) > max_chars:
+                label = label[: max_chars - 1].rstrip() + "…"
+            label = f"{label}  ({gid})"
+        else:
+            label = gid
+        out.append(label)
+    return out
+
+
 def _rscu_to_freq_df(rscu_data) -> pd.DataFrame:
     """Convert an RSCU Series or dict to the freq_df format expected by heatmap/bar plots.
 
@@ -59,10 +98,22 @@ _mahal_rscu_to_freq_df = _rscu_to_freq_df
 
 
 def _safe_label(value, fallback: str = "", maxlen: int = 50) -> str:
-    """Return a truncated string label, safely handling NaN/None."""
+    """Return a truncated string label, safely handling NaN/None and empties.
+
+    Empty strings ("") and the literal string "nan" are treated as
+    missing — those happen routinely when a join leaves a row with no
+    matching ``pathway_name`` entry, or when ``load_pathway_names``
+    couldn't find a name for a given KEGG pathway accession. Without
+    this treatment the enrichment plots produced blank y-axis labels
+    in those rows, which read as "nothing here" rather than as a
+    pathway with a missing description.
+    """
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return str(fallback)[:maxlen] if fallback else ""
-    return str(value)[:maxlen]
+    text = str(value).strip()
+    if text == "" or text.lower() == "nan":
+        return str(fallback)[:maxlen] if fallback else ""
+    return text[:maxlen]
 
 
 # ─── Single-genome plots ────────────────────────────────────────────────────
@@ -3556,6 +3607,20 @@ def plot_enrichment_heatmap(
     top_n = min(len(all_pathways), max_pathways)
     all_pathways = list(all_pathways)[:top_n]
 
+    # Build a single accession -> name lookup from the source DataFrames.
+    # Without this, the heatmap labels rows with the bare KEGG accession
+    # (ko00010) instead of the human-readable name (Glycolysis /
+    # Gluconeogenesis). Walk every comparison so that even pathways that
+    # only appear in one tier still get their name picked up.
+    pathway_name_lookup: dict[str, str] = {}
+    for _metric_tier, edf in comparisons:
+        if "pathway" not in edf.columns or "pathway_name" not in edf.columns:
+            continue
+        for pw, name in zip(edf["pathway"].astype(str), edf["pathway_name"].astype(str)):
+            cleaned = name.strip()
+            if pw and cleaned and cleaned.lower() != "nan" and pw not in pathway_name_lookup:
+                pathway_name_lookup[pw] = cleaned
+
     # Build matrix: rows = pathways, columns = comparisons
     matrix = []
     pathway_names = []
@@ -3571,8 +3636,12 @@ def plot_enrichment_heatmap(
             else:
                 row.append(np.nan)  # White for untested
         matrix.append(row)
-        pathway_name = _safe_label(pathway, maxlen=30)
-        pathway_names.append(pathway_name)
+        # Prefer the resolved name; fall back to the accession when KEGG
+        # didn't provide a name for that pathway. The accession alone is
+        # shown only when the network was unavailable AND the cache had
+        # no entry — at that point the user has no other option.
+        pathway_label = pathway_name_lookup.get(str(pathway), str(pathway))
+        pathway_names.append(_safe_label(pathway_label, fallback=str(pathway), maxlen=40))
 
     if not matrix:
         logger.warning("No data for enrichment heatmap")
@@ -6468,6 +6537,24 @@ def generate_single_genome_plots(
                      else None)
 
     if _ineff_report is not None and not _ineff_report.empty:
+        # Merge KO_definition from the annotated expression table when
+        # available, so the inefficiency plots can label rows with the
+        # human-readable KofamScan description (e.g.
+        # "30S ribosomal protein S12") instead of the bare locus tag.
+        # If expr_df doesn't have the column the plots fall back to the
+        # gene id, so this merge is always safe.
+        if (
+            expr_df is not None
+            and "gene" in expr_df.columns
+            and "KO_definition" in expr_df.columns
+            and "gene" in _ineff_report.columns
+            and "KO_definition" not in _ineff_report.columns
+        ):
+            _ineff_report = _ineff_report.merge(
+                expr_df[["gene", "KO_definition"]].drop_duplicates("gene"),
+                on="gene", how="left",
+            )
+
         # Re-rank by rare_codon_burden descending (the report ships sorted by
         # core_CAI ascending, but these plots specifically visualize the burden
         # metric from the Mahalanobis-cluster adaptation weights).
@@ -6997,9 +7084,12 @@ def plot_inefficiency_waterfall(
 
     ax.barh(y_pos, df[metric_col].values, color=colors, edgecolor="none", height=0.8)
 
-    # Gene labels (show only if ≤ 60 genes, else too crowded)
+    # Gene labels (show only if ≤ 60 genes, else too crowded). Prefer the
+    # human-readable KofamScan description when the upstream merge (in
+    # generate_single_genome_plots) populated KO_definition; fall back to
+    # the bare locus tag otherwise.
     if n_genes <= 60:
-        labels = df["gene"].astype(str).values
+        labels = _gene_labels_with_definition(df)
         ax.set_yticks(y_pos)
         ax.set_yticklabels(labels, fontsize=6)
     else:
@@ -7093,14 +7183,15 @@ def plot_inefficiency_rscu_deviation_heatmap(
             ax.axvline(i - 0.5, color="black", linewidth=0.5, alpha=0.5)
         prev_aa = aa
 
-    # Y-axis: gene names
-    gene_labels = gene_data["gene"].astype(str).values
-    if len(gene_labels) <= 80:
-        ax.set_yticks(np.arange(len(gene_labels)))
-        ax.set_yticklabels(gene_labels, fontsize=5)
+    # Y-axis: gene names. Prefer KO_definition when the upstream merge
+    # populated it; fall back to the bare locus tag.
+    if len(gene_data) <= 80:
+        labels = _gene_labels_with_definition(gene_data)
+        ax.set_yticks(np.arange(len(labels)))
+        ax.set_yticklabels(labels, fontsize=5)
     else:
         ax.set_yticks([])
-        ax.set_ylabel(f"Genes (n = {len(gene_labels)}, ranked by inefficiency)")
+        ax.set_ylabel(f"Genes (n = {len(gene_data)}, ranked by inefficiency)")
 
     cbar = fig.colorbar(im, ax=ax, shrink=0.6, pad=0.02)
     cbar.set_label("RSCU deviation from RP cluster\n(gene − optimum)", fontsize=9)
