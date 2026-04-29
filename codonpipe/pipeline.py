@@ -198,6 +198,8 @@ def run_single_genome(
     stability_core_threshold: float = 0.5,
     kegg_ko_pathway: Path | None = None,
     kegg_ko_module: Path | None = None,
+    kegg_pathway_names: Path | None = None,
+    kegg_module_names: Path | None = None,
     kegg_cache_dir: Path | None = None,
     gff_file: Path | None = None,
     force: bool = False,
@@ -528,6 +530,7 @@ def run_single_genome(
             enrich_outputs = run_enrichment_analysis(
                 expr_df, kofam_df, output_dir, sample_id,
                 kegg_ko_pathway_file=kegg_ko_pathway,
+                kegg_pathway_names_file=kegg_pathway_names,
                 cache_dir=kegg_cache_dir,
             )
             all_outputs.update(enrich_outputs)
@@ -1025,6 +1028,7 @@ def run_single_genome(
             mahal_enrich_outputs = run_enrichment_analysis(
                 expr_df, kofam_df, output_dir, sample_id,
                 kegg_ko_pathway_file=kegg_ko_pathway,
+                kegg_pathway_names_file=kegg_pathway_names,
                 output_subdir="enrichment_mahal",
                 cache_dir=kegg_cache_dir,
             )
@@ -1046,6 +1050,7 @@ def run_single_genome(
             enrich_outputs = run_enrichment_analysis(
                 expr_df, kofam_df, output_dir, sample_id,
                 kegg_ko_pathway_file=kegg_ko_pathway,
+                kegg_pathway_names_file=kegg_pathway_names,
                 cache_dir=kegg_cache_dir,
             )
             all_outputs.update(enrich_outputs)
@@ -1204,7 +1209,9 @@ def run_single_genome(
             ko_pw_map = load_ko_pathway_map(
                 user_file=kegg_ko_pathway, cache_dir=cache_dir,
             )
-            pw_names = load_pathway_names(cache_dir=cache_dir)
+            pw_names = load_pathway_names(
+                cache_dir=cache_dir, user_file=kegg_pathway_names,
+            )
 
             gsea_results = run_gsea_analysis(
                 mahal_clusters_path=Path(mahal_results["mahal_clusters_path"]),
@@ -1220,6 +1227,7 @@ def run_single_genome(
                 n_perm=gsea_permutations,
                 cache_dir=cache_dir,
                 ko_module_user_file=kegg_ko_module,
+                module_names_user_file=kegg_module_names,
             )
             for key, val in gsea_results.items():
                 if isinstance(val, Path):
