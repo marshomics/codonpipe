@@ -197,6 +197,7 @@ def run_single_genome(
     stability_bootstraps: int = 100,
     stability_core_threshold: float = 0.5,
     kegg_ko_pathway: Path | None = None,
+    kegg_ko_module: Path | None = None,
     kegg_cache_dir: Path | None = None,
     gff_file: Path | None = None,
     force: bool = False,
@@ -1218,6 +1219,7 @@ def run_single_genome(
                 ),
                 n_perm=gsea_permutations,
                 cache_dir=cache_dir,
+                ko_module_user_file=kegg_ko_module,
             )
             for key, val in gsea_results.items():
                 if isinstance(val, Path):
