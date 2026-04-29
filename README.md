@@ -346,22 +346,22 @@ codonpipe corpus output_run/*/signatures \\
 
 Validation strategy: with thousands of genomes, expect HDBSCAN to find anywhere from 5 to 50 clusters with the default heuristic. Inspect `corpus_validation.tsv` to see how cluster membership associates with phylum, isolation source, growth rate, etc. A defensible workflow always checks (1) Mantel `r` against phylogeny — too high (~0.95+) means the signature is mostly recovering taxonomy and you should revisit the feature set, (2) cluster enrichment against ecology metadata — clusters that align cleanly with habitat or growth-rate class are likely capturing real biology, (3) phylogenetically-controlled tests if you have a tree — Pagel's λ on each feature column tells you whether the variance is phylogenetic or trait-like.
 
-### `codonpipe codon-optimization`
+### Codon-optimization outputs (Step 12)
 
-```
-codonpipe codon-optimization SAMPLE_DIR [OPTIONS]
-```
+The codon-optimization analysis runs automatically as Step 12 of every
+`codonpipe run` and `codonpipe batch` invocation. There is no longer a
+standalone `codonpipe codon-optimization` subcommand. To opt out, pass
+`--skip-codon-optimization` on `run` or `batch`. To re-derive the
+analysis from scratch on an existing sample directory, import
+`codonpipe.modules.codon_optimization.run_codon_optimization` directly.
 
-Compares the genome / ribosomal-protein / Mahalanobis-cluster codon-usage profiles for one organism, quantifies the gain from Mahal-cluster-derived codon optimization vs the classic RP-derived approach, and emits a synthesis-ready preferred-codon table.
+The analysis compares the genome / ribosomal-protein / Mahalanobis-cluster
+codon-usage profiles for one organism, quantifies the gain from
+Mahal-cluster-derived codon optimization vs the classic RP-derived
+approach, and emits a synthesis-ready preferred-codon table. Output
+goes to `<sample_dir>/codon_optimization/`.
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `-s, --sample-id` | dir name | Sample identifier (defaults to the directory name). |
-| `-o, --output-dir` | `<SAMPLE_DIR>/codon_optimization/` | Output directory. |
-| `--no-figure` | off | Skip the three figures, write only the TSV outputs. |
-| `-v, --verbose` | off | Debug-level logging. |
-
-Outputs:
+Files produced:
 
 - `<sample_id>_codon_optimization_table.tsv` — per-codon comparison: amino_acid, family, codon, codon_col, genome_rscu, rp_rscu, mahal_rscu, rp_w, mahal_w, rp_optimal, mahal_optimal, family_agree, delta_w_mahal_minus_rp, delta_rscu_mahal_minus_rp, delta_rscu_mahal_minus_genome. The full data behind every plot.
 - `<sample_id>_codon_optimization_summary.tsv` — per-AA-family summary: which codon is optimal under each scheme, do they agree, and the maximum within-family Δw shift.
@@ -371,7 +371,7 @@ Outputs:
 - `<sample_id>_optimization_agreement.png` / `.svg` — compact per-AA-family table showing the RP-optimal codon vs the Mahal-optimal codon side by side, with ✓/✗ for agreement and a red bar showing the within-family max-Δw magnitude. Reads at a glance.
 - `<sample_id>_optimization_gain.png` / `.svg` — three-panel quantification of the gain: scatter of per-gene cbi_rp vs cbi_mahal coloured by membership_score with the diagonal line; histogram of the gain distribution annotated with the fraction of genes that benefit from Mahal-style optimization; bar chart of the top genes most improved.
 
-The pipeline also produces a parallel set of analyses comparing Mahal-cluster-derived weights against the **genome-mean** reference frame (the naive "just match the genome's overall codon distribution" baseline), so you can quantify how much Mahal-style optimization actually moves the needle over a naive approach:
+A parallel set of outputs compares Mahal-cluster-derived weights against the **genome-mean** reference frame (the naive "just match the genome's overall codon distribution" baseline), so you can quantify how much Mahal-style optimization actually moves the needle over a naive approach:
 
 - `<sample_id>_codon_optimization_summary_vs_genome.tsv` — per-AA-family agreement: genome_optimal_codon vs mahal_optimal_codon, agree (bool), max_codon_w_shift_vs_genome.
 - `<sample_id>_codon_optimization_recommend_vs_genome.tsv` — synthesis-ready recommendation table with the genome-mean as the comparison anchor instead of the RP set.
@@ -382,13 +382,6 @@ The pipeline also produces a parallel set of analyses comparing Mahal-cluster-de
 Why both comparisons matter. The Mahal-vs-RP comparison is the classical "is the Mahal cluster a better anchor than ribosomal proteins?" question. The Mahal-vs-genome comparison is the practical "is Mahal-style optimization worth doing at all over naive genome-matching?" question. For low-GC organisms whose genome bulk already aligns with the optimized cluster, the answer to the first is often "yes by a wide margin" while the second is "yes by a much smaller margin". For high-GC organisms with strong selection on the cluster, both are typically large.
 
 Defensible reason to prefer Mahal-derived weights for codon optimization. The Mahal cluster is identified by codon-usage similarity rather than by RP gene annotations, so it captures the organism's actual translationally-optimized cohort and excludes RP annotation outliers (truncations, paralogs, modified variants) that can pull the RP-based reference centroid off-target. When the two reference frames agree on the optimal codon for an amino acid (the common case), the recommended codon is unambiguous. When they disagree, the recommendation table flags the disagreement with a `confidence` value so the user can make the call rather than blindly defaulting to one frame. The per-gene gain figure shows whether Mahal-style optimization actually pays off in the user's organism: if the median (cbi_mahal − cbi_rp) is positive and most genes sit above the diagonal in the scatter, Mahal-derived codons match the host's optimization signal better than RP-derived codons.
-
-Example:
-
-```
-codonpipe codon-optimization output_run/G0370_i3 \
-    -o output_run/G0370_i3/codon_optimization/
-```
 
 ### `codonpipe install-grodon`
 
