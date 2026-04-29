@@ -867,6 +867,16 @@ def permanova_rscu(
     "RSCU composition differs in either location or dispersion" rather
     than as a pure mean-comparison.
 
+    PHYLOGENETIC NON-INDEPENDENCE CAVEAT. PERMANOVA permutes condition
+    labels under the null that samples are exchangeable. If the
+    condition correlates with phylogeny (which it often does for
+    habitat / oxygen-tolerance / temperature in microbial datasets),
+    a significant p-value can reflect shared ancestry rather than the
+    nominal effect of the condition. Pair this test with a
+    phylogenetic comparative method (PIC; Felsenstein 1985, or PGLS
+    via phylolm) for any adaptive-evolution claim, and at minimum
+    report the phylogenetic spread within each condition group.
+
     Returns dict with F_statistic, p_value, R2, n_perm, distance ("aitchison").
     """
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in metrics_df.columns]
