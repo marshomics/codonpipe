@@ -10,7 +10,6 @@ import logging
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
@@ -2237,6 +2236,41 @@ def plot_mge_cu_deviation_by_condition(
 # ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _render_plot_task(task: tuple) -> tuple[str, Path | None]:
+    """Worker for parallelised plot generation.
+
+    Each plot in :func:`generate_comparative_plots` is independent — it
+    reads its own input DataFrames, writes its own output files, and
+    doesn't share mutable state with the others. We exploit that by
+    queueing every plot as a task and dispatching them through
+    ``parallel_map`` (loky processes, BLAS threads capped at 1 per
+    worker so matplotlib's internal numpy doesn't oversubscribe).
+
+    Each task is ``(name, fn, args, output_stem)``. The worker:
+      1. switches matplotlib to the non-interactive Agg backend (a
+         no-op when already set),
+      2. calls ``fn(*args, output_stem)``,
+      3. returns ``(name, output_stem.with_suffix('.png'))`` on success
+         or ``(name, None)`` on failure (the warning is logged on the
+         main side after results return).
+
+    The args tuple is positional and passed verbatim. Keep callables
+    pure of side effects beyond writing the output file.
+    """
+    import matplotlib
+    matplotlib.use("Agg", force=False)
+
+    name, fn, args, output_stem = task
+    try:
+        fn(*args, output_stem)
+        return name, output_stem.with_suffix(".png")
+    except Exception as exc:
+        # Stash the exception message on the second tuple element so
+        # the orchestrator can surface it; logger calls inside loky
+        # workers don't propagate to the main handler reliably.
+        return name, RuntimeError(f"{type(exc).__name__}: {exc}")
+
+
 def generate_comparative_plots(
     metrics_df: pd.DataFrame,
     output_dir: Path,
@@ -2255,7 +2289,11 @@ def generate_comparative_plots(
 ) -> dict[str, Path]:
     """Generate all within- and between-condition comparative plots.
 
-    Returns dict of plot paths.
+    Plot generation is parallelised: each plot is an independent
+    task (own inputs, own output file, no shared mutable state) and
+    they run through joblib's loky backend with BLAS threads capped
+    at 1 per worker. Set ``CODONPIPE_JOBS=1`` to fall back to serial
+    rendering for debugging. Returns dict of plot paths.
     """
     plot_dir = output_dir / "batch_condition" / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
@@ -2268,254 +2306,135 @@ def generate_comparative_plots(
     conditions = metrics_df[condition_col].dropna().unique()
     logger.info("Generating comparative plots for %d conditions", len(conditions))
 
+    # Queue every plot as an independent task. The orchestration logic
+    # (which plot runs given which inputs) stays here; the rendering
+    # itself runs in parallel workers below.
+    tasks: list[tuple[str, callable, tuple, Path]] = []
+
+    def _enqueue(name: str, fn, args: tuple) -> None:
+        tasks.append((name, fn, args, plot_dir / name))
+
     # ── Within-condition ──────────────────────────────────────────────
-    try:
-        p = plot_dir / "within_metric_violins"
-        plot_within_metric_violins(metrics_df, condition_col, p)
-        outputs["within_metric_violins"] = p.with_suffix(".png")
-    except Exception as e:
-        logger.warning("Failed: within_metric_violins — %s", e)
-
-    try:
-        p = plot_dir / "within_rscu_heatmap"
-        plot_within_rscu_heatmap(metrics_df, condition_col, p)
-        outputs["within_rscu_heatmap"] = p.with_suffix(".png")
-    except Exception as e:
-        logger.warning("Failed: within_rscu_heatmap — %s", e)
-
+    _enqueue("within_metric_violins",
+             plot_within_metric_violins, (metrics_df, condition_col))
+    _enqueue("within_rscu_heatmap",
+             plot_within_rscu_heatmap, (metrics_df, condition_col))
     if rscu_disp_df is not None and not rscu_disp_df.empty:
-        try:
-            p = plot_dir / "within_rscu_cv"
-            plot_within_rscu_cv(rscu_disp_df, p)
-            outputs["within_rscu_cv"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Failed: within_rscu_cv — %s", e)
-
-    try:
-        p = plot_dir / "within_pca_ellipse"
-        plot_within_pca(metrics_df, condition_col, p)
-        outputs["within_pca_ellipse"] = p.with_suffix(".png")
-    except Exception as e:
-        logger.warning("Failed: within_pca_ellipse — %s", e)
-
-    try:
-        p = plot_dir / "radar_by_condition"
-        plot_radar_by_condition(metrics_df, condition_col, p)
-        outputs["radar_by_condition"] = p.with_suffix(".png")
-    except Exception as e:
-        logger.warning("Failed: radar_by_condition — %s", e)
+        _enqueue("within_rscu_cv", plot_within_rscu_cv, (rscu_disp_df,))
+    _enqueue("within_pca_ellipse",
+             plot_within_pca, (metrics_df, condition_col))
+    _enqueue("radar_by_condition",
+             plot_radar_by_condition, (metrics_df, condition_col))
 
     # ── Between-condition ─────────────────────────────────────────────
     if len(conditions) >= 2:
         if between_tests_df is not None and not between_tests_df.empty:
-            try:
-                p = plot_dir / "between_metric_comparison"
-                plot_between_metric_comparison(metrics_df, between_tests_df, condition_col, p)
-                outputs["between_metric_comparison"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: between_metric_comparison — %s", e)
-
+            _enqueue("between_metric_comparison",
+                     plot_between_metric_comparison,
+                     (metrics_df, between_tests_df, condition_col))
         if rscu_tests_df is not None and not rscu_tests_df.empty:
-            try:
-                p = plot_dir / "rscu_volcano"
-                plot_rscu_volcano(rscu_tests_df, p)
-                outputs["rscu_volcano"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: rscu_volcano — %s", e)
-
-            try:
-                p = plot_dir / "rscu_condition_heatmap"
-                plot_rscu_condition_heatmap(rscu_tests_df, p)
-                outputs["rscu_condition_heatmap"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: rscu_condition_heatmap — %s", e)
-
-        try:
-            p = plot_dir / "enc_gc3_by_condition"
-            plot_enc_gc3_by_condition(metrics_df, condition_col, p)
-            outputs["enc_gc3_by_condition"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Failed: enc_gc3_by_condition — %s", e)
-
-        try:
-            p = plot_dir / "growth_rate_by_condition"
-            plot_growth_rate_by_condition(metrics_df, condition_col, p)
-            outputs["growth_rate_by_condition"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Failed: growth_rate_by_condition — %s", e)
-
-        try:
-            p = plot_dir / "hgt_by_condition"
-            plot_hgt_by_condition(metrics_df, condition_col, p)
-            outputs["hgt_by_condition"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Failed: hgt_by_condition — %s", e)
-
-        try:
-            p = plot_dir / "neutrality_by_condition"
-            plot_neutrality_by_condition(metrics_df, condition_col, p)
-            outputs["neutrality_by_condition"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Failed: neutrality_by_condition — %s", e)
-
+            _enqueue("rscu_volcano", plot_rscu_volcano, (rscu_tests_df,))
+            _enqueue("rscu_condition_heatmap",
+                     plot_rscu_condition_heatmap, (rscu_tests_df,))
+        _enqueue("enc_gc3_by_condition",
+                 plot_enc_gc3_by_condition, (metrics_df, condition_col))
+        _enqueue("growth_rate_by_condition",
+                 plot_growth_rate_by_condition, (metrics_df, condition_col))
+        _enqueue("hgt_by_condition",
+                 plot_hgt_by_condition, (metrics_df, condition_col))
+        _enqueue("neutrality_by_condition",
+                 plot_neutrality_by_condition, (metrics_df, condition_col))
         if perm_result:
-            try:
-                p = plot_dir / "permanova_summary"
-                plot_permanova_summary(perm_result, p)
-                outputs["permanova_summary"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: permanova_summary — %s", e)
+            _enqueue("permanova_summary",
+                     plot_permanova_summary, (perm_result,))
 
         # ── Enhanced comparative plots ───────────────────────────────
         if between_tests_df is not None and not between_tests_df.empty:
-            try:
-                p = plot_dir / "effect_size_forest"
-                plot_effect_size_forest(between_tests_df, p)
-                outputs["effect_size_forest"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: effect_size_forest — %s", e)
-
+            _enqueue("effect_size_forest",
+                     plot_effect_size_forest, (between_tests_df,))
         if rscu_tests_df is not None and not rscu_tests_df.empty:
-            try:
-                p = plot_dir / "rscu_paired_dot"
-                plot_rscu_paired_dot(rscu_tests_df, p)
-                outputs["rscu_paired_dot"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: rscu_paired_dot — %s", e)
-
-        try:
-            p = plot_dir / "condition_summary_dashboard"
-            plot_condition_summary_dashboard(
-                metrics_df, condition_col, between_tests_df, perm_result, p,
-            )
-            outputs["condition_summary_dashboard"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Failed: condition_summary_dashboard — %s", e)
-
-        try:
-            p = plot_dir / "translational_selection_comparison"
-            plot_translational_selection_comparison(
-                metrics_df, condition_col, between_tests_df, p,
-            )
-            outputs["translational_selection_comparison"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Failed: translational_selection_comparison — %s", e)
-
-        try:
-            p = plot_dir / "strand_asymmetry_comparison"
-            plot_strand_asymmetry_comparison(
-                metrics_df, condition_col, between_tests_df, p,
-            )
-            outputs["strand_asymmetry_comparison"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Failed: strand_asymmetry_comparison — %s", e)
-
-        try:
-            p = plot_dir / "operon_coadaptation_comparison"
-            plot_operon_coadaptation_comparison(
-                metrics_df, condition_col, between_tests_df, p,
-            )
-            outputs["operon_coadaptation_comparison"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Failed: operon_coadaptation_comparison — %s", e)
+            _enqueue("rscu_paired_dot", plot_rscu_paired_dot, (rscu_tests_df,))
+        _enqueue("condition_summary_dashboard",
+                 plot_condition_summary_dashboard,
+                 (metrics_df, condition_col, between_tests_df, perm_result))
+        _enqueue("translational_selection_comparison",
+                 plot_translational_selection_comparison,
+                 (metrics_df, condition_col, between_tests_df))
+        _enqueue("strand_asymmetry_comparison",
+                 plot_strand_asymmetry_comparison,
+                 (metrics_df, condition_col, between_tests_df))
+        _enqueue("operon_coadaptation_comparison",
+                 plot_operon_coadaptation_comparison,
+                 (metrics_df, condition_col, between_tests_df))
 
         # ── Bio/ecology between-condition plots ───────────────────────
         if hgt_burden:
-            try:
-                p = plot_dir / "hgt_burden_comparison"
-                plot_hgt_burden_comparison(hgt_burden, metrics_df, condition_col, p)
-                outputs["hgt_burden_comparison"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: hgt_burden_comparison — %s", e)
-
-        try:
-            p = plot_dir / "phage_mobile_comparison"
-            plot_phage_mobile_comparison(metrics_df, condition_col, between_tests_df, p)
-            outputs["phage_mobile_comparison"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Failed: phage_mobile_comparison — %s", e)
-
+            _enqueue("hgt_burden_comparison",
+                     plot_hgt_burden_comparison,
+                     (hgt_burden, metrics_df, condition_col))
+        _enqueue("phage_mobile_comparison",
+                 plot_phage_mobile_comparison,
+                 (metrics_df, condition_col, between_tests_df))
         if optimal_codons_df is not None and not optimal_codons_df.empty:
-            try:
-                p = plot_dir / "optimal_codon_divergence"
-                plot_optimal_codon_divergence(optimal_codons_df, p)
-                outputs["optimal_codon_divergence"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: optimal_codon_divergence — %s", e)
-
+            _enqueue("optimal_codon_divergence",
+                     plot_optimal_codon_divergence, (optimal_codons_df,))
         if strand_asym_patterns_df is not None and not strand_asym_patterns_df.empty:
-            try:
-                p = plot_dir / "strand_asymmetry_pattern_comparison"
-                plot_strand_asymmetry_pattern_comparison(strand_asym_patterns_df, p)
-                outputs["strand_asymmetry_pattern_comparison"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: strand_asymmetry_pattern_comparison — %s", e)
-
+            _enqueue("strand_asymmetry_pattern_comparison",
+                     plot_strand_asymmetry_pattern_comparison,
+                     (strand_asym_patterns_df,))
         if gc3_gc12_df is not None and not gc3_gc12_df.empty:
-            try:
-                p = plot_dir / "neutrality_scatter_by_condition"
-                plot_neutrality_scatter_by_condition(gc3_gc12_df, metrics_df, condition_col, p)
-                outputs["neutrality_scatter_by_condition"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: neutrality_scatter_by_condition — %s", e)
+            _enqueue("neutrality_scatter_by_condition",
+                     plot_neutrality_scatter_by_condition,
+                     (gc3_gc12_df, metrics_df, condition_col))
 
         # ── Expression-class RSCU & enrichment plots ─────────────────
         if rp_rscu_tests_df is not None and not rp_rscu_tests_df.empty:
-            try:
-                p = plot_dir / "ribosomal_rscu_volcano"
-                plot_expression_class_rscu_volcano(rp_rscu_tests_df, "ribosomal", p)
-                outputs["ribosomal_rscu_volcano"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: ribosomal_rscu_volcano — %s", e)
-
+            _enqueue("ribosomal_rscu_volcano",
+                     plot_expression_class_rscu_volcano,
+                     (rp_rscu_tests_df, "ribosomal"))
         if he_rscu_tests_df is not None and not he_rscu_tests_df.empty:
-            try:
-                p = plot_dir / "high_expression_rscu_volcano"
-                plot_expression_class_rscu_volcano(he_rscu_tests_df, "high_expression", p)
-                outputs["high_expression_rscu_volcano"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: high_expression_rscu_volcano — %s", e)
-
+            _enqueue("high_expression_rscu_volcano",
+                     plot_expression_class_rscu_volcano,
+                     (he_rscu_tests_df, "high_expression"))
         if rp_rscu_tests_df is not None or he_rscu_tests_df is not None:
-            try:
-                p = plot_dir / "expression_class_rscu_heatmap"
-                plot_expression_class_rscu_heatmap(rp_rscu_tests_df, he_rscu_tests_df, p)
-                outputs["expression_class_rscu_heatmap"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: expression_class_rscu_heatmap — %s", e)
-
+            _enqueue("expression_class_rscu_heatmap",
+                     plot_expression_class_rscu_heatmap,
+                     (rp_rscu_tests_df, he_rscu_tests_df))
         if enrichment_comp_df is not None and not enrichment_comp_df.empty:
-            try:
-                p = plot_dir / "enrichment_comparison"
-                plot_enrichment_comparison(enrichment_comp_df, p)
-                outputs["enrichment_comparison"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: enrichment_comparison — %s", e)
+            _enqueue("enrichment_comparison",
+                     plot_enrichment_comparison, (enrichment_comp_df,))
 
         # ── RP vs HE divergence by condition ─────────────────────────
-        try:
-            p = plot_dir / "rp_he_divergence_by_condition"
-            plot_rp_he_divergence_by_condition(metrics_df, condition_col, p)
-            outputs["rp_he_divergence_by_condition"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Failed: rp_he_divergence_by_condition — %s", e)
+        _enqueue("rp_he_divergence_by_condition",
+                 plot_rp_he_divergence_by_condition,
+                 (metrics_df, condition_col))
 
         # ── gRodon2 by condition ────────────────────────────────────
         if "grodon2_doubling_time_hours" in metrics_df.columns:
-            try:
-                p = plot_dir / "grodon2_by_condition"
-                plot_grodon2_by_condition(metrics_df, condition_col, p)
-                outputs["grodon2_by_condition"] = p.with_suffix(".png")
-            except Exception as e:
-                logger.warning("Failed: grodon2_by_condition — %s", e)
+            _enqueue("grodon2_by_condition",
+                     plot_grodon2_by_condition, (metrics_df, condition_col))
 
         # ── MGE codon usage deviation by condition ───────────────────
-        try:
-            p = plot_dir / "mge_cu_deviation_by_condition"
-            plot_mge_cu_deviation_by_condition(metrics_df, condition_col, p)
-            outputs["mge_cu_deviation_by_condition"] = p.with_suffix(".png")
-        except Exception as e:
-            logger.warning("Failed: mge_cu_deviation_by_condition — %s", e)
+        _enqueue("mge_cu_deviation_by_condition",
+                 plot_mge_cu_deviation_by_condition,
+                 (metrics_df, condition_col))
+
+    # Dispatch the queued plots in parallel. Each task is fully
+    # independent; loky worker processes guarantee per-figure isolation
+    # for matplotlib's stateful backend. BLAS thread count is capped
+    # inside the worker so joblib_workers × BLAS_threads does not blow
+    # past the core count.
+    from codonpipe.utils._parallel import parallel_map
+
+    results = parallel_map(
+        tasks, _render_plot_task, desc="comparative-plots",
+    )
+    for name, result in results:
+        if isinstance(result, Path):
+            outputs[name] = result
+        else:
+            # Result was an exception sentinel (RuntimeError instance).
+            logger.warning("Failed: %s — %s", name, result)
 
     logger.info("Generated %d comparative plots", len(outputs))
     return outputs
