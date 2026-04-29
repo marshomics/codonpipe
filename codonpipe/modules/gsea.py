@@ -196,7 +196,12 @@ def run_preranked_gsea(
         mean_pos = np.mean(pos_null_es) if len(pos_null_es) > 0 else 0.0
         mean_neg = np.mean(neg_null_es) if len(neg_null_es) > 0 else 0.0
 
-        # Nominal p-value (one-sided, against full null)
+        # Nominal p-value (one-sided, against full null). For positive ES
+        # this is the right-tail probability under the null; for negative
+        # ES, the left tail. This is the Subramanian et al. (2005) convention
+        # — direction is determined by the gene set, so the test is
+        # naturally one-sided. Reported as ``p_value_one_sided`` and
+        # aliased as ``p_value`` for backward compatibility.
         if es >= 0:
             p_val = (np.sum(null_es >= es) + 1) / (n_perm + 1)
         else:
@@ -231,14 +236,16 @@ def run_preranked_gsea(
             "size": int(mask.sum()),
             "es": round(es, 6),
             "nes": round(nes, 4),
-            "p_value": p_val,
+            "p_value_one_sided": p_val,
+            "p_value": p_val,  # backward-compat alias; same one-sided value
             "leading_edge_size": len(leading_edge),
             "leading_edge_genes": ",".join(leading_edge),
         })
 
     if not rows:
         return pd.DataFrame(columns=[
-            "gene_set", "size", "es", "nes", "p_value", "fdr",
+            "gene_set", "size", "es", "nes",
+            "p_value_one_sided", "p_value", "fdr",
             "leading_edge_size", "leading_edge_genes",
         ])
 
