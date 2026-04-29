@@ -906,14 +906,29 @@ def permanova_rscu(
     if f_obs is None:
         return {}
 
-    # Permutation
-    rng = np.random.default_rng(42)
-    n_greater = 0
-    for _ in range(n_perm):
-        perm = rng.permutation(conditions)
+    # Permutation. Each iteration permutes the condition label vector
+    # independently and recomputes pseudo-F on a fresh permutation;
+    # pickling cost is tiny (one float per iter) so joblib over loky
+    # processes is the right backend.
+    from codonpipe.utils._parallel import parallel_perm
+
+    conditions_arr = np.asarray(conditions)
+
+    def _perm_iter(rng: np.random.Generator, _idx: int) -> float:
+        perm = rng.permutation(conditions_arr)
         f_perm = _permanova_f(dist_matrix, perm)
-        if f_perm is not None and f_perm >= f_obs:
-            n_greater += 1
+        # Treat None / NaN as below f_obs (i.e. don't count toward p).
+        if f_perm is None:
+            return float("-inf")
+        return float(f_perm)
+
+    f_perms = parallel_perm(
+        n_perm,
+        _perm_iter,
+        master_seed=42,
+        desc="permanova-perm",
+    )
+    n_greater = int(sum(1 for f in f_perms if f >= f_obs))
 
     p_value = (n_greater + 1) / (n_perm + 1)
 
