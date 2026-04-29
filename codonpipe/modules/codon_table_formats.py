@@ -632,14 +632,14 @@ def generate_all_codon_tables(
                 )
             
             counts_path = codon_dir / f"{sample_id}_{geneset_name}_codon_counts.tsv"
-            codon_counts.to_csv(counts_path, sep="	", index=False)
+            codon_counts.to_csv(counts_path, sep="\t", index=False)
             outputs[f"{geneset_name}_codon_counts"] = counts_path
             logger.info("Saved codon counts to %s", counts_path)
-        
+
         # Save relative_adaptiveness as a separate file (only this keeps w_value semantics)
         if not w_values.empty:
             adapt_path = codon_dir / f"{sample_id}_{geneset_name}_relative_adaptiveness.tsv"
-            w_values.to_csv(adapt_path, sep="	", index=False)
+            w_values.to_csv(adapt_path, sep="\t", index=False)
             outputs[f"{geneset_name}_relative_adaptiveness"] = adapt_path
             logger.info("Saved relative adaptiveness to %s", adapt_path)
 
