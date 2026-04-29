@@ -128,6 +128,7 @@ def run_single_genome(
     force: bool = False,
     skip_gsea: bool = False,
     gsea_permutations: int = 1000,
+    skip_codon_optimization: bool = False,
 ) -> dict[str, Path]:
     """Run the full codon analysis pipeline on a single genome.
 
@@ -1111,7 +1112,7 @@ def run_single_genome(
             logger.warning("Genomic island detection failed: %s. Continuing.", e, exc_info=True)
 
     # ── Step 11: Codon usage tables ──────────────────────────────────────
-    logger.info("[Step 11/12] Generating codon usage tables in all standard formats")
+    logger.info("[Step 11/13] Generating codon usage tables in all standard formats")
     try:
         table_outputs = generate_all_codon_tables(
             ffn_path=ffn_path,
@@ -1126,8 +1127,48 @@ def run_single_genome(
     except Exception as e:
         logger.warning("Codon usage table generation failed: %s. Continuing.", e, exc_info=True)
 
-    # ── Step 12: Plots ────────────────────────────────────────────────────
-    logger.info("[Step 12/12] Generating publication-ready plots")
+    # ── Step 12: Codon-optimization comparison ────────────────────────────
+    # Produces per-codon comparison of genome / RP / Mahal-cluster reference
+    # frames, a synthesis-ready preferred-codon table, and three figures
+    # quantifying the gain from Mahal-style optimization. Lives in its own
+    # codon_optimization/ subfolder so output is segregated from the
+    # upstream codon-table outputs. Skipped automatically when any of the
+    # three RSCU references (genome / RP / Mahal cluster) is unavailable —
+    # for example when --skip-mahal was passed.
+    if not skip_codon_optimization:
+        logger.info("[Step 12/13] Running codon-optimization comparison")
+        try:
+            from codonpipe.modules.codon_optimization import run_codon_optimization
+            co_dir = output_dir / "codon_optimization"
+            co_outputs = run_codon_optimization(
+                sample_dir=output_dir,
+                sample_id=sample_id,
+                output_dir=co_dir,
+                ffn_path=ffn_path,
+                make_figures=True,
+            )
+            for k, v in co_outputs.items():
+                all_outputs[f"codon_optimization_{k}"] = v
+            logger.info(
+                "[Step 12/13] Codon optimization complete: %d output(s) in %s",
+                len(co_outputs), co_dir,
+            )
+        except FileNotFoundError as e:
+            logger.warning(
+                "Codon optimization skipped (required input missing): %s. "
+                "Run with --skip-mahal removed to enable.",
+                e,
+            )
+        except Exception as e:
+            logger.warning(
+                "Codon-optimization analysis failed: %s. Continuing.",
+                e, exc_info=True,
+            )
+    else:
+        logger.info("[Step 12/13] Codon optimization skipped (--skip-codon-optimization)")
+
+    # ── Step 13: Plots ────────────────────────────────────────────────────
+    logger.info("[Step 13/13] Generating publication-ready plots")
     try:
         plot_outputs = generate_single_genome_plots(
             sample_id, output_dir,
