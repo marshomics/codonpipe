@@ -947,9 +947,19 @@ def predict_growth_rate(
     ref_mask = expr_df["gene"].isin(ref_genes)
     ref_vals_series = expr_df.loc[ref_mask, metric].dropna()
 
-    if len(ref_vals_series) < 3:
-        logger.warning("Too few reference genes with %s values (%d); need at least 3",
-                       metric, len(ref_vals_series))
+    # 15 is the same floor used by run_expression_analysis: below this,
+    # mean RP-CAI itself has too much sampling noise to support even a
+    # direction-only proxy. The previous floor of 3 was permissive
+    # enough to silently produce extreme proxy_doubling_time_hours
+    # values driven entirely by which 3-5 genes happened to land in
+    # the reference set.
+    _MIN_REF_GENES_FOR_PROXY = 15
+    if len(ref_vals_series) < _MIN_REF_GENES_FOR_PROXY:
+        logger.warning(
+            "Too few reference genes with %s values (%d); need at least %d "
+            "for a stable RP-CAI mean. Skipping growth rate proxy.",
+            metric, len(ref_vals_series), _MIN_REF_GENES_FOR_PROXY,
+        )
         return None
 
     mean_metric = ref_vals_series.mean()
@@ -1680,7 +1690,15 @@ def compute_operon_codon_coadaptation(
     n_permutations = 1000
     n_pair_per_perm = min(len(rscu_map) - 1, len(result_df))
     gene_keys = list(rscu_map.keys())
-    rscu_matrix = np.asarray([rscu_map[g] for g in gene_keys])
+    # Force float64 dtype: rscu_map values can come from pandas
+    # extension types or be lists with mixed numeric types, in which
+    # case np.asarray defaults to object dtype and downstream np.sqrt
+    # fails with "loop of ufunc does not support argument 0 of type
+    # float". Casting eagerly fixes the issue and makes the numerical
+    # behaviour deterministic.
+    rscu_matrix = np.asarray(
+        [rscu_map[g] for g in gene_keys], dtype=float,
+    )
     n_genes_total = len(gene_keys)
 
     def _operon_perm_iter(
