@@ -175,10 +175,22 @@ def compute_coa_on_rscu(
 # ─── RSCU distance to reference profile ─────────────────────────────────────
 #
 # Previously called "S-value" in earlier versions of this pipeline. Renamed
-# to avoid confusion with the Sharp & Li (1987) S index (codon adaptation
-# index based on relative adaptedness weights and geometric means). This
-# metric is a straightforward Euclidean or chi-squared distance between a
-# gene's RSCU vector and a reference RSCU profile.
+# to avoid confusion with two unrelated published quantities:
+#   1. The Sharp & Li (1987) S index (a CAI-style geometric mean of
+#      relative adaptiveness weights).
+#   2. The Carbone et al. (2003) S value, which is a chi-squared distance
+#      *projected onto the first COA axis*. This module computes the raw
+#      distance to a reference vector — not the COA-axis projection — so
+#      it is NOT the Carbone S value either.
+#
+# What this function actually computes is a per-gene distance between the
+# gene's RSCU vector and a fixed reference RSCU profile. Three metrics are
+# supported: euclidean (default for backward compatibility), chi_squared
+# (asymmetric: divides by the reference), and aitchison (Euclidean on
+# CLR-transformed RSCU — the metric that respects the compositional
+# constraints baked into RSCU). Aitchison is the principled choice for
+# compositional data; use it when the result feeds into downstream
+# distance-based statistics.
 
 
 def compute_rscu_distance(
@@ -188,14 +200,14 @@ def compute_rscu_distance(
     rscu_ace: dict[str, float] | None = None,
     rscu_mahal_cluster: dict[str, float] | None = None,
 ) -> pd.DataFrame:
-    """Compute per-gene RSCU distance to a reference codon usage profile.
+    """Per-gene RSCU distance to a reference codon usage profile.
 
     Reference priority: Mahalanobis cluster > ACE consensus > ribosomal proteins.
 
     The Mahalanobis optimal cluster captures the codon usage of translationally
     optimised genes identified by data-driven clustering, making it the
-    most biologically grounded reference.  ACE consensus is genome-specific
-    and composition-independent.  Ribosomal proteins are the traditional
+    most biologically grounded reference. ACE consensus is genome-specific
+    and composition-independent. Ribosomal proteins are the traditional
     fallback.
 
     Genes with low RSCU distance have codon usage similar to the reference
@@ -204,12 +216,20 @@ def compute_rscu_distance(
     Args:
         rscu_gene_df: Per-gene RSCU table.
         rscu_rp: Concatenated RSCU for ribosomal proteins (fallback reference).
-        metric: 'euclidean' or 'chi_squared'.
+        metric: 'euclidean' (default), 'chi_squared', or 'aitchison'.
+            Aitchison is the compositional-data-correct choice (Euclidean
+            on CLR-transformed RSCU, Aitchison 1986); use it whenever the
+            output feeds into a downstream distance-based test. Euclidean
+            and chi_squared treat each codon coordinate as independent,
+            which is wrong in principle for RSCU (per-AA-family sum
+            constraints) but is fine for ranking genes by similarity to
+            a single reference.
         rscu_ace: ACE consensus RSCU dict.
         rscu_mahal_cluster: Mahalanobis optimal cluster RSCU dict (preferred reference).
 
     Returns:
-        DataFrame with gene, RSCU_distance, RSCU_distance_reference columns.
+        DataFrame with gene, RSCU_distance, RSCU_distance_reference,
+        RSCU_distance_metric columns.
     """
     # Priority: Mahalanobis cluster > ACE consensus > RP
     if rscu_mahal_cluster is not None:
@@ -222,32 +242,55 @@ def compute_rscu_distance(
         ref = rscu_rp
         ref_label = "rp"
 
+    empty_cols = [
+        COL_GENE,
+        "RSCU_distance",
+        "RSCU_distance_reference",
+        "RSCU_distance_metric",
+    ]
     if ref is None:
-        return pd.DataFrame(columns=[COL_GENE, "RSCU_distance", "RSCU_distance_reference"])
+        return pd.DataFrame(columns=empty_cols)
 
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns and c in ref]
     if not rscu_cols:
-        return pd.DataFrame(columns=[COL_GENE, "RSCU_distance", "RSCU_distance_reference"])
+        return pd.DataFrame(columns=empty_cols)
 
-    ref_vec = np.array([ref[c] for c in rscu_cols])
-    gene_mat = rscu_gene_df[rscu_cols].values
+    ref_vec = np.array([ref[c] for c in rscu_cols], dtype=float)
+    gene_mat = rscu_gene_df[rscu_cols].values.astype(float)
 
-    if metric == "chi_squared":
-        # Chi-squared distance: sum((obs_i - exp_i)^2 / exp_i)
+    metric_norm = (metric or "euclidean").lower()
+    if metric_norm == "chi_squared":
         denom = np.where(ref_vec == 0, 1e-10, ref_vec)
         dists = np.sqrt(np.sum((gene_mat - ref_vec[np.newaxis, :]) ** 2 / denom[np.newaxis, :], axis=1))
+    elif metric_norm == "aitchison":
+        # CLR transform: log(x + ε) − mean(log(x + ε)) per row, then
+        # Euclidean on the centered log-ratio vectors. ε floors zeros so
+        # log(0) does not blow up. This is the textbook Aitchison distance
+        # for compositional data and is the right choice when the RSCU
+        # row sums to a constant per-AA-family (which it does).
+        eps = 1e-6
+        log_gene = np.log(np.clip(gene_mat, eps, None))
+        clr_gene = log_gene - log_gene.mean(axis=1, keepdims=True)
+        log_ref = np.log(np.clip(ref_vec, eps, None))
+        clr_ref = log_ref - log_ref.mean()
+        diff = clr_gene - clr_ref[np.newaxis, :]
+        dists = np.sqrt(np.sum(diff ** 2, axis=1))
     else:
-        # Euclidean distance
+        # Plain Euclidean. Default for backward compatibility.
         dists = np.sqrt(np.sum((gene_mat - ref_vec[np.newaxis, :]) ** 2, axis=1))
 
     return pd.DataFrame({
         COL_GENE: rscu_gene_df[COL_GENE].values,
         "RSCU_distance": dists,
         "RSCU_distance_reference": ref_label,
+        "RSCU_distance_metric": metric_norm,
     })
 
 
-# Backward-compatibility alias for external code that imported the old name
+# Backward-compatibility alias for external code that imported the old name.
+# The "S-value" name is misleading (this is NOT the Sharp & Li S index nor
+# the Carbone et al. 2003 S value); kept solely so that downstream callers
+# don't break. Prefer ``compute_rscu_distance`` in new code.
 compute_s_value = compute_rscu_distance
 
 
@@ -441,14 +484,24 @@ def compute_delta_rscu(
     class_col: str = COL_EXPRESSION_CLASS,
     rscu_reference: dict[str, float] | None = None,
     reference_label: str = "genome_avg",
+    test: bool = True,
 ) -> pd.DataFrame:
-    """Compute delta RSCU (high-expression genes vs a reference) per codon.
+    """Per-codon delta-RSCU (high-expression vs reference) plus per-codon test.
 
-    Positive delta = codon favored in highly expressed genes relative to the
-    reference.  Negative delta = codon avoided.
+    The raw delta is `mean(RSCU_high) - reference_RSCU`. RSCU is compositional
+    within each AA family (per-family sums to the family size), so the raw
+    deltas are not statistically independent across codons within a family;
+    interpret them as a *ranking* of codon shifts, not as effect sizes that
+    are comparable across families.
 
-    The default *class_col* is ``expression_class``, which resolves to
-    ACE-MELP tiers when ACE has run, or RP-MELP tiers otherwise.
+    To make the output statistically interpretable rather than purely
+    descriptive, a per-codon Mann-Whitney U test of `RSCU(high)` vs
+    `RSCU(rest)` is added when ``test=True``, with a global Benjamini-
+    Hochberg FDR correction across all codons (the multiple-testing
+    family is "any codon shifted in high-expression genes"). A CLR
+    pretreatment of RSCU is also computed and included as
+    ``delta_clr`` so callers who want a compositionally-correct
+    "shift" magnitude have it without re-deriving CLR themselves.
 
     Args:
         rscu_gene_df: Per-gene RSCU table.
@@ -459,10 +512,15 @@ def compute_delta_rscu(
             average is used as the baseline.
         reference_label: Label used in the ``ref_rscu`` output column
             name (e.g. ``"genome_avg"`` or ``"mahal_cluster"``).
+        test: If True (default), add per-codon Mann-Whitney U test
+            (high vs rest) with global BH FDR. Set False for a purely
+            descriptive table.
 
     Returns:
-        DataFrame with codon, amino_acid, ref_rscu, high_expr_rscu,
-        delta_rscu columns.
+        DataFrame with codon, amino_acid, {reference_label}_rscu,
+        high_expr_rscu, delta_rscu, delta_clr (CLR-space shift), and —
+        when ``test=True`` — ``mw_p``, ``corrected_p`` (BH FDR over all
+        codons), ``significant`` (BH < 0.05).
     """
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
     if not rscu_cols:
@@ -484,6 +542,7 @@ def compute_delta_rscu(
         ref_vals = merged[rscu_cols].mean()
 
     high_mask = merged[class_col] == "high"
+    rest_mask = ~high_mask
 
     if high_mask.sum() < 3:
         logger.warning("Fewer than 3 high-expression genes for delta RSCU")
@@ -491,21 +550,62 @@ def compute_delta_rscu(
 
     high_avg = merged.loc[high_mask, rscu_cols].mean()
 
+    # CLR-space shift, computed on per-AA-family proportions. CLR removes
+    # the per-family sum constraint so the "shift" is interpretable
+    # cross-family. ε floors zeros for log stability.
+    eps = 1e-6
+    high_log = np.log(np.clip(high_avg.values, eps, None))
+    high_clr = high_log - high_log.mean()
+    ref_log = np.log(np.clip(ref_vals.values, eps, None))
+    ref_clr = ref_log - ref_log.mean()
+    delta_clr_vec = high_clr - ref_clr
+
+    if test:
+        try:
+            from scipy.stats import mannwhitneyu
+        except ImportError:
+            mannwhitneyu = None
+    else:
+        mannwhitneyu = None
+
     rows = []
-    for col in rscu_cols:
+    for i, col in enumerate(rscu_cols):
         parts = col.split("-")
         aa = parts[0]
         codon = parts[-1]
-        rows.append({
+        row = {
             "codon_col": col,
             "codon": codon,
             "amino_acid": aa,
-            f"{reference_label}_rscu": round(ref_vals[col], 4),
-            "high_expr_rscu": round(high_avg[col], 4),
-            "delta_rscu": round(high_avg[col] - ref_vals[col], 4),
-        })
+            f"{reference_label}_rscu": round(float(ref_vals[col]), 4),
+            "high_expr_rscu": round(float(high_avg[col]), 4),
+            "delta_rscu": round(float(high_avg[col] - ref_vals[col]), 4),
+            "delta_clr": round(float(delta_clr_vec[i]), 4),
+        }
+        if mannwhitneyu is not None and rest_mask.sum() >= 3:
+            x = merged.loc[high_mask, col].dropna().values
+            y = merged.loc[rest_mask, col].dropna().values
+            if len(x) >= 3 and len(y) >= 3 and (np.std(x) > 0 or np.std(y) > 0):
+                try:
+                    _, p = mannwhitneyu(x, y, alternative="two-sided")
+                    row["mw_p"] = float(p)
+                except ValueError:
+                    row["mw_p"] = float("nan")
+            else:
+                row["mw_p"] = float("nan")
+        rows.append(row)
 
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+
+    # Global BH FDR across all codons in the panel. The multiple-testing
+    # family is the whole codon table, not per-AA-family, because the
+    # downstream interpretation is "any codon shifted under selection".
+    if "mw_p" in out.columns and out["mw_p"].notna().any():
+        pvals = out["mw_p"].fillna(1.0).values
+        out["corrected_p"] = benjamini_hochberg(pvals)
+        out["significant"] = out["corrected_p"] < 0.05
+
+    return out
 
 
 # ─── tRNA gene count vs codon frequency ──────────────────────────────────────
@@ -694,10 +794,20 @@ def compute_trna_codon_correlation(
     expr_df: pd.DataFrame | None = None,
     class_col: str = COL_EXPRESSION_CLASS,
 ) -> pd.DataFrame:
-    """Correlate tRNA gene copy number with codon frequency in highly expressed genes.
+    """Correlate tRNA gene copy number with codon usage across genes.
 
-    Strong positive correlation = evidence of co-adaptation between tRNA pools
-    and codon usage in highly expressed genes.
+    Returns the per-codon table AND attaches a Spearman summary on
+    ``df.attrs["trna_correlation_summary"]`` with keys per gene set
+    (``all_genes``, ``high_expr``, ``low_expr``): each value is a dict of
+    ``{rho, p_value, n_codons}``. The companion function
+    :func:`summarize_trna_codon_correlation` extracts that summary into
+    a tidy DataFrame for serialization (TSV does not preserve ``attrs``).
+
+    A strong positive Spearman ρ on the high-expression subset is the
+    classical evidence of tRNA-codon co-adaptation (dos Reis et al. 2004).
+    Spearman is preferred over Pearson because tRNA copy numbers are
+    highly skewed and the relationship with RSCU is monotonic but not
+    necessarily linear.
 
     Args:
         trna_df: tRNA count table (from extract_trna_counts_from_gff).
@@ -707,8 +817,9 @@ def compute_trna_codon_correlation(
             ``expression_class``, which is ACE-MELP when available).
 
     Returns:
-        DataFrame with codon, amino_acid, tRNA_copy_number, codon_freq_all,
-        codon_freq_high, codon_freq_low.
+        DataFrame with codon, amino_acid, tRNA_copy_number, rscu_all_genes,
+        rscu_high_expr (if available), rscu_low_expr (if available).
+        Spearman summary attached as ``.attrs["trna_correlation_summary"]``.
     """
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
     if trna_df.empty or not rscu_cols:
@@ -762,6 +873,59 @@ def compute_trna_codon_correlation(
             row["rscu_low_expr"] = round(low_avg[col], 4)
         rows.append(row)
 
+    out = pd.DataFrame(rows)
+
+    # Spearman correlation across codons. Restricted to multi-codon AA families
+    # because Met/Trp tRNAs vs RSCU=1 are uninformative singletons.
+    summary: dict[str, dict] = {}
+    if not out.empty:
+        try:
+            from scipy.stats import spearmanr
+        except ImportError:
+            spearmanr = None
+        if spearmanr is not None:
+            multi = out[~out["amino_acid"].isin(("Met", "Trp"))]
+            for label, col in (
+                ("all_genes", "rscu_all_genes"),
+                ("high_expr", "rscu_high_expr"),
+                ("low_expr", "rscu_low_expr"),
+            ):
+                if col in multi.columns:
+                    sub = multi[["tRNA_copy_number", col]].dropna()
+                    if len(sub) >= 6 and sub["tRNA_copy_number"].std() > 0:
+                        rho, p = spearmanr(sub["tRNA_copy_number"], sub[col])
+                        summary[label] = {
+                            "rho": float(rho) if rho == rho else float("nan"),
+                            "p_value": float(p) if p == p else float("nan"),
+                            "n_codons": int(len(sub)),
+                        }
+    if summary:
+        out.attrs["trna_correlation_summary"] = summary
+
+    return out
+
+
+def summarize_trna_codon_correlation(
+    trna_corr_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Extract the Spearman summary stashed on ``trna_corr_df.attrs`` into a
+    tidy DataFrame suitable for ``to_csv``. Returns one row per gene set
+    (``all_genes``, ``high_expr``, ``low_expr``) with ``rho``, ``p_value``,
+    and ``n_codons``. Returns an empty frame if the summary is missing
+    (e.g. when scipy was unavailable or the input was empty).
+    """
+    summary = trna_corr_df.attrs.get("trna_correlation_summary", {}) if hasattr(trna_corr_df, "attrs") else {}
+    if not summary:
+        return pd.DataFrame(columns=["gene_set", "rho", "p_value", "n_codons"])
+    rows = [
+        {
+            "gene_set": label,
+            "rho": vals.get("rho"),
+            "p_value": vals.get("p_value"),
+            "n_codons": vals.get("n_codons"),
+        }
+        for label, vals in summary.items()
+    ]
     return pd.DataFrame(rows)
 
 
@@ -920,9 +1084,12 @@ def compute_gene_length_bias(
     enc_df: pd.DataFrame,
     expr_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Merge gene length with codon bias metrics for scatter analysis.
+    """Merge gene length with codon bias metrics. Returns the per-gene table.
 
-    Short genes tend to have weaker codon bias due to stochastic effects.
+    Naming kept for backward compatibility. The companion function
+    :func:`fit_gene_length_bias` performs the actual regression of each
+    bias metric on log10(length); call it on this output if you need
+    slope, R², and a length-effect p-value.
 
     Args:
         enc_df: ENC table with gene, length, ENC, GC3.
@@ -930,6 +1097,7 @@ def compute_gene_length_bias(
 
     Returns:
         DataFrame with gene, length, ENC, GC3, and optionally CAI/MELP/Fop.
+        This is the *data table* — no regression is fit here.
     """
     if enc_df.empty:
         return pd.DataFrame()
@@ -944,6 +1112,79 @@ def compute_gene_length_bias(
             )
 
     return result
+
+
+def fit_gene_length_bias(
+    length_bias_df: pd.DataFrame,
+    metrics: tuple[str, ...] = (COL_ENC, COL_GC3, "MELP", "CAI", "Fop"),
+    min_n: int = 30,
+) -> pd.DataFrame:
+    """Fit a Spearman correlation and an OLS regression of each bias metric
+    on log10(gene length).
+
+    Spearman is the headline statistic because the relationship between
+    length and codon bias is monotonic but rarely linear (short genes
+    have noisy RSCU which depresses CAI/Fop in a non-linear way). The
+    OLS slope and R² on log10(length) are reported as a secondary, more
+    interpretable summary; do not over-interpret the linearity.
+
+    Multiple-testing correction is applied across the panel of metrics
+    (BH FDR, q < 0.05).
+
+    Args:
+        length_bias_df: Output of :func:`compute_gene_length_bias`.
+        metrics: Bias metrics to test. Skipped if absent or fewer than
+            ``min_n`` non-null values.
+        min_n: Minimum number of genes required to fit.
+
+    Returns:
+        DataFrame with one row per metric: ``metric``, ``n``,
+        ``spearman_rho``, ``spearman_p``, ``ols_slope_log10_length``,
+        ``ols_intercept``, ``ols_r_squared``, ``corrected_p`` (BH FDR
+        on the Spearman p-values), ``significant`` (BH FDR < 0.05).
+    """
+    if length_bias_df.empty or "length" not in length_bias_df.columns:
+        return pd.DataFrame()
+
+    try:
+        from scipy.stats import spearmanr, linregress
+    except ImportError:
+        logger.warning("scipy unavailable; cannot fit gene length bias")
+        return pd.DataFrame()
+
+    log_len = np.log10(length_bias_df["length"].astype(float).clip(lower=1.0))
+
+    rows = []
+    for metric in metrics:
+        if metric not in length_bias_df.columns:
+            continue
+        sub = pd.DataFrame({
+            "log_length": log_len,
+            metric: length_bias_df[metric],
+        }).dropna()
+        if len(sub) < min_n:
+            continue
+        if sub["log_length"].std() == 0 or sub[metric].std() == 0:
+            continue
+        rho, p_spearman = spearmanr(sub["log_length"], sub[metric])
+        lin = linregress(sub["log_length"].values, sub[metric].values)
+        rows.append({
+            "metric": metric,
+            "n": int(len(sub)),
+            "spearman_rho": float(rho) if rho == rho else float("nan"),
+            "spearman_p": float(p_spearman) if p_spearman == p_spearman else float("nan"),
+            "ols_slope_log10_length": float(lin.slope),
+            "ols_intercept": float(lin.intercept),
+            "ols_r_squared": float(lin.rvalue ** 2),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    out["corrected_p"] = benjamini_hochberg(out["spearman_p"].values)
+    out["significant"] = out["corrected_p"] < 0.05
+    return out
 
 
 # ─── Helper functions ────────────────────────────────────────────────────────
@@ -1115,6 +1356,18 @@ def run_advanced_analyses(
                 trna_corr_df.to_csv(corr_out, sep="\t", index=False)
                 outputs["trna_codon_correlation"] = trna_corr_df
                 outputs["trna_codon_correlation_path"] = corr_out
+
+                # Spearman summary lives on .attrs and would be lost in
+                # to_csv; emit a separate small TSV so the correlation
+                # the README documents is actually persisted to disk.
+                summary_df = summarize_trna_codon_correlation(trna_corr_df)
+                if not summary_df.empty:
+                    summary_out = (
+                        adv_dir / f"{sample_id}_trna_codon_correlation_summary.tsv"
+                    )
+                    summary_df.to_csv(summary_out, sep="\t", index=False)
+                    outputs["trna_codon_correlation_summary"] = summary_df
+                    outputs["trna_codon_correlation_summary_path"] = summary_out
         else:
             logger.info("No tRNA features found in GFF for %s", sample_id)
     else:
@@ -1130,7 +1383,7 @@ def run_advanced_analyses(
             outputs["cog_enrichment"] = cog_enrich
             outputs["cog_enrichment_path"] = out_path
 
-    # 9. Gene length vs codon bias
+    # 9. Gene length vs codon bias — per-gene table plus regression fit
     logger.info("Computing gene length vs codon bias for %s", sample_id)
     length_bias_df = compute_gene_length_bias(enc_df, expr_df)
     if not length_bias_df.empty:
@@ -1138,6 +1391,17 @@ def run_advanced_analyses(
         length_bias_df.to_csv(out_path, sep="\t", index=False)
         outputs["gene_length_bias"] = length_bias_df
         outputs["gene_length_bias_path"] = out_path
+
+        # Spearman + OLS on log10(length) per metric, BH FDR across the panel.
+        # The function call is what makes this an "analysis" rather than just
+        # a data merge — without it, callers had only the merged columns and
+        # had to fit themselves.
+        fit_df = fit_gene_length_bias(length_bias_df)
+        if not fit_df.empty:
+            fit_path = adv_dir / f"{sample_id}_gene_length_bias_fit.tsv"
+            fit_df.to_csv(fit_path, sep="\t", index=False)
+            outputs["gene_length_bias_fit"] = fit_df
+            outputs["gene_length_bias_fit_path"] = fit_path
 
     n_analyses = sum(1 for k in outputs if not k.endswith("_path"))
     logger.info("Advanced analyses complete for %s: %d datasets produced", sample_id, n_analyses)
