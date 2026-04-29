@@ -62,6 +62,11 @@ tryCatch({
     # Strip FASTA headers to first word for consistent gene IDs
     names(fasta) <- sub(" .*", "", names(fasta))
     codons <- codonTable(fasta)
+    # Set the genetic code to NCBI table 11 (bacterial) when the slot is
+    # exposed; otherwise rely on the metric call's id_or_name2 argument.
+    if ("genetic.code" %in% slotNames(codons)) {
+        codons@genetic.code <- "11"
+    }
     codons@KO <- codons@ID
 
     scores <- __METRIC__(codons, id_or_name2 = "11")
@@ -132,22 +137,47 @@ def run_cu_statistics(
     stats_dir.mkdir(parents=True, exist_ok=True)
     outputs = {}
 
+    # ENCprime and MILC are independent R subprocesses: same input
+    # FASTA, no shared mutable state, no ordering dependency. Launch
+    # them concurrently with a small ThreadPoolExecutor (threads, not
+    # processes — the work is happening inside Rscript, which already
+    # runs in its own OS process; Python here is just waiting on
+    # subprocess.run). Each worker has its own NamedTemporaryFile so
+    # there's no temp-file collision.
+    metric_jobs: list[tuple[str, str, Path, bool]] = []
     for metric, outname in [("ENCprime", "encprime"), ("MILC", "milc")]:
         out_path = stats_dir / f"{sample_id}_{outname}.tsv"
-        if not out_path.exists() or force:
-            logger.info("Computing %s for %s", metric, sample_id)
-            _run_r_statistic(
-                _cu_statistic_r_script(metric),
-                ffn_path, out_path, metric, sample_id,
-                min_length=min_length,
-            )
         outputs[outname] = out_path
-        # Sanity-check the coRdon output. ENCprime should sit roughly in
-        # [20, 61] (Wright-style bounds; small over-shoots are possible
-        # under shrinkage). MILC is positive; values much larger than ~5
-        # indicate either a numerical pathology or an unexpected reference
-        # set. We log warnings — not errors — so a single off-bound gene
-        # doesn't kill the run, but reproducibility issues are visible.
+        metric_jobs.append(
+            (metric, outname, out_path, not out_path.exists() or force)
+        )
+
+    pending = [(m, o, p) for (m, _o2, p, run) in metric_jobs for o in [_o2] if run]
+    if pending:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # 2 workers max (we only have 2 metrics). Using min keeps us
+        # honest if more metrics are added later.
+        with ThreadPoolExecutor(max_workers=min(len(pending), 2)) as pool:
+            futures = {
+                pool.submit(
+                    _run_r_statistic,
+                    _cu_statistic_r_script(metric),
+                    ffn_path, out_path, metric, sample_id,
+                    min_length,
+                ): (metric, out_path)
+                for (metric, _outname, out_path) in pending
+            }
+            for future in as_completed(futures):
+                metric, out_path = futures[future]
+                # Re-raise any exception raised in the worker so the
+                # error message points at the right metric.
+                future.result()
+                logger.info("Computed %s for %s", metric, sample_id)
+
+    # Output validation runs after all metrics finish. Range-checking
+    # is fast and serial avoids interleaved log output.
+    for metric, _outname, out_path, _run in metric_jobs:
         _validate_cu_statistic_output(out_path, metric)
 
     return outputs
