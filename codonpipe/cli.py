@@ -66,21 +66,31 @@ def main():
               help="Maximum number of Mahalanobis clustering components to test.")
 @click.option("--mahal-distance-multiplier", type=float, default=2.0, show_default=True,
               help="Mahalanobis cluster radius as a multiplier of the median RP distance. "
-                   "Lower values (e.g. 1.5) produce a tighter cluster; higher values (e.g. 3.0) are more permissive.")
+                   "Used by the chi-squared boundary method. Lower values (e.g. 1.5) "
+                   "produce a tighter cluster; higher values (e.g. 3.0) are more permissive.")
+@click.option("--cluster-boundary-method", type=click.Choice(["chi2", "bootstrap"]),
+              default="chi2", show_default=True,
+              help="How to define which genes belong to the optimised Mahalanobis cluster. "
+                   "'chi2' (default): a gene is in the cluster if its squared Mahalanobis "
+                   "distance is below the chi-squared 95th-percentile threshold "
+                   "(deterministic, fast, assumes the RP cohort is approximately "
+                   "multivariate-normal in COA space). 'bootstrap': run B bootstrap "
+                   "resamples and call a gene 'in' if its membership frequency exceeds "
+                   "--stability-core-threshold (no parametric assumption, robust to RP "
+                   "sub-structure, requires --stability-bootstraps replicates). Selecting "
+                   "'bootstrap' implicitly enables --run-stability.")
 @click.option("--run-stability", is_flag=True,
-              help="Run bootstrap stability analysis on the Mahalanobis cluster. "
-                   "Sweeps a grid of multipliers and reports per-gene membership frequency.")
+              help="Run bootstrap stability analysis as a diagnostic. With "
+                   "--cluster-boundary-method=chi2 (default) the bootstrap output is "
+                   "saved alongside the chi2-defined cluster but does not change it. "
+                   "With --cluster-boundary-method=bootstrap the bootstrap is required "
+                   "and is enabled automatically.")
 @click.option("--stability-bootstraps", type=int, default=100, show_default=True,
-              help="Number of bootstrap replicates per multiplier for stability analysis.")
-@click.option("--stability-multipliers", type=str, default=None,
-              help="Comma-separated multiplier values to test (e.g. '1.0,1.5,2.0,2.5,3.0'). "
-                   "Defaults to 1.0,1.25,1.5,1.75,2.0,2.5,3.0.")
-@click.option("--auto-select-multiplier", is_flag=True,
-              help="Automatically use the stability-recommended multiplier instead of "
-                   "--mahal-distance-multiplier. Requires --run-stability.")
+              help="Number of bootstrap replicates for stability analysis.")
 @click.option("--stability-core-threshold", type=float, default=0.5, show_default=True,
-              help="Membership frequency threshold for a gene to be 'core'. "
-                   "0.5 = majority-rule consensus; 0.9 = high-confidence subset.")
+              help="Membership frequency threshold for a gene to be 'core' under the "
+                   "bootstrap boundary method. 0.5 = majority-rule consensus; "
+                   "0.9 = high-confidence subset.")
 @click.option("--kegg-ko-pathway", type=click.Path(exists=True, path_type=Path), default=None,
               help="KO-to-pathway mapping TSV for offline enrichment (auto-downloaded from KEGG if omitted).")
 @click.option("--force", is_flag=True, help="Overwrite existing outputs.")
@@ -111,10 +121,9 @@ def run(
     mahal_min_k: int,
     mahal_max_k: int,
     mahal_distance_multiplier: float,
+    cluster_boundary_method: str,
     run_stability: bool,
     stability_bootstraps: int,
-    stability_multipliers: str | None,
-    auto_select_multiplier: bool,
     stability_core_threshold: float,
     kegg_ko_pathway: Path | None,
     force: bool,
@@ -148,14 +157,13 @@ def run(
     if kofam_results is not None:
         skip_kofamscan = True
 
-    # Parse stability multipliers from comma-separated string
-    stab_mult_list = None
-    if stability_multipliers is not None:
-        try:
-            stab_mult_list = [float(x.strip()) for x in stability_multipliers.split(",")]
-        except ValueError:
-            logger.error("Invalid --stability-multipliers value: %s", stability_multipliers)
-            sys.exit(1)
+    # The bootstrap boundary method needs the bootstrap product to exist.
+    # Force --run-stability on so users don't have to pass two flags.
+    if cluster_boundary_method == "bootstrap" and not run_stability:
+        logger.info(
+            "--cluster-boundary-method=bootstrap implies --run-stability; enabling."
+        )
+        run_stability = True
 
     try:
         outputs = run_single_genome(
@@ -179,10 +187,9 @@ def run(
             mahal_min_k=mahal_min_k,
             mahal_max_k=mahal_max_k,
             mahal_distance_multiplier=mahal_distance_multiplier,
+            cluster_boundary_method=cluster_boundary_method,
             run_stability=run_stability,
             stability_bootstraps=stability_bootstraps,
-            stability_multipliers=stab_mult_list,
-            auto_select_multiplier=auto_select_multiplier,
             stability_core_threshold=stability_core_threshold,
             kegg_ko_pathway=kegg_ko_pathway,
             gff_file=gff_file,
@@ -229,19 +236,24 @@ def run(
 @click.option("--mahal-max-k", type=int, default=8, show_default=True,
               help="Maximum number of Mahalanobis clustering components to test.")
 @click.option("--mahal-distance-multiplier", type=float, default=2.0, show_default=True,
-              help="Mahalanobis cluster radius as a multiplier of the median RP distance. "
-                   "Lower values (e.g. 1.5) produce a tighter cluster; higher values (e.g. 3.0) are more permissive.")
+              help="Mahalanobis cluster radius as a multiplier of the median RP distance "
+                   "(used by the chi-squared boundary method).")
+@click.option("--cluster-boundary-method", type=click.Choice(["chi2", "bootstrap"]),
+              default="chi2", show_default=True,
+              help="How to define which genes belong to the optimised Mahalanobis cluster. "
+                   "'chi2' = parametric chi-squared 95th-percentile threshold. "
+                   "'bootstrap' = membership frequency >= --stability-core-threshold "
+                   "across --stability-bootstraps bootstrap replicates "
+                   "(implies --run-stability).")
 @click.option("--run-stability", is_flag=True,
-              help="Run bootstrap stability analysis on the Mahalanobis cluster.")
+              help="Run bootstrap stability analysis as a diagnostic. "
+                   "Required and auto-enabled by --cluster-boundary-method=bootstrap.")
 @click.option("--stability-bootstraps", type=int, default=100, show_default=True,
-              help="Number of bootstrap replicates per multiplier for stability analysis.")
-@click.option("--stability-multipliers", type=str, default=None,
-              help="Comma-separated multiplier values to test (e.g. '1.0,1.5,2.0,2.5,3.0').")
-@click.option("--auto-select-multiplier", is_flag=True,
-              help="Automatically use the stability-recommended multiplier. Requires --run-stability.")
+              help="Number of bootstrap replicates for stability analysis.")
 @click.option("--stability-core-threshold", type=float, default=0.5, show_default=True,
-              help="Membership frequency threshold for a gene to be 'core'. "
-                   "0.5 = majority-rule consensus; 0.9 = high-confidence subset.")
+              help="Membership frequency threshold for a gene to be 'core' under the "
+                   "bootstrap boundary method. 0.5 = majority-rule consensus; "
+                   "0.9 = high-confidence subset.")
 @click.option("--kegg-ko-pathway", type=click.Path(exists=True, path_type=Path), default=None,
               help="KO-to-pathway mapping TSV for offline enrichment.")
 @click.option("--gff", "gff_file", type=click.Path(exists=True, path_type=Path), default=None,
@@ -268,10 +280,9 @@ def batch(
     mahal_min_k: int,
     mahal_max_k: int,
     mahal_distance_multiplier: float,
+    cluster_boundary_method: str,
     run_stability: bool,
     stability_bootstraps: int,
-    stability_multipliers: str | None,
-    auto_select_multiplier: bool,
     stability_core_threshold: float,
     kegg_ko_pathway: Path | None,
     gff_file: Path | None,
@@ -312,14 +323,13 @@ def batch(
 
     from codonpipe.pipeline import run_batch
 
-    # Parse stability multipliers from comma-separated string
-    stab_mult_list = None
-    if stability_multipliers is not None:
-        try:
-            stab_mult_list = [float(x.strip()) for x in stability_multipliers.split(",")]
-        except ValueError:
-            logger.error("Invalid --stability-multipliers value: %s", stability_multipliers)
-            sys.exit(1)
+    # The bootstrap boundary method needs the bootstrap product to exist.
+    # Force --run-stability on so users don't have to pass two flags.
+    if cluster_boundary_method == "bootstrap" and not run_stability:
+        logger.info(
+            "--cluster-boundary-method=bootstrap implies --run-stability; enabling."
+        )
+        run_stability = True
 
     try:
         meta_cols = list(metadata_cols) if metadata_cols else None
@@ -342,10 +352,9 @@ def batch(
             mahal_min_k=mahal_min_k,
             mahal_max_k=mahal_max_k,
             mahal_distance_multiplier=mahal_distance_multiplier,
+            cluster_boundary_method=cluster_boundary_method,
             run_stability=run_stability,
             stability_bootstraps=stability_bootstraps,
-            stability_multipliers=stab_mult_list,
-            auto_select_multiplier=auto_select_multiplier,
             stability_core_threshold=stability_core_threshold,
             kegg_ko_pathway=kegg_ko_pathway,
             gff_file=gff_file,
