@@ -213,14 +213,30 @@ def run_stability_analysis(
     X, coa_gene_ids, rp_indices, n_axes = coa_prep
 
     # ── Bootstrap ───────────────────────────────────────────────────
-    boot_clusters: list[set[str]] = []
-    for b in range(n_bootstraps):
-        cluster_ids = _bootstrap_rp_reference(
+    # Each iteration is independent and the result (a set of gene IDs) is
+    # cheap to pickle, so this is a textbook joblib loop. We pass the
+    # iteration index as the per-iteration seed to keep bit-identical
+    # results against the previous serial path; the parallel-aware
+    # helper still spawns child rngs for any callee that asks for one.
+    from codonpipe.utils._parallel import parallel_perm
+
+    def _boot_iter(rng: np.random.Generator, idx: int) -> set[str]:
+        # _bootstrap_rp_reference takes a deterministic ``seed`` integer.
+        # Pass ``idx`` so the per-iteration seed is identical to the
+        # serial code's loop variable — reproducibility against pre-
+        # parallelisation runs is preserved exactly.
+        return _bootstrap_rp_reference(
             X, coa_gene_ids, rp_indices, n_axes,
             multiplier=0.0,  # unused, chi-squared threshold
-            seed=b,
+            seed=idx,
         )
-        boot_clusters.append(cluster_ids)
+
+    boot_clusters: list[set[str]] = parallel_perm(
+        n_bootstraps,
+        _boot_iter,
+        master_seed=0,  # individual seeds come from idx; master unused
+        desc="cluster-stability-bootstrap",
+    )
 
     # ── Per-gene membership frequency ──────────────────────────────
     freq: dict[str, float] = {}
