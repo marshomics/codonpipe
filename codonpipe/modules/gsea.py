@@ -462,7 +462,14 @@ def _download_kegg_ko_module_map() -> dict[str, set[str]]:
                 )
                 time.sleep(_KEGG_RETRY_DELAY * attempt)
             else:
-                logger.warning("KEGG module download failed after %d attempts: %s", _KEGG_MAX_RETRIES, e)
+                logger.warning(
+                    "KEGG module download failed after %d attempts: %s. "
+                    "GSEA module gene-sets will be skipped for this run. "
+                    "Pass --kegg-ko-module <path-to-ko_module.tsv> for an "
+                    "offline run; you can fetch the file once with "
+                    "`curl https://rest.kegg.jp/link/module/ko -o ko_module.tsv`.",
+                    _KEGG_MAX_RETRIES, e,
+                )
     return {}
 
 
@@ -577,6 +584,7 @@ def run_gsea_analysis(
     min_size: int = _MIN_GENE_SET_SIZE,
     max_size: int = _MAX_GENE_SET_SIZE,
     cache_dir: Path | None = None,
+    ko_module_user_file: Path | None = None,
 ) -> dict[str, pd.DataFrame | Path]:
     """Run GSEA on a single genome using multiple gene-set sources.
 
@@ -640,7 +648,14 @@ def run_gsea_analysis(
     # ── KEGG Modules ─────────────────────────────────────────────────────
     if kofam_df is not None and not kofam_df.empty:
         try:
-            ko_mod_map = load_ko_module_map(cache_dir=cache_dir)
+            # Use the user-supplied KO→module map when provided; otherwise
+            # consult the cache and fall back to a fresh KEGG download. The
+            # module names map (M00001 → "Glycolysis (Embden-Meyerhof) ...")
+            # is presentation-only and degrades gracefully to bare module IDs
+            # if the network is unavailable.
+            ko_mod_map = load_ko_module_map(
+                user_file=ko_module_user_file, cache_dir=cache_dir,
+            )
             mod_names = load_module_names(cache_dir=cache_dir)
 
             if ko_mod_map:
