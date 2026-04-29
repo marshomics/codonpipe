@@ -155,6 +155,18 @@ def main():
               help="KO-to-module mapping TSV for offline GSEA module gene-sets "
                    "(auto-downloaded from KEGG if omitted). Pass this together "
                    "with --kegg-ko-pathway for a fully offline run.")
+@click.option("--kegg-pathway-names", type=click.Path(exists=True, path_type=Path), default=None,
+              help="Pathway-ID-to-name TSV for offline enrichment / GSEA "
+                   "(auto-downloaded from KEGG if omitted). Fetch with: "
+                   "`curl https://rest.kegg.jp/list/pathway/ko -o "
+                   "kegg_pathway_names.tsv`. Required on offline compute "
+                   "nodes; without it pathway tables fall back to bare "
+                   "ko##### IDs.")
+@click.option("--kegg-module-names", type=click.Path(exists=True, path_type=Path), default=None,
+              help="Module-ID-to-name TSV for offline GSEA "
+                   "(auto-downloaded from KEGG if omitted). Fetch with: "
+                   "`curl https://rest.kegg.jp/list/module -o "
+                   "kegg_module_names.tsv`.")
 @click.option("--force", is_flag=True, help="Overwrite existing outputs.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 @click.option("--log-file", type=click.Path(path_type=Path), default=None,
@@ -189,6 +201,8 @@ def run(
     stability_core_threshold: float,
     kegg_ko_pathway: Path | None,
     kegg_ko_module: Path | None,
+    kegg_pathway_names: Path | None,
+    kegg_module_names: Path | None,
     force: bool,
     verbose: bool,
     log_file: Path | None,
@@ -264,6 +278,8 @@ def run(
             stability_core_threshold=stability_core_threshold,
             kegg_ko_pathway=kegg_ko_pathway,
             kegg_ko_module=kegg_ko_module,
+            kegg_pathway_names=kegg_pathway_names,
+            kegg_module_names=kegg_module_names,
             gff_file=gff_file,
             force=force,
         )
@@ -332,6 +348,16 @@ def run(
                    "offline GSEA run).")
 @click.option("--kegg-ko-module", type=click.Path(exists=True, path_type=Path), default=None,
               help="KO-to-module mapping TSV for offline GSEA module gene-sets.")
+@click.option("--kegg-pathway-names", type=click.Path(exists=True, path_type=Path), default=None,
+              help="Pathway-ID-to-name TSV for offline enrichment / GSEA "
+                   "(``curl https://rest.kegg.jp/list/pathway/ko -o "
+                   "kegg_pathway_names.tsv``). Required on offline compute "
+                   "nodes; without it pathway tables fall back to bare "
+                   "ko##### IDs.")
+@click.option("--kegg-module-names", type=click.Path(exists=True, path_type=Path), default=None,
+              help="Module-ID-to-name TSV for offline GSEA "
+                   "(``curl https://rest.kegg.jp/list/module -o "
+                   "kegg_module_names.tsv``).")
 @click.option("--gff", "gff_file", type=click.Path(exists=True, path_type=Path), default=None,
               help="GFF3 annotation file for tRNA extraction (overrides per-sample auto-detection).")
 @click.option("--force", is_flag=True, help="Overwrite existing outputs.")
@@ -362,6 +388,8 @@ def batch(
     stability_core_threshold: float,
     kegg_ko_pathway: Path | None,
     kegg_ko_module: Path | None,
+    kegg_pathway_names: Path | None,
+    kegg_module_names: Path | None,
     gff_file: Path | None,
     skip_gsea: bool,
     gsea_permutations: int,
@@ -443,6 +471,8 @@ def batch(
             stability_core_threshold=stability_core_threshold,
             kegg_ko_pathway=kegg_ko_pathway,
             kegg_ko_module=kegg_ko_module,
+            kegg_pathway_names=kegg_pathway_names,
+            kegg_module_names=kegg_module_names,
             gff_file=gff_file,
             force=force,
             skip_gsea=skip_gsea,
