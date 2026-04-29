@@ -192,10 +192,9 @@ def run_single_genome(
     mahal_min_k: int = 2,
     mahal_max_k: int = 8,
     mahal_distance_multiplier: float = 2.0,
+    cluster_boundary_method: str = "chi2",
     run_stability: bool = False,
     stability_bootstraps: int = 100,
-    stability_multipliers: list[float] | None = None,
-    auto_select_multiplier: bool = False,
     stability_core_threshold: float = 0.5,
     kegg_ko_pathway: Path | None = None,
     kegg_cache_dir: Path | None = None,
@@ -254,22 +253,27 @@ def run_single_genome(
         mahal_min_k: Minimum Mahalanobis components to test (default 2).
         mahal_max_k: Maximum Mahalanobis components to test (default 8).
         mahal_distance_multiplier: Threshold = multiplier × median RP
-            Mahalanobis distance (default 2.0).  Lower values produce a
-            tighter cluster; higher values are more permissive.
-        run_stability: Run bootstrap stability analysis on the Mahalanobis
-            cluster (default False).  Sweeps a grid of multipliers and
-            computes per-gene membership frequency to quantify robustness.
-        stability_bootstraps: Number of bootstrap replicates per multiplier
-            (default 100).
-        stability_multipliers: Custom list of multiplier values to test.
-            Defaults to [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0].
-        auto_select_multiplier: When True and run_stability is True, use
-            the stability-recommended multiplier instead of the user-supplied
-            mahal_distance_multiplier.  The Mahalanobis clustering step is
-            re-run with the recommended value.
+            Mahalanobis distance (default 2.0). Used by the chi-squared
+            boundary method. Lower values produce a tighter cluster;
+            higher values are more permissive.
+        cluster_boundary_method: How the optimised cluster's gene set is
+            defined. ``"chi2"`` (default) uses the chi-squared 95th
+            percentile of squared Mahalanobis distance — deterministic
+            and parametric. ``"bootstrap"`` uses bootstrap membership
+            frequency thresholded at ``stability_core_threshold`` — robust
+            to RP-cohort sub-structure. Selecting ``"bootstrap"`` requires
+            (and the CLI auto-enables) ``run_stability=True`` because the
+            bootstrap product must exist for the boundary call.
+        run_stability: Run bootstrap stability analysis. With
+            ``cluster_boundary_method="chi2"`` this saves the bootstrap
+            product as a diagnostic but does not change the cluster
+            boundary. With ``cluster_boundary_method="bootstrap"`` the
+            boundary itself comes from the bootstrap, so this is required.
+        stability_bootstraps: Number of bootstrap replicates (default 100).
         stability_core_threshold: Membership frequency threshold for a gene
             to be considered "core" in the stability analysis (default 0.5).
-            Set to 0.9 for a high-confidence subset.
+            Set to 0.9 for a high-confidence subset. This is the threshold
+            applied when ``cluster_boundary_method="bootstrap"``.
         kegg_ko_pathway: User-supplied KO-to-pathway mapping TSV for offline use.
         kegg_cache_dir: Shared directory for cached KEGG KO/pathway maps.
             When running many samples in batch, pass a single shared path
@@ -661,7 +665,11 @@ def run_single_genome(
                 rp_rscu_df=rp_rscu_df_stab,
                 expr_df=expr_df,
                 n_bootstraps=stability_bootstraps,
-                multiplier_grid=stability_multipliers,
+                # multiplier_grid is a vestigial backward-compat parameter on
+                # run_stability_analysis; the chi-squared threshold has long
+                # since replaced the multiplier sweep. Pass None and let the
+                # callee ignore it.
+                multiplier_grid=None,
                 core_threshold=stability_core_threshold,
             )
 
@@ -672,21 +680,31 @@ def run_single_genome(
         except Exception as e:
             logger.warning("Stability analysis failed: %s. Continuing.", e, exc_info=True)
 
-    # ── Promote stability core set when available ────────────────────────────
-    # When bootstrap stability analysis has been run, the core gene set
-    # (genes above core_threshold membership frequency) replaces the
-    # Mahalanobis cluster for MELP scoring and enrichment.
-    # The frequency-weighted RSCU replaces the distance-weighted RSCU.
-    # Safeguard: only apply if core set has >= _MIN_CORE_FOR_OVERRIDE genes.
+    # ── Promote stability core set when boundary method is bootstrap ─────────
+    # When ``cluster_boundary_method="bootstrap"`` is selected, the bootstrap
+    # core gene set (genes whose membership frequency exceeds
+    # ``stability_core_threshold``) replaces the chi-squared-defined cluster
+    # for MELP scoring and enrichment. The frequency-weighted RSCU replaces
+    # the distance-weighted RSCU. Under ``cluster_boundary_method="chi2"``
+    # (default) the bootstrap output is saved as a diagnostic but the chi2
+    # cluster is preserved as the primary.
+    #
+    # Safeguard: only apply if the core set has >= _MIN_CORE_FOR_OVERRIDE
+    # genes. Below that threshold the core is too sparse to anchor MELP /
+    # codon-optimization / HGT downstream, so we keep the chi2 cluster and
+    # warn the user.
     _MIN_CORE_FOR_OVERRIDE = 30
     stability_core_ids = stability_results.get("core_gene_ids")
     stability_core_rscu = stability_results.get("core_rscu")
     stability_core_ids_path = stability_results.get("core_ids_path")
 
-    if (
-        stability_core_ids
+    use_bootstrap_boundary = (
+        cluster_boundary_method == "bootstrap"
+        and stability_core_ids
         and len(stability_core_ids) >= _MIN_CORE_FOR_OVERRIDE
-    ):
+    )
+
+    if use_bootstrap_boundary:
         logger.info(
             "Stability core set (%d genes, threshold=%.2f) replaces "
             "Mahalanobis cluster (%s genes) for MELP/enrichment",
@@ -772,13 +790,30 @@ def run_single_genome(
                 _cat_counts.get("neither", 0),
             )
 
-    elif stability_core_ids is not None and len(stability_core_ids) < _MIN_CORE_FOR_OVERRIDE:
+    elif (
+        cluster_boundary_method == "bootstrap"
+        and stability_core_ids is not None
+        and len(stability_core_ids) < _MIN_CORE_FOR_OVERRIDE
+    ):
         logger.warning(
-            "Stability core set too small (%d < %d genes); keeping "
-            "Mahalanobis cluster for MELP/enrichment. Consider lowering "
-            "--stability-core-threshold (currently %.2f).",
+            "--cluster-boundary-method=bootstrap requested, but the stability "
+            "core set has only %d genes (< %d required). Falling back to the "
+            "chi-squared boundary for this sample. Consider lowering "
+            "--stability-core-threshold (currently %.2f) or increasing "
+            "--stability-bootstraps.",
             len(stability_core_ids), _MIN_CORE_FOR_OVERRIDE,
             stability_core_threshold,
+        )
+    elif (
+        cluster_boundary_method == "chi2"
+        and run_stability
+        and stability_core_ids is not None
+    ):
+        logger.info(
+            "Bootstrap stability ran as a diagnostic (%d core genes at "
+            "threshold=%.2f). Keeping the chi-squared cluster as primary "
+            "because --cluster-boundary-method=chi2 (default).",
+            len(stability_core_ids), stability_core_threshold,
         )
 
     # Refresh the cluster IDs path reference for Step 9b
@@ -1496,14 +1531,27 @@ def run_batch(
                     prokka_files["gff"] = Path(gff_val)
                 row_kwargs["prokka_files"] = prokka_files
 
-        # Per-sample GFF path from batch table (for tRNA extraction)
+        # Per-sample GFF path from batch table (for tRNA extraction).
+        # The per-row column takes precedence over the global --gff CLI
+        # flag. The previous "not in row_kwargs" check failed because the
+        # CLI handler always passes ``gff_file=...`` to run_batch, even
+        # when the flag wasn't supplied — so the key was always present
+        # (with value None) and the per-row column was silently ignored.
+        # Use value-truthiness instead so a per-row path overrides a None
+        # default.
         gff_path_val = str(row.get("gff_path", "") or "").strip()
-        if gff_path_val and "gff_file" not in row_kwargs:
+        if gff_path_val:
             row_kwargs["gff_file"] = Path(gff_path_val)
 
-        # Per-sample pre-computed KofamScan results from batch table
+        # Per-sample pre-computed KofamScan results from batch table.
+        # Same bug-fix as gff_file above: the global CLI flag's
+        # ``kofam_results_file=None`` was suppressing the per-row column
+        # because the check was on key presence, not value truthiness.
+        # The per-row column always wins now; pass --kofam-results on the
+        # command line only when you want a single global file applied to
+        # every row that doesn't have a per-row value of its own.
         kofam_res_val = str(row.get("kofam_results", "") or "").strip()
-        if kofam_res_val and "kofam_results_file" not in row_kwargs:
+        if kofam_res_val:
             row_kwargs["kofam_results_file"] = Path(kofam_res_val)
 
         return row_kwargs
