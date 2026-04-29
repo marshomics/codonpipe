@@ -78,6 +78,81 @@ def _load_rp_ids(rp_ids_file: Path | None) -> set[str] | None:
     }
 
 
+def _log_metric_correlations(
+    expr_df: pd.DataFrame,
+    sample_id: str,
+    label: str,
+    threshold: float = 0.95,
+) -> None:
+    """Log per-pair Pearson correlations of MELP / CAI / Fop within one
+    reference frame, plus the fraction of MELP values exactly at zero.
+
+    Used as a diagnostic so users notice when:
+      (1) the three metrics carry essentially the same signal — i.e.
+          all r > threshold (default 0.95). This typically means the
+          reference set is too uniform to distinguish a chi-squared
+          measure (MELP), a geometric-mean measure (CAI) and a
+          most-frequent-codon count (Fop). The reference probably needs
+          broadening.
+      (2) MELP is dominated by its non-negative floor (Supek & Smuc 2010
+          convention: genes below the genome baseline collapse to 0).
+          When >40% of genes have MELP exactly equal to zero, the metric
+          loses its lower-half dynamic range and the resulting tier
+          classifications become biased — the bottom 40+% all collapse
+          into one undifferentiated "low" cohort.
+
+    The function only emits warnings; it does not modify ``expr_df``.
+    """
+    metrics = [c for c in (COL_MELP, COL_CAI, COL_FOP) if c in expr_df.columns]
+    if len(metrics) < 2:
+        return
+
+    sub = expr_df[metrics].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(sub) < 10:
+        return
+
+    # Pairwise Pearson correlations across genes
+    high_pairs = []
+    for i, m1 in enumerate(metrics):
+        for m2 in metrics[i + 1:]:
+            if sub[m1].std() == 0 or sub[m2].std() == 0:
+                continue
+            r = float(sub[m1].corr(sub[m2]))
+            if r >= threshold:
+                high_pairs.append((m1, m2, r))
+    if high_pairs:
+        details = ", ".join(f"{a}~{b} r={r:.3f}" for a, b, r in high_pairs)
+        logger.warning(
+            "[%s/%s] Expression metrics are highly correlated (>%.2f): %s. "
+            "MELP/CAI/Fop carry mostly the same signal in this organism — "
+            "either the reference (RP or Mahal cluster) is too uniform, or "
+            "translational selection is so strong that all three metrics "
+            "saturate. Treat the three as redundant rather than as "
+            "independent expression predictors.",
+            sample_id, label, threshold, details,
+        )
+
+    # MELP-floor diagnostic
+    if COL_MELP in expr_df.columns:
+        melp_vals = pd.to_numeric(expr_df[COL_MELP], errors="coerce").dropna()
+        if len(melp_vals) >= 20:
+            frac_zero = float((melp_vals == 0).mean())
+            if frac_zero > 0.4:
+                logger.warning(
+                    "[%s/%s] %.1f%% of MELP values are exactly 0. coRdon's "
+                    "MELP follows the Supek & Smuc (2010) convention of "
+                    "non-negative scores (genes below the genome baseline "
+                    "are clipped to 0). With this much of the dynamic range "
+                    "lost, the MELP_class 'low' tier will essentially be "
+                    "'any gene below genome average', which is not what the "
+                    "10th-percentile classification is meant to capture. "
+                    "Consider relying on CAI or Fop tiers for low-expression "
+                    "discrimination, or use ENC' / MILC for the unclipped "
+                    "signal.",
+                    sample_id, label, 100 * frac_zero,
+                )
+
+
 def _validate_prokka_files(prokka_files: dict[str, Path]) -> None:
     """Validate that user-supplied Prokka files exist and are non-empty."""
     for key in ("faa", "ffn"):
@@ -303,77 +378,142 @@ def run_single_genome(
     else:
         logger.info("SKIPPED: RSCU KofamScan annotation (no KofamScan data)")
 
-    # ── Step 5: CU bias statistics (ENCprime, MILC) ────────────────────
+    # ── Steps 5 + 6: CU bias statistics and RP-based expression in parallel ──
+    # Step 5 (ENCprime + MILC) and Step 6 (RP-referenced MELP / CAI / Fop)
+    # are both R/coRdon subprocess blocks that read ``ffn_path`` and
+    # write to disjoint output subdirectories. They have no data
+    # dependency on each other (Step 6's ENC' residual merge consumes
+    # Step 5's output, but only after both have completed). Launch the
+    # two as concurrent futures so the wall clock for the R block is
+    # roughly max(Step5, Step6) instead of Step5 + Step6.
     encprime_df = None
     milc_df = None
-    if not skip_expression:
-        logger.info("[Step 5/12] Computing CU bias statistics (ENCprime, MILC)")
-        try:
-            cu_stat_outputs = run_cu_statistics(
-                ffn_path, output_dir, sample_id, force=force,
-            )
-            all_outputs.update(cu_stat_outputs)
-
-            if "encprime" in cu_stat_outputs and cu_stat_outputs["encprime"].exists():
-                encprime_df = pd.read_csv(cu_stat_outputs["encprime"], sep="\t")
-            if "milc" in cu_stat_outputs and cu_stat_outputs["milc"].exists():
-                milc_df = pd.read_csv(cu_stat_outputs["milc"], sep="\t")
-        except (FileNotFoundError, RuntimeError) as e:
-            logger.warning("CU statistics failed: %s. Continuing.", e, exc_info=True)
-    else:
-        logger.info("[Step 5/12] Skipping CU bias statistics (--skip-expression)")
-
-    # ── Step 6: Expression analysis ─────────────────────────────────────
-    # When Mahalanobis clustering is enabled (!skip_mahal), expression
-    # scoring is deferred to Step 9b so that genes are scored against the
-    # broader Mahalanobis cluster reference instead of RP-only IDs.
-    # Expression runs here only when Mahalanobis is skipped (skip_mahal=True).
     expr_df = None
-    if not skip_expression and rp_ids_file and rp_ids_file.exists() and skip_mahal:
-        logger.info("[Step 6/12] Running expression level prediction (MELP/CAI/Fop)")
-        try:
-            expr_outputs, expr_df = run_expression_analysis(
-                ffn_path, rp_ids_file, output_dir, sample_id, force=force,
+    rp_expr_df = None  # always-RP-referenced scores, preserved as rp_* columns
+    expr_outputs: dict[str, Path] = {}
+
+    run_step5 = not skip_expression
+    run_step6 = (
+        not skip_expression and rp_ids_file is not None and rp_ids_file.exists()
+    )
+
+    if run_step5 or run_step6:
+        from concurrent.futures import ThreadPoolExecutor
+
+        if run_step5 and run_step6:
+            logger.info(
+                "[Steps 5+6/12] Running CU bias statistics (ENCprime, MILC) "
+                "and RP-based expression (MELP, CAI, Fop) in parallel"
             )
-            all_outputs.update(expr_outputs)
+        elif run_step5:
+            logger.info("[Step 5/12] Computing CU bias statistics (ENCprime, MILC)")
+        else:
+            logger.info(
+                "[Step 6/12] Running RP-based expression level prediction "
+                "(MELP/CAI/Fop)"
+            )
 
-            if expr_df is None and "expression_combined" in expr_outputs:
-                expr_df = pd.read_csv(expr_outputs["expression_combined"], sep="\t")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            cu_future = (
+                pool.submit(
+                    run_cu_statistics, ffn_path, output_dir, sample_id, force=force,
+                ) if run_step5 else None
+            )
+            expr_future = (
+                pool.submit(
+                    run_expression_analysis,
+                    ffn_path, rp_ids_file, output_dir, sample_id, force=force,
+                ) if run_step6 else None
+            )
 
-                # Merge ENC' residual (ENC - ENC') as first-class column
-                if enc_df is not None and encprime_df is not None:
-                    try:
-                        from codonpipe.modules.advanced_analyses import compute_enc_diff
-                        enc_diff_df = compute_enc_diff(enc_df, encprime_df)
-                        if not enc_diff_df.empty and COL_GENE in enc_diff_df.columns:
-                            expr_df = expr_df.merge(
-                                enc_diff_df[[COL_GENE, COL_ENC_DIFF]].rename(
-                                    columns={COL_ENC_DIFF: COL_ENCPRIME_RESIDUAL}
-                                ),
-                                on=COL_GENE, how="left",
-                            )
-                            # Re-save the updated expression table
-                            expr_df.to_csv(expr_outputs["expression_combined"], sep="\t", index=False)
-                            logger.info("Merged ENC' residual into expression table (%d genes with values)",
-                                        expr_df[COL_ENCPRIME_RESIDUAL].notna().sum())
-                    except Exception as e:
-                        logger.warning("Could not merge ENC' residual: %s", e)
+            if cu_future is not None:
+                try:
+                    cu_stat_outputs = cu_future.result()
+                    all_outputs.update(cu_stat_outputs)
+                    if (
+                        "encprime" in cu_stat_outputs
+                        and cu_stat_outputs["encprime"].exists()
+                    ):
+                        encprime_df = pd.read_csv(
+                            cu_stat_outputs["encprime"], sep="\t"
+                        )
+                    if (
+                        "milc" in cu_stat_outputs
+                        and cu_stat_outputs["milc"].exists()
+                    ):
+                        milc_df = pd.read_csv(cu_stat_outputs["milc"], sep="\t")
+                except (FileNotFoundError, RuntimeError) as e:
+                    logger.warning(
+                        "CU statistics failed: %s. Continuing.", e, exc_info=True,
+                    )
 
-                # Annotate with KofamScan
-                if kofam_df is not None and not kofam_df.empty:
-                    expr_ann = annotate_with_kofam(expr_df, kofam_df)
-                    expr_ann_dir = get_output_subdir(output_dir, "expression")
-                    expr_ann_path = expr_ann_dir / f"{sample_id}_expression_annotated.tsv"
-                    expr_ann.to_csv(expr_ann_path, sep="\t", index=False)
-                    all_outputs["expression_annotated"] = expr_ann_path
-        except (FileNotFoundError, RuntimeError) as e:
-            logger.warning("Expression analysis failed: %s. Continuing.", e, exc_info=True)
-    elif skip_expression:
-        logger.info("[Step 6/12] Skipping expression analysis (--skip-expression)")
-    elif not skip_mahal:
-        logger.info("[Step 6/12] Deferring expression analysis to Step 9b (Mahalanobis reference)")
+            if expr_future is not None:
+                try:
+                    expr_outputs, rp_expr_df = expr_future.result()
+                    all_outputs.update(expr_outputs)
+                    if rp_expr_df is None and "expression_combined" in expr_outputs:
+                        rp_expr_df = pd.read_csv(
+                            expr_outputs["expression_combined"], sep="\t"
+                        )
+                except (FileNotFoundError, RuntimeError) as e:
+                    logger.warning(
+                        "RP-based expression analysis failed: %s. Continuing "
+                        "without expression scores.", e, exc_info=True,
+                    )
     else:
-        logger.info("[Step 6/12] Skipping expression analysis (no ribosomal proteins found)")
+        if skip_expression:
+            logger.info(
+                "[Steps 5+6/12] Skipping CU bias statistics and expression "
+                "analysis (--skip-expression)"
+            )
+        else:
+            logger.info(
+                "[Step 6/12] Skipping expression analysis "
+                "(no ribosomal proteins found)"
+            )
+
+    # When Mahalanobis clustering is skipped, the RP-based result IS the
+    # primary expr_df. Otherwise, Step 9b will overwrite the primary
+    # with Mahal-referenced values and we'll merge rp_* back from
+    # rp_expr_df. Either way, this merge depends on Step 5 having
+    # finished (encprime_df) and Step 6 having succeeded — both
+    # guaranteed because the ThreadPoolExecutor above blocks until
+    # both futures resolve.
+    if run_step6 and skip_mahal and rp_expr_df is not None:
+        expr_df = rp_expr_df.copy()
+
+        # Merge ENC' residual (ENC - ENC') as first-class column
+        if enc_df is not None and encprime_df is not None:
+            try:
+                from codonpipe.modules.advanced_analyses import compute_enc_diff
+                enc_diff_df = compute_enc_diff(enc_df, encprime_df)
+                if not enc_diff_df.empty and COL_GENE in enc_diff_df.columns:
+                    expr_df = expr_df.merge(
+                        enc_diff_df[[COL_GENE, COL_ENC_DIFF]].rename(
+                            columns={COL_ENC_DIFF: COL_ENCPRIME_RESIDUAL}
+                        ),
+                        on=COL_GENE, how="left",
+                    )
+                    if "expression_combined" in expr_outputs:
+                        expr_df.to_csv(
+                            expr_outputs["expression_combined"],
+                            sep="\t", index=False,
+                        )
+                    logger.info(
+                        "Merged ENC' residual into expression table "
+                        "(%d genes with values)",
+                        expr_df[COL_ENCPRIME_RESIDUAL].notna().sum(),
+                    )
+            except Exception as e:
+                logger.warning("Could not merge ENC' residual: %s", e)
+
+        # Annotate with KofamScan when Mahal step won't re-do it
+        if kofam_df is not None and not kofam_df.empty:
+            expr_ann = annotate_with_kofam(expr_df, kofam_df)
+            expr_ann_dir = get_output_subdir(output_dir, "expression")
+            expr_ann_path = expr_ann_dir / f"{sample_id}_expression_annotated.tsv"
+            expr_ann.to_csv(expr_ann_path, sep="\t", index=False)
+            all_outputs["expression_annotated"] = expr_ann_path
 
     # ── Step 7: Pathway enrichment (RP-based tiers) ─────────────────────
     enrichment_results = {}
@@ -656,10 +796,21 @@ def run_single_genome(
             logger.warning("Could not save Mahalanobis cluster RSCU to rscu/: %s", e)
 
     # ── Step 9b: Re-run expression scoring with Mahalanobis cluster as reference ─
-    # Step 6 scored genes against RP-only IDs.  The Mahalanobis cluster provides a
-    # broader, biologically grounded reference set (RP + co-clustered genes).
-    # Re-run MELP/CAI/Fop via coRdon using Mahalanobis cluster gene IDs, then
-    # promote the Mahalanobis-based classification as the primary expression_class.
+    # Step 6 already scored genes against RP-only IDs (rp_expr_df). The
+    # Mahalanobis cluster provides a broader, biologically grounded reference
+    # set (RP + co-clustered genes). Re-run MELP/CAI/Fop using the Mahal
+    # cluster as the subset, promote that as the primary expression score,
+    # and merge the RP-referenced scores back in as rp_MELP / rp_CAI / rp_Fop.
+    #
+    # CAVEAT: when the Mahal cluster is dominated by RP genes (the common
+    # case), MELP/CAI/Fop and rp_MELP/rp_CAI/rp_Fop will be highly
+    # correlated by construction — both references point at substantially
+    # the same codon-usage profile. CAI in particular is nearly invariant
+    # because it only depends on relative adaptiveness within each AA
+    # family, which is determined by whichever codon dominates each
+    # family's RSCU; if both references agree on the dominant codon, CAI
+    # is identical. This is biology, not a bug, but the metric_correlation
+    # diagnostic emitted below will surface it.
     if (
         mahal_cluster_gene_ids
         and mahal_cluster_ids_path
@@ -671,29 +822,56 @@ def run_single_genome(
             len(mahal_cluster_gene_ids),
         )
         try:
-            mahal_expr_outputs, expr_df = run_expression_analysis(
+            mahal_expr_outputs, mahal_expr_df = run_expression_analysis(
                 ffn_path, mahal_cluster_ids_path, output_dir, sample_id,
                 force=True,  # overwrite the RP-based expression files
             )
             all_outputs.update(mahal_expr_outputs)
 
-            if expr_df is None and "expression_combined" in mahal_expr_outputs:
-                mahal_expr_df = pd.read_csv(mahal_expr_outputs["expression_combined"], sep="\t")
+            # Materialise the dataframe — older paths returned (outputs, None)
+            # when the in-memory df wasn't carried back. Keep that fallback.
+            if mahal_expr_df is None and "expression_combined" in mahal_expr_outputs:
+                mahal_expr_df = pd.read_csv(
+                    mahal_expr_outputs["expression_combined"], sep="\t"
+                )
 
-                # Preserve RP-based scores as secondary columns
-                if expr_df is not None and not expr_df.empty:
+            if mahal_expr_df is not None and not mahal_expr_df.empty:
+                # Merge RP-referenced scores back in as rp_* columns. This is
+                # the bit that was previously dead code (the conditions
+                # contradicted each other), which is why earlier outputs
+                # had stale or missing rp_* values.
+                if rp_expr_df is not None and not rp_expr_df.empty:
                     rp_cols_to_keep = {}
-                    for col in (*EXPRESSION_METRICS, *EXPRESSION_CLASS_COLS, COL_EXPRESSION_CLASS):
-                        if col in expr_df.columns:
+                    for col in (
+                        *EXPRESSION_METRICS,
+                        *EXPRESSION_CLASS_COLS,
+                        COL_EXPRESSION_CLASS,
+                    ):
+                        if col in rp_expr_df.columns:
                             rp_cols_to_keep[col] = f"{RP_PREFIX}{col}"
 
-                    rp_backup = expr_df[[COL_GENE] + list(rp_cols_to_keep.keys())].rename(
-                        columns=rp_cols_to_keep
+                    if rp_cols_to_keep:
+                        rp_backup = rp_expr_df[
+                            [COL_GENE] + list(rp_cols_to_keep.keys())
+                        ].rename(columns=rp_cols_to_keep)
+                        mahal_expr_df = mahal_expr_df.merge(
+                            rp_backup, on=COL_GENE, how="left"
+                        )
+                        logger.info(
+                            "Merged RP-referenced scores into expression table "
+                            "as %s", sorted(rp_cols_to_keep.values()),
+                        )
+                else:
+                    logger.warning(
+                        "No RP-referenced expression dataframe available; "
+                        "rp_MELP / rp_CAI / rp_Fop columns will be absent. "
+                        "This usually means Step 6 was skipped or failed."
                     )
-                    mahal_expr_df = mahal_expr_df.merge(rp_backup, on=COL_GENE, how="left")
 
                 # Add Mahalanobis cluster membership flag
-                mahal_expr_df[COL_IN_MAHAL_CLUSTER] = mahal_expr_df[COL_GENE].isin(mahal_cluster_gene_ids)
+                mahal_expr_df[COL_IN_MAHAL_CLUSTER] = (
+                    mahal_expr_df[COL_GENE].isin(mahal_cluster_gene_ids)
+                )
 
                 # Merge ENC' residual if available
                 if enc_df is not None and encprime_df is not None:
@@ -710,6 +888,17 @@ def run_single_genome(
                     except Exception as e:
                         logger.warning("Could not merge ENC' residual: %s", e)
 
+                # Cross-metric correlation diagnostic. If MELP, CAI, and Fop
+                # within the same reference frame are >0.95 Pearson-correlated
+                # across genes, the user's reference is too uniform to give
+                # the three metrics independent signals — the chi-squared,
+                # geometric-mean, and most-frequent-codon flavours collapse
+                # into one signal. Emit a warning so users know to read the
+                # metrics as redundant rather than independent.
+                _log_metric_correlations(mahal_expr_df, sample_id, label="mahal")
+                if rp_expr_df is not None and not rp_expr_df.empty:
+                    _log_metric_correlations(rp_expr_df, sample_id, label="rp")
+
                 # Annotate with KofamScan
                 if kofam_df is not None and not kofam_df.empty:
                     expr_ann = annotate_with_kofam(mahal_expr_df, kofam_df)
@@ -719,7 +908,9 @@ def run_single_genome(
                     all_outputs["expression_annotated"] = expr_ann_path
 
                 # Save and promote
-                mahal_expr_df.to_csv(mahal_expr_outputs["expression_combined"], sep="\t", index=False)
+                mahal_expr_df.to_csv(
+                    mahal_expr_outputs["expression_combined"], sep="\t", index=False
+                )
                 expr_df = mahal_expr_df
                 logger.info(
                     "Expression analysis re-scored with Mahalanobis cluster reference "
@@ -732,18 +923,15 @@ def run_single_genome(
                 "Keeping RP-based expression scores.", e, exc_info=True,
             )
 
-    # Fallback: if Mahalanobis-based expression wasn't produced, run RP-based
-    if not skip_mahal and expr_df is None and not skip_expression and rp_ids_file and rp_ids_file.exists():
-        logger.warning("[Step 9b fallback] Mahalanobis-based expression unavailable; falling back to RP-based expression analysis")
-        try:
-            expr_outputs, expr_df = run_expression_analysis(
-                ffn_path, rp_ids_file, output_dir, sample_id, force=force,
-            )
-            all_outputs.update(expr_outputs)
-            if expr_df is None and "expression_combined" in expr_outputs:
-                expr_df = pd.read_csv(expr_outputs["expression_combined"], sep="\t")
-        except (FileNotFoundError, RuntimeError) as e:
-            logger.warning("RP-based expression analysis failed: %s. Continuing.", e, exc_info=True)
+    # Fallback: if Mahalanobis re-scoring didn't populate expr_df but
+    # the RP-based pass succeeded, use the RP version as primary.
+    if expr_df is None and rp_expr_df is not None and not rp_expr_df.empty:
+        logger.info(
+            "[Step 9b fallback] Mahalanobis-based expression unavailable; "
+            "promoting RP-based scores as primary expression_class."
+        )
+        expr_df = rp_expr_df.copy()
+        _log_metric_correlations(expr_df, sample_id, label="rp")
 
     # ── Step 9b-caveat: Flag weak translational selection ─────────────────
     # If the dual-anchor analysis determined that translational selection is
