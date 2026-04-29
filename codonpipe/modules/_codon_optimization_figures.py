@@ -41,6 +41,41 @@ def _plt():
         return None
 
 
+def _gene_labels(
+    df: pd.DataFrame,
+    *,
+    max_chars: int = 55,
+    gene_col: str = "gene",
+    definition_col: str = "KO_definition",
+) -> list[str]:
+    """Return one label per row, preferring KO_definition over the gene id.
+
+    Per-gene figures previously labelled the y-axis with bare locus tags
+    (``GUT184460_00009``), which carry no biological information for a
+    reader skimming the panel. When a KofamScan annotation is available
+    the function uses ``KO_definition`` (e.g. ``"30S ribosomal protein
+    S12"``) and appends the locus tag in parentheses for traceability;
+    otherwise it falls back to the locus tag alone. Long descriptions
+    are truncated with an ellipsis so they don't overflow the panel.
+    """
+    labels: list[str] = []
+    has_def = definition_col in df.columns
+    for _, row in df.iterrows():
+        gid = str(row.get(gene_col, "")).strip() or "(unknown)"
+        definition = str(row.get(definition_col, "")).strip() if has_def else ""
+        # pandas reads NA as the string "nan" through .astype(str); guard
+        # against that and against empty / quote-only definitions.
+        if definition and definition.lower() not in ("nan", "none", '""', "''"):
+            label = definition.strip('"').strip("'")
+            if len(label) > max_chars:
+                label = label[: max_chars - 1].rstrip() + "…"
+            label = f"{label}  ({gid})"
+        else:
+            label = gid
+        labels.append(label)
+    return labels
+
+
 def render_three_way_rscu(
     output_dir: Path,
     sample_id: str,
@@ -419,7 +454,11 @@ def render_optimization_gain_vs_genome(
         axC.barh(ypos, df_sorted["gain_mahal_vs_genome"],
                  color="#2ca02c", edgecolor="black", linewidth=0.4)
         axC.set_yticks(ypos)
-        axC.set_yticklabels(df_sorted["gene"].astype(str), fontsize=7)
+        # Label with KO_definition (human readable, e.g.
+        # "30S ribosomal protein S12") when available; fall back to the
+        # bare locus tag for genes without a KO assignment. Long
+        # definitions are truncated so they don't overflow the panel.
+        axC.set_yticklabels(_gene_labels(df_sorted), fontsize=7)
         axC.axvline(0, color="black", linewidth=0.5)
         axC.set_xlabel("CAI gain (cai_mahal − cai_genome)")
         axC.set_title(
@@ -551,7 +590,9 @@ def render_optimization_gain(
         axC.barh(ypos, df_sorted["gain_mahal_minus_rp"],
                  color="#2ca02c", edgecolor="black", linewidth=0.4)
         axC.set_yticks(ypos)
-        axC.set_yticklabels(df_sorted["gene"].astype(str), fontsize=7)
+        # Label with KO_definition when available (see _gene_labels for
+        # the fallback policy).
+        axC.set_yticklabels(_gene_labels(df_sorted), fontsize=7)
         axC.axvline(0, color="black", linewidth=0.5)
         axC.set_xlabel("CBI gain (cbi_mahal − cbi_rp)")
         axC.set_title(f"C. Top {len(df_sorted)} genes most improved by Mahal optimization",
