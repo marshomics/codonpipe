@@ -65,6 +65,16 @@ from codonpipe.utils.io import check_tool, get_output_subdir, run_cmd
 logger = logging.getLogger("codonpipe")
 
 
+# Minimum reference set size below which CAI / MELP / Fop weight
+# estimates are too noisy to trust. The 15-gene floor follows the
+# guidance in Sharp & Li (1987) and is the smallest count that produces
+# stable RSCU_max estimates per amino acid family across replicate
+# samples drawn from the same genome. Below this threshold, every
+# downstream metric inherits sampling noise that cannot be undone by
+# more bootstrapping.
+_MIN_REFERENCE_GENES = 15
+
+
 _EXPRESSION_R_TEMPLATE = r"""
 library(coRdon)
 library(Biostrings)
@@ -170,7 +180,11 @@ def run_expression_analysis(
     expr_dir.mkdir(parents=True, exist_ok=True)
     outputs = {}
 
-    # Check that ribosomal protein IDs file is non-empty
+    # Check that ribosomal protein IDs file is non-empty and large
+    # enough for stable w_i estimation. Reference sets below
+    # _MIN_REFERENCE_GENES produce noisy RSCU_max values that cascade
+    # through every metric, and skipping the analysis is preferable to
+    # publishing a number whose error bars dominate the signal.
     rp_ids = [l.strip() for l in rp_ids_file.read_text().splitlines() if l.strip()]
     if not rp_ids:
         logger.warning(
@@ -179,7 +193,18 @@ def run_expression_analysis(
             "This genome may lack ribosomal protein annotations.", sample_id,
         )
         outputs["_skipped"] = "no_rp_ids"
-        return outputs
+        return outputs, None
+    if len(rp_ids) < _MIN_REFERENCE_GENES:
+        logger.warning(
+            "Reference set for %s has only %d genes (< %d). RSCU_max "
+            "estimates per amino acid family will be unstable; skipping "
+            "expression analysis. To override, supply a curated reference "
+            "set with at least %d genes.",
+            sample_id, len(rp_ids), _MIN_REFERENCE_GENES, _MIN_REFERENCE_GENES,
+        )
+        outputs["_skipped"] = "rp_set_too_small"
+        outputs["_n_reference_genes"] = len(rp_ids)
+        return outputs, None
 
     # Use temporary directory for per-metric coRdon outputs
     with tempfile.TemporaryDirectory() as tmpdir:
