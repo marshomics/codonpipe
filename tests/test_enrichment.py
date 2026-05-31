@@ -216,3 +216,105 @@ class TestExpressionClassification:
         vals = pd.Series([np.nan, np.nan, np.nan])
         classes = _classify_by_percentile(vals)
         assert (classes == "unknown").all()
+
+
+class TestMelpDegenerateFallback:
+    """expression_class must fall back from a saturated MELP to a metric whose
+    high/low tiers are populated.
+
+    MELP clips to the coRdon non-negative floor (Supek & Smuc 2010). In high-GC
+    genomes such as B. subtilis most genes sit at exactly 0, so the 10th and
+    90th percentiles coincide and _classify_by_percentile collapses every gene
+    to 'medium'. A degenerate expression_class silently breaks every downstream
+    tier analysis (MELP/COG enrichment, tier delta-RSCU). The old logic only
+    fell back when MELP was *absent*; these tests lock in fallback when MELP is
+    present but degenerate.
+    """
+
+    def test_is_degenerate_flags_saturated_column(self):
+        from codonpipe.modules.expression import _is_degenerate_class
+
+        # All-medium (no high, no low) -> degenerate.
+        saturated = pd.Series(["medium"] * 50)
+        assert _is_degenerate_class(saturated) is True
+
+        # Missing only the low tier is still unusable for tier contrast.
+        no_low = pd.Series(["high"] * 5 + ["medium"] * 45)
+        assert _is_degenerate_class(no_low) is True
+
+        # Empty / all-unknown -> degenerate.
+        assert _is_degenerate_class(pd.Series([], dtype=object)) is True
+        assert _is_degenerate_class(pd.Series(["unknown"] * 10)) is True
+
+    def test_healthy_column_not_degenerate(self):
+        from codonpipe.modules.expression import _is_degenerate_class
+
+        healthy = pd.Series(["high"] * 10 + ["medium"] * 80 + ["low"] * 10)
+        assert _is_degenerate_class(healthy) is False
+
+    def test_combine_falls_back_to_cai_when_melp_saturated(self, tmp_path):
+        """End-to-end: a saturated MELP score column makes expression_class use
+        CAI tiers, restoring populated high/low tiers."""
+        from codonpipe.modules.expression import _combine_expression
+        from codonpipe.utils.codon_tables import (
+            COL_GENE, COL_WIDTH, COL_EXPRESSION_CLASS,
+            COL_MELP_CLASS, COL_CAI_CLASS,
+        )
+
+        n = 100
+        genes = [f"g{i:03d}" for i in range(n)]
+        widths = [300] * n
+        # MELP saturated: every gene at the coRdon floor -> degenerate tiers.
+        melp_scores = [0.0] * n
+        # CAI spans a real range -> populated high/low tiers.
+        cai_scores = [i / (n - 1) for i in range(n)]
+        # Fop also saturated, to prove the fallback stops at CAI (priority order).
+        fop_scores = [0.0] * n
+
+        melp_path = tmp_path / "melp.tsv"
+        cai_path = tmp_path / "cai.tsv"
+        fop_path = tmp_path / "fop.tsv"
+        pd.DataFrame({COL_GENE: genes, COL_WIDTH: widths, "MILC": melp_scores}).to_csv(
+            melp_path, sep="\t", index=False)
+        pd.DataFrame({COL_GENE: genes, "CAI": cai_scores}).to_csv(
+            cai_path, sep="\t", index=False)
+        pd.DataFrame({COL_GENE: genes, "Fop": fop_scores}).to_csv(
+            fop_path, sep="\t", index=False)
+
+        combined = _combine_expression(melp_path, cai_path, fop_path, "testsample")
+
+        # MELP tiers degenerate, CAI tiers healthy.
+        assert (combined[COL_MELP_CLASS] == "medium").all()
+        assert (combined[COL_CAI_CLASS] == "high").any()
+        assert (combined[COL_CAI_CLASS] == "low").any()
+
+        # expression_class should now equal CAI tiers, NOT the saturated MELP.
+        assert (combined[COL_EXPRESSION_CLASS] == combined[COL_CAI_CLASS]).all()
+        assert (combined[COL_EXPRESSION_CLASS] == "high").any()
+        assert (combined[COL_EXPRESSION_CLASS] == "low").any()
+
+    def test_combine_prefers_melp_when_healthy(self, tmp_path):
+        """When MELP tiers are populated, expression_class stays on MELP."""
+        from codonpipe.modules.expression import _combine_expression
+        from codonpipe.utils.codon_tables import (
+            COL_GENE, COL_WIDTH, COL_EXPRESSION_CLASS, COL_MELP_CLASS,
+        )
+
+        n = 100
+        genes = [f"g{i:03d}" for i in range(n)]
+        melp_scores = [i / (n - 1) for i in range(n)]   # real range
+        cai_scores = [i / (n - 1) for i in range(n)]
+
+        melp_path = tmp_path / "melp.tsv"
+        cai_path = tmp_path / "cai.tsv"
+        fop_path = tmp_path / "fop.tsv"
+        pd.DataFrame({COL_GENE: genes, COL_WIDTH: [300] * n, "MILC": melp_scores}).to_csv(
+            melp_path, sep="\t", index=False)
+        pd.DataFrame({COL_GENE: genes, "CAI": cai_scores}).to_csv(
+            cai_path, sep="\t", index=False)
+        pd.DataFrame({COL_GENE: genes, "Fop": cai_scores}).to_csv(
+            fop_path, sep="\t", index=False)
+
+        combined = _combine_expression(melp_path, cai_path, fop_path, "testsample")
+        assert (combined[COL_EXPRESSION_CLASS] == combined[COL_MELP_CLASS]).all()
+        assert (combined[COL_EXPRESSION_CLASS] == "high").any()

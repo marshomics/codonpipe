@@ -484,6 +484,27 @@ def _rename_score_column(df: pd.DataFrame, target_name: str) -> pd.DataFrame:
     return df
 
 
+def _is_degenerate_class(class_series: pd.Series) -> bool:
+    """True when an expression-tier column cannot discriminate expression.
+
+    A tier column is usable for the downstream tier analyses (pathway/COG
+    enrichment, tier delta-RSCU) only if it actually contains a high tier AND a
+    low tier. When a metric saturates (e.g. MELP clipped to the coRdon floor for
+    most genes), the percentile classifier collapses everything into "medium",
+    leaving no contrast. Treat such a column as degenerate so the caller can
+    fall back to a metric whose tiers are populated.
+    """
+    if class_series is None or len(class_series) == 0:
+        return True
+    labels = class_series.astype(str)
+    real = labels[~labels.isin(["unknown", "nan"])]
+    if real.empty:
+        return True
+    counts = real.value_counts()
+    # Needs both a high and a low tier to be useful for tier-contrast analyses.
+    return ("high" not in counts.index) or ("low" not in counts.index)
+
+
 def _combine_expression(
     melp_path: Path, cai_path: Path, fop_path: Path, sample_id: str,
 ) -> pd.DataFrame:
@@ -539,9 +560,46 @@ def _combine_expression(
             combined[f"{metric}_class"] = _classify_by_percentile(combined[metric])
 
     # Primary expression class: prefer MELP (more robust in high-GC organisms),
-    # fall back to CAI if MELP unavailable
-    if COL_MELP_CLASS in combined.columns:
+    # then CAI, then Fop. A metric is only usable here if its class column is
+    # NOT degenerate. MELP saturates at the coRdon non-negative floor (Supek &
+    # Smuc 2010); when most genes sit below the reference baseline (observed:
+    # B. subtilis, ~91% of MELP values exactly 0), the 10th/90th percentiles
+    # collapse and every gene is labelled "medium". That leaves no high/low
+    # tiers, which silently breaks every downstream tier analysis (MELP
+    # enrichment, COG enrichment, expression/MELP delta-RSCU). The old logic
+    # only fell back when MELP was *absent*, not when it was present but
+    # degenerate, so it never recovered. Fall back to the next metric whose
+    # tiers are actually populated.
+    _class_priority = [
+        (COL_MELP_CLASS, "MELP"),
+        (COL_CAI_CLASS, "CAI"),
+        (COL_FOP_CLASS, "Fop"),
+    ]
+    _chosen_col, _chosen_name = None, None
+    for _col, _name in _class_priority:
+        if _col in combined.columns and not _is_degenerate_class(combined[_col]):
+            _chosen_col, _chosen_name = _col, _name
+            break
+
+    if _chosen_col is not None:
+        combined[COL_EXPRESSION_CLASS] = combined[_chosen_col]
+        if _chosen_name != "MELP" and COL_MELP_CLASS in combined.columns:
+            logger.warning(
+                "[%s] expression_class falls back to %s tiers: the preferred "
+                "MELP tiers are degenerate (saturated at the coRdon floor), so "
+                "MELP cannot discriminate expression here. Downstream tier "
+                "analyses (enrichment, delta-RSCU) now use %s.",
+                sample_id, _chosen_name, _chosen_name,
+            )
+    elif COL_MELP_CLASS in combined.columns:
+        # All metrics degenerate: keep MELP labels (all 'medium') rather than
+        # inventing tiers, but make the situation explicit.
         combined[COL_EXPRESSION_CLASS] = combined[COL_MELP_CLASS]
+        logger.warning(
+            "[%s] expression_class is degenerate for every metric "
+            "(MELP/CAI/Fop); no high/low tiers could be formed. Tier-based "
+            "analyses will be skipped.", sample_id,
+        )
     elif COL_CAI_CLASS in combined.columns:
         combined[COL_EXPRESSION_CLASS] = combined[COL_CAI_CLASS]
     else:
