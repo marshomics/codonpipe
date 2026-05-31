@@ -17,6 +17,9 @@ from codonpipe.modules.advanced_analyses import (
     compute_rscu_distance,
     compute_trna_codon_correlation,
     extract_trna_counts_from_gff,
+    _explicit_valid_anticodon,
+    _infer_anticodon_from_sequence,
+    _normalize_trna_aa,
     _reverse_complement,
 )
 from codonpipe.utils.codon_tables import RSCU_COLUMN_NAMES
@@ -245,6 +248,110 @@ class TestTRNA:
             assert not result.empty
             assert "tRNA_copy_number" in result.columns
             assert "rscu_all_genes" in result.columns
+
+
+def _trna_gene_with_anticodon(anticodon_dna: str, length: int = 76) -> str:
+    """Synthetic tRNA gene: the anticodon at the canonical index 33, padded with
+    C so no other amino-acid-consistent triplet falls in the search window."""
+    pad = "C" * 33
+    tail = "C" * (length - 33 - 3)
+    return pad + anticodon_dna + tail
+
+
+class TestTRNANcbiAnnotations:
+    """NCBI/RefSeq GFFs put only the amino acid in product= (e.g.
+    product=tRNA-Ile) and sometimes a wrong anticodon in the Note. The parser
+    must recover the anticodon from the genome sequence and override bad Notes,
+    while still trusting Prokka's inline anticodons."""
+
+    def test_normalize_trna_aa(self):
+        assert _normalize_trna_aa("Ile") == "Ile"
+        assert _normalize_trna_aa("fMet") == "Met"
+        assert _normalize_trna_aa("Ile2") == "Ile"   # strip isoacceptor suffix
+        assert _normalize_trna_aa("OTHER") is None
+        assert _normalize_trna_aa("Xaa") is None
+        assert _normalize_trna_aa("") is None
+
+    def test_explicit_valid_anticodon_accepts_consistent(self):
+        # TGC decodes Ala (Watson-Crick GCA) -> accepted.
+        assert _explicit_valid_anticodon("product=tRNA-Ala(TGC)", "Ala") == "TGC"
+        # anticodon= attribute form.
+        assert _explicit_valid_anticodon("anticodon=tgc;x=1", "Ala") == "TGC"
+
+    def test_explicit_valid_anticodon_rejects_inconsistent(self):
+        # AGC decodes Ala, not Arg -> rejected (real NCBI annotation error).
+        assert _explicit_valid_anticodon("product=tRNA-Arg(AGC)", "Arg") is None
+        # GAU/GAT does not decode Tyr -> rejected.
+        assert _explicit_valid_anticodon("transfer RNA-Tyr(GAU)", "Tyr") is None
+
+    def test_infer_anticodon_from_sequence(self):
+        gene = _trna_gene_with_anticodon("TGC")        # Ala anticodon at idx 33
+        assert _infer_anticodon_from_sequence(gene, "Ala") == "TGC"
+        # Amino-acid constraint: Trp's only anticodon (CCA) is absent from this
+        # poly-C + TGC gene, so no spurious match is returned.
+        assert _infer_anticodon_from_sequence(gene, "Trp") is None
+
+    def test_amino_acid_only_recovered_from_genome(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            gene = _trna_gene_with_anticodon("TGC")
+            (tmp / "genome.fasta").write_text(f">chr1\n{gene}\n")
+            gff = tmp / "x.gff"
+            gff.write_text(
+                "##gff-version 3\n"
+                f"chr1\tRefSeq\ttRNA\t1\t{len(gene)}\t.\t+\t.\t"
+                "ID=t1;product=tRNA-Ala\n"   # amino acid only, no anticodon
+            )
+            df = extract_trna_counts_from_gff(gff, genome_fasta=tmp / "genome.fasta")
+            assert not df.empty
+            assert set(df["anticodon"]) == {"TGC"}
+            assert (df["amino_acid"] == "Ala").all()
+
+    def test_wrong_note_overridden_by_genome(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            gene = _trna_gene_with_anticodon("ACG")    # true Arg anticodon
+            (tmp / "g.fasta").write_text(f">chr1\n{gene}\n")
+            gff = tmp / "x.gff"
+            gff.write_text(
+                "##gff-version 3\n"
+                f"chr1\tRefSeq\ttRNA\t1\t{len(gene)}\t.\t+\t.\t"
+                "ID=t1;product=tRNA-Arg;Note=transfer RNA-Arg(AGC)\n"  # AGC is wrong
+            )
+            df = extract_trna_counts_from_gff(gff, genome_fasta=tmp / "g.fasta")
+            anticodons = set(df["anticodon"])
+            assert "ACG" in anticodons       # genome-inferred, correct
+            assert "AGC" not in anticodons   # bad Note rejected
+
+    def test_embedded_fasta_used_when_no_genome_arg(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            gene = _trna_gene_with_anticodon("TGC")
+            gff = tmp / "x.gff"
+            gff.write_text(
+                "##gff-version 3\n"
+                f"chr1\tProkka\ttRNA\t1\t{len(gene)}\t.\t+\t.\t"
+                "ID=t1;product=tRNA-Ala\n"
+                "##FASTA\n"
+                f">chr1\n{gene}\n"
+            )
+            df = extract_trna_counts_from_gff(gff)   # no genome_fasta arg
+            assert set(df["anticodon"]) == {"TGC"}
+
+    def test_minus_strand_inference(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            gene = _trna_gene_with_anticodon("TGC")      # sense strand
+            contig = _reverse_complement(gene)           # store on the - strand
+            (tmp / "g.fasta").write_text(f">chr1\n{contig}\n")
+            gff = tmp / "x.gff"
+            gff.write_text(
+                "##gff-version 3\n"
+                f"chr1\tRefSeq\ttRNA\t1\t{len(contig)}\t.\t-\t.\t"
+                "ID=t1;product=tRNA-Ala\n"
+            )
+            df = extract_trna_counts_from_gff(gff, genome_fasta=tmp / "g.fasta")
+            assert set(df["anticodon"]) == {"TGC"}
 
 
 class TestReverseComplement:

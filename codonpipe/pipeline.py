@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from codonpipe.modules.prokka import run_prokka
+from codonpipe.modules.prokka import deduplicate_annotation_files, run_prokka
 from codonpipe.modules.cogclassifier import run_cogclassifier, extract_ribosomal_proteins
 from codonpipe.modules.kofamscan import run_kofamscan, parse_kofamscan, annotate_with_kofam
 from codonpipe.modules.rscu import (
@@ -320,6 +320,14 @@ def run_single_genome(
     faa_path = prokka_out["faa"]
     ffn_path = prokka_out["ffn"]
 
+    # Guard against non-unique gene IDs in external annotations (NCBI/RefSeq
+    # frameshift/readthrough products share a locus tag). Duplicate IDs crash
+    # KofamScan and corrupt every per-gene join; dedupe before anything reads
+    # these files. No-op for Prokka (unique locus tags).
+    faa_path, ffn_path = deduplicate_annotation_files(
+        faa_path, ffn_path, output_dir, sample_id,
+    )
+
     # ── Step 2: COGclassifier ───────────────────────────────────────────
     logger.info("[Step 2/12] Running COGclassifier for ribosomal protein identification")
     cog_result = run_cogclassifier(faa_path, output_dir, sample_id, cpus=cpus, force=force)
@@ -579,6 +587,7 @@ def run_single_genome(
             encprime_df=encprime_df,
             gff_path=resolved_gff,
             cog_result_tsv=all_outputs.get("cog_result"),
+            genome_fasta=genome_fasta,
         )
         # Separate DataFrames from file paths for plotting
         for key, val in adv_outputs.items():

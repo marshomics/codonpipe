@@ -196,6 +196,101 @@ def _collect_outputs(prokka_dir: Path, sample_id: str) -> dict[str, Path]:
     return outputs
 
 
+def _fasta_has_duplicate_ids(path: Path) -> bool:
+    """True if any sequence ID (first whitespace-delimited header token) repeats."""
+    seen: set[str] = set()
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith(">"):
+                gid = line[1:].split()[0]
+                if gid in seen:
+                    return True
+                seen.add(gid)
+    return False
+
+
+def _dedupe_fasta_keep_longest(src: Path, dst: Path) -> list[str]:
+    """Copy *src* to *dst* keeping one record per sequence ID.
+
+    When an ID repeats, the longest record is retained (the full-length primary
+    product of a frameshift/readthrough locus), and first-seen order is
+    preserved. Returns the sorted list of IDs that had duplicates.
+    """
+    order: list[str] = []
+    best: dict[str, tuple[int, list[str]]] = {}
+    duplicated: set[str] = set()
+
+    gid: str | None = None
+    buf: list[str] = []
+
+    def _commit(gid: str | None, buf: list[str]) -> None:
+        if gid is None:
+            return
+        seq_len = sum(len(line.strip()) for line in buf[1:])
+        if gid not in best:
+            best[gid] = (seq_len, buf)
+            order.append(gid)
+        else:
+            duplicated.add(gid)
+            if seq_len > best[gid][0]:
+                best[gid] = (seq_len, buf)
+
+    with open(src) as fin:
+        for line in fin:
+            if line.startswith(">"):
+                _commit(gid, buf)
+                gid = line[1:].split()[0]
+                buf = [line]
+            else:
+                buf.append(line)
+        _commit(gid, buf)
+
+    with open(dst, "w") as fout:
+        for g in order:
+            fout.writelines(best[g][1])
+
+    return sorted(duplicated)
+
+
+def deduplicate_annotation_files(
+    faa_path: Path, ffn_path: Path, output_dir: Path, sample_id: str,
+) -> tuple[Path, Path]:
+    """Ensure the per-gene protein/CDS files have unique sequence IDs.
+
+    External annotations (NCBI/RefSeq) can assign one locus tag to two CDS:
+    genes with a programmed ribosomal frameshift or stop-codon readthrough emit
+    two products under a single tag (e.g. dnaX/b0470 -> tau and gamma; prfB).
+    Duplicate IDs make KofamScan abort ("Non-unique query name") and become
+    duplicate pandas index labels downstream, which produces a Cartesian blow-up
+    when the expression metrics are merged on the gene column, ragged ``.loc``
+    arrays ("inhomogeneous shape"), and gene-track/plot length mismatches.
+
+    When duplicates are present, sanitized copies with the longest record per ID
+    are written and their paths returned. Prokka assigns unique locus tags, so
+    this is a no-op for Prokka output (original paths returned unchanged).
+    """
+    faa_dup = _fasta_has_duplicate_ids(faa_path)
+    ffn_dup = _fasta_has_duplicate_ids(ffn_path)
+    if not faa_dup and not ffn_dup:
+        return faa_path, ffn_path
+
+    annot_dir = get_output_subdir(output_dir, "annotation")
+    new_faa = annot_dir / f"{sample_id}_dedup.faa"
+    new_ffn = annot_dir / f"{sample_id}_dedup.ffn"
+    dropped_faa = _dedupe_fasta_keep_longest(faa_path, new_faa)
+    dropped_ffn = _dedupe_fasta_keep_longest(ffn_path, new_ffn)
+    dropped = sorted(set(dropped_faa) | set(dropped_ffn))
+
+    logger.warning(
+        "Annotation has %d duplicate gene ID(s) (e.g. %s) — one locus tag on "
+        "multiple CDS (frameshift/readthrough products). Per-gene tables require "
+        "unique IDs, so the longest record per ID is kept and sanitized copies "
+        "are used: %s, %s.",
+        len(dropped), ", ".join(dropped[:6]) or "n/a", new_faa.name, new_ffn.name,
+    )
+    return new_faa, new_ffn
+
+
 def _validate_outputs(outputs: dict[str, Path], sample_id: str) -> None:
     """Validate that critical Prokka outputs exist and are non-empty."""
     critical = ["faa", "ffn"]
