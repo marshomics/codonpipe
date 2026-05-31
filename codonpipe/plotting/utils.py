@@ -40,6 +40,12 @@ STYLE_PARAMS = {
     "axes.linewidth": 0.8,
     "xtick.major.width": 0.6,
     "ytick.major.width": 0.6,
+    # Dense vector figures (e.g. the codon-similarity network, which draws
+    # thousands of edges as a single Path) overflow Agg's default cell-block
+    # limit and fail to render with "Exceeded cell block limit in Agg.  Please
+    # set ... agg.path.chunksize". Splitting the path into chunks lets these
+    # large plots rasterise. 10000 is matplotlib's own recommended value.
+    "agg.path.chunksize": 10000,
 }
 
 
@@ -47,6 +53,16 @@ def apply_style() -> None:
     """Apply publication-quality matplotlib style."""
     plt.rcParams.update(STYLE_PARAMS)
     sns.set_style("whitegrid", {"grid.linestyle": "--", "grid.alpha": 0.3})
+    # A few figures mix constrained-layout-incompatible Axes (3-D panels, inset
+    # colourbars) with a fig.tight_layout() call, which emits a cosmetic
+    # "not compatible with tight_layout" UserWarning without affecting the
+    # output. Silence just that message so it does not clutter run logs.
+    import warnings
+    warnings.filterwarnings(
+        "ignore",
+        message=".*not compatible with tight_layout.*",
+        category=UserWarning,
+    )
 
 
 def save_fig(

@@ -1235,14 +1235,41 @@ def quantify_translational_selection(
                 all_fop_vals.append(fop_val)
                 all_metric_vals.append(metric_lookup[gene_id])
 
-        if len(all_fop_vals) >= 10:
+        # Drop non-finite pairs before correlating. Fop is NaN whenever a gene
+        # has no optimal-codon-bearing positions, and the expression metric can
+        # be NaN; when (e.g. under heavy MELP-floor saturation) an entire array
+        # is NaN, some SciPy versions raise "Encountered all NA values" rather
+        # than returning NaN, which previously aborted the whole translational-
+        # selection analysis and silently dropped the Fop-gradient and
+        # position-effect outputs. Clean first, require enough finite pairs and
+        # non-zero variance, and pass nan_policy="omit" for safety.
+        _m = np.asarray(all_metric_vals, dtype=float)
+        _f = np.asarray(all_fop_vals, dtype=float)
+        _ok = np.isfinite(_m) & np.isfinite(_f)
+        _n_ok = int(_ok.sum())
+        if _n_ok >= 10 and np.nanstd(_m[_ok]) > 0 and np.nanstd(_f[_ok]) > 0:
             from scipy.stats import spearmanr
-            spearman_rho, spearman_p = spearmanr(all_metric_vals, all_fop_vals)
-            fop_gradient_df.attrs["spearman_rho"] = round(spearman_rho, 4)
-            fop_gradient_df.attrs["spearman_p"] = spearman_p
-            fop_gradient_df.attrs["expression_metric"] = metric
-            logger.info("%s-Fop Spearman correlation: rho=%.4f, p=%.2e",
-                        metric, spearman_rho, spearman_p)
+            spearman_rho, spearman_p = spearmanr(
+                _m[_ok], _f[_ok], nan_policy="omit"
+            )
+            if np.isfinite(spearman_rho):
+                fop_gradient_df.attrs["spearman_rho"] = round(float(spearman_rho), 4)
+                fop_gradient_df.attrs["spearman_p"] = float(spearman_p)
+                fop_gradient_df.attrs["expression_metric"] = metric
+                logger.info("%s-Fop Spearman correlation: rho=%.4f, p=%.2e",
+                            metric, spearman_rho, spearman_p)
+            else:
+                logger.info(
+                    "SKIPPED: %s-Fop correlation (degenerate values after "
+                    "cleaning; %d finite pairs)", metric, _n_ok,
+                )
+        else:
+            logger.info(
+                "SKIPPED: %s-Fop correlation (only %d finite metric/Fop pairs "
+                "with non-zero variance; need >= 10). Often expected when the "
+                "expression metric is heavily floor-saturated (e.g. MELP).",
+                metric, _n_ok,
+            )
 
     # --- C. Within-gene codon position effects ---
     # Reuse cached sequences from initial parse instead of re-reading the FASTA.

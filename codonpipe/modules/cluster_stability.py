@@ -57,6 +57,87 @@ _CLUSTER_STABLE_JACCARD = 0.75      # Hennig: >=0.75 = valid, stable cluster
 _CLUSTER_DISSOLVED_JACCARD = 0.60   # Hennig: <0.60 = dissolved / not a real cluster
 _CLUSTER_VALIDATION_BOOTSTRAPS = 100
 
+# ── Gap-based RP-cluster boundary ───────────────────────────────────────────
+# A fixed chi-squared quantile (the old _CLUSTER_CHI2_P=0.95 boundary) is too
+# tight for a well-separated RP cohort: it cuts through the cohort and excludes
+# legitimate members, while the genome's distant RP outliers sit far beyond.
+# The RP genes' own Mahalanobis-distance distribution, however, typically shows
+# a clear *gap* between the compact translational-optimum cohort and the
+# scattered outliers (verified on real data: B. subtilis RP distances run
+# ~0.5-3.9 then jump to 5.6+). We therefore cut at the largest gap in the
+# cleaned RP distances, with guards:
+#   floor   = chi2 p90  -> never cut inside the dense core
+#   ceiling = chi2 p999 -> never run out into the genomic bulk ...
+#   EXCEPT a single wide, clean gap may push the boundary past the ceiling, up
+#   to the gap, because a wide separation is itself strong evidence of a real
+#   cohort/outlier boundary (this is what recovers the full B. subtilis cohort).
+_GAP_FLOOR_CHI2_P = 0.90
+_GAP_CEIL_CHI2_P = 0.999
+# A gap qualifies as "wide/clean" (allowed to override the chi-squared ceiling)
+# when it is at least this multiple of the median spacing between consecutive
+# RP distances below it — i.e. a genuine discontinuity, not ordinary scatter.
+_GAP_OVERRIDE_RATIO = 3.0
+# Absolute safety cap on the override, as a chi-squared quantile: even a huge
+# gap cannot push the boundary past this (prevents a pathological RP set from
+# producing a genome-spanning cluster).
+_GAP_OVERRIDE_HARD_CEIL_CHI2_P = 0.99999
+
+
+def _gap_boundary(rp_distances, n_axes):
+    """Largest-gap RP-cluster boundary with chi-squared guards.
+
+    Cuts the cleaned RP Mahalanobis distances at their largest interior gap so
+    the boundary sits between the compact RP cohort and the distant outliers,
+    rather than at an arbitrary fixed quantile. Returns (threshold, info).
+
+    The search for the largest gap is restricted to the band
+    [chi2 p90, chi2 p999]; a sufficiently wide, clean gap (>= _GAP_OVERRIDE_RATIO
+    times the local median spacing) is allowed to extend the boundary above the
+    p999 ceiling, up to the gap itself but never past chi2 p99999.
+    """
+    d = np.sort(np.asarray(rp_distances, float))
+    d = d[np.isfinite(d)]
+    floor = _chi2_threshold(n_axes, _GAP_FLOOR_CHI2_P)
+    ceil = _chi2_threshold(n_axes, _GAP_CEIL_CHI2_P)
+    hard_ceil = _chi2_threshold(n_axes, _GAP_OVERRIDE_HARD_CEIL_CHI2_P)
+    if d.size < 4:
+        return float(min(ceil, max(floor, _chi2_threshold(n_axes, _CLUSTER_CHI2_P)))), {
+            "method": "chi2_fallback_small_rp", "n_rp": int(d.size)}
+
+    spacings = np.diff(d)
+    med_spacing = float(np.median(spacings)) if spacings.size else 0.0
+
+    # Candidate cut points: lower edge of each gap, considered if it lies in the
+    # band OR forms a wide/clean gap (which may sit at/above the ceiling).
+    best_cut, best_gap, overrode = None, -1.0, False
+    for i in range(d.size - 1):
+        lo = float(d[i])
+        gap = float(d[i + 1] - lo)
+        wide = med_spacing > 0 and gap >= _GAP_OVERRIDE_RATIO * med_spacing
+        in_band = floor <= lo <= ceil
+        # allow override only for a genuinely wide gap whose lower edge is past
+        # the floor (i.e. outside the dense core) and not already deep in noise
+        override_ok = wide and lo >= floor and lo <= hard_ceil
+        if (in_band or override_ok) and gap > best_gap:
+            best_gap, best_cut = gap, lo
+            overrode = override_ok and lo > ceil
+
+    if best_cut is None:
+        # No qualifying gap: fall back to the chi-squared p99 boundary, bounded.
+        thr = float(np.clip(_chi2_threshold(n_axes, 0.99), floor, ceil))
+        return thr, {"method": "chi2_p99_no_gap", "n_rp": int(d.size),
+                     "floor": round(floor, 3), "ceil": round(ceil, 3)}
+
+    thr = float(min(best_cut, hard_ceil))
+    return thr, {
+        "method": "largest_gap_override" if overrode else "largest_gap_in_band",
+        "n_rp": int(d.size), "gap_width": round(best_gap, 3),
+        "median_spacing": round(med_spacing, 4),
+        "floor": round(floor, 3), "ceil": round(ceil, 3),
+        "overrode_ceiling": bool(overrode),
+        "rp_below_threshold": int((d <= thr).sum()),
+    }
+
 
 def _jaccard_index(a: set, b: set) -> float:
     """Jaccard similarity |a∩b| / |a∪b| (0 when both empty)."""
@@ -333,7 +414,14 @@ def _bootstrap_rp_reference(
     )
 
     distances = _compute_mahalanobis_distances(X, centroid, cov_inv)
-    threshold = _chi2_threshold(n_axes, _CLUSTER_CHI2_P)
+    # Largest-gap boundary on this replicate's RP-gene distances, rather than a
+    # fixed chi-squared quantile. The cut is computed from the unique resampled
+    # (in-bag) RP genes — the cohort the centroid was actually fit on — so the
+    # boundary lands in the gap between the compact RP cohort and the distant
+    # outliers, recovering legitimate cohort members the p95 cut excluded while
+    # still keeping the far outliers out.
+    rp_dist_inbag = distances[np.unique(boot_rp_idx)]
+    threshold, _ = _gap_boundary(rp_dist_inbag, n_axes)
     opt_mask = distances <= threshold
 
     # Out-of-bag recovery: which RP indices were NEVER drawn this round?

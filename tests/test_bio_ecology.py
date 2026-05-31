@@ -229,6 +229,44 @@ class TestTranslationalSelection:
         assert result["fop_gradient"].empty
         assert result["position_effects"].empty
 
+    def test_floor_saturated_metric_does_not_crash(self, tmp_path):
+        # Regression: a real E. coli run failed with "Encountered all NA values"
+        # because ~49% of MELP was floor-saturated at 0, which under some SciPy
+        # versions made the metric/Fop Spearman correlation raise rather than
+        # return NaN — aborting the whole analysis and silently dropping the
+        # Fop-gradient and position-effect outputs. The function must instead
+        # complete and return the three keys (correlation skipped gracefully).
+        n = 100
+        rscu_df = _make_rscu_gene_df(n)
+        enc_df = _make_enc_df(n)
+        ffn = _write_fasta(tmp_path, n)
+        rng = np.random.default_rng(7)
+        melp = np.zeros(n)              # mostly floor-saturated, like the real run
+        melp[-8:] = rng.uniform(1.0, 3.0, 8)
+        expr_df = pd.DataFrame({
+            "gene": [f"gene_{i:04d}" for i in range(n)],
+            "MELP": melp,
+            "CAI": rng.uniform(0.1, 0.9, n),
+            "expression_class": (["low"] * 92 + ["high"] * 8),
+        })
+        # Must not raise.
+        result = quantify_translational_selection(rscu_df, enc_df, expr_df, ffn)
+        assert set(result) >= {"optimal_codons", "fop_gradient", "position_effects"}
+
+    def test_all_nan_metric_does_not_crash(self, tmp_path):
+        # The extreme case: the chosen expression metric is entirely NaN.
+        n = 60
+        rscu_df = _make_rscu_gene_df(n)
+        enc_df = _make_enc_df(n)
+        ffn = _write_fasta(tmp_path, n)
+        expr_df = pd.DataFrame({
+            "gene": [f"gene_{i:04d}" for i in range(n)],
+            "MELP": [np.nan] * n,
+            "expression_class": (["low"] * 54 + ["high"] * 6),
+        })
+        result = quantify_translational_selection(rscu_df, enc_df, expr_df, ffn)
+        assert set(result) >= {"optimal_codons", "fop_gradient", "position_effects"}
+
 
 # ── Phage/Mobile Element Detection ────────────────────────────────────────
 

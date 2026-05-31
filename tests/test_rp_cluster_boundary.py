@@ -77,3 +77,50 @@ class TestBootstrapBoundary:
         # The bootstrap path depends on the single-shot dense-core helper;
         # guard against the import being dropped.
         assert hasattr(CS, "_select_rp_dense_core")
+
+
+class TestGapBoundary:
+    """The RP boundary cuts at the largest gap between the compact cohort and
+    the distant outliers, rather than at a fixed chi-squared quantile."""
+
+    def test_cuts_at_cohort_outlier_gap(self):
+        # Compact cohort 0.5-3.9, then a clear jump to 5.6+ (the outliers).
+        cohort = np.linspace(0.5, 3.9, 40)
+        outliers = np.array([5.6, 6.0, 7.1, 8.2, 9.5, 11.0, 12.3])
+        d = np.concatenate([cohort, outliers])
+        thr, info = CS._gap_boundary(d, n_axes=3)
+        # The boundary must sit in the gap (between 3.9 and 5.6), keeping the
+        # whole cohort and excluding every outlier.
+        assert 3.9 <= thr < 5.6, f"threshold {thr} not in the cohort/outlier gap"
+        assert int((d <= thr).sum()) == len(cohort)
+
+    def test_wide_gap_can_override_chi2_ceiling(self):
+        import numpy as np
+        from codonpipe.modules.cluster_stability import _chi2_threshold
+        ceil = _chi2_threshold(3, CS._GAP_CEIL_CHI2_P)
+        # Put the cohort/outlier gap ABOVE the chi-squared p999 ceiling so the
+        # override path is exercised; the cohort still ends just past the ceiling.
+        cohort = np.linspace(0.5, ceil + 0.6, 45)
+        outliers = np.array([ceil + 5.0, ceil + 7.0, ceil + 9.0])
+        d = np.concatenate([cohort, outliers])
+        thr, info = CS._gap_boundary(d, n_axes=3)
+        assert thr > ceil, "a wide gap above the ceiling should extend the boundary"
+        assert thr <= _chi2_threshold(3, CS._GAP_OVERRIDE_HARD_CEIL_CHI2_P)
+        assert int((d <= thr).sum()) == len(cohort)
+
+    def test_no_clean_gap_stays_bounded(self):
+        import numpy as np
+        from codonpipe.modules.cluster_stability import _chi2_threshold
+        # Smoothly decaying distances with no discontinuity: the boundary must
+        # not run away; it stays within [floor, ceil].
+        d = np.sort(np.abs(np.random.default_rng(0).normal(2.0, 1.0, 60)))
+        thr, info = CS._gap_boundary(d, n_axes=3)
+        floor = _chi2_threshold(3, CS._GAP_FLOOR_CHI2_P)
+        hard = _chi2_threshold(3, CS._GAP_OVERRIDE_HARD_CEIL_CHI2_P)
+        assert floor <= thr <= hard
+
+    def test_small_rp_set_falls_back_to_chi2(self):
+        d = np.array([1.0, 1.5, 2.0])  # < 4 points
+        thr, info = CS._gap_boundary(d, n_axes=3)
+        assert info["method"] == "chi2_fallback_small_rp"
+        assert np.isfinite(thr) and thr > 0

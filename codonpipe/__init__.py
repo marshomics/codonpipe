@@ -19,6 +19,19 @@ _os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")   # 3 = errors only (hide IN
 _os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 _os.environ.setdefault("GLOG_minloglevel", "2")
 _os.environ.setdefault("KMP_WARNINGS", "0")
+# The CUDA-driver probe in TensorFlow's cudart_stub.cc writes
+#   "Could not find cuda drivers ... GPU will not be used"
+# (preceded by the "All log messages before absl::InitializeLog()" banner)
+# straight to stderr *before* absl reads TF_CPP_MIN_LOG_LEVEL, so the level
+# vars above do not suppress that specific line. The probe is triggered
+# transitively (e.g. umap-learn -> numba -> a TensorFlow-backed dependency)
+# during the plotting stage. Telling the process there are no visible CUDA
+# devices makes the stub skip the probe entirely — correct here, since
+# CodonPipe does no GPU compute. Only set when the user has not already chosen
+# a GPU configuration, so an intentional GPU setup is preserved.
+if "CUDA_VISIBLE_DEVICES" not in _os.environ:
+    _os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+_os.environ.setdefault("TF_CPP_MIN_VLOG_LEVEL", "3")
 del _os
 
 __version__ = "0.1.0"
