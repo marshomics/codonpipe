@@ -92,6 +92,23 @@ _RP_EMPIRICAL_PCTL = 90            # RP cluster: 90th percentile of cleaned RP d
 _RP_SUBCLUSTER_MIN = 15
 _RP_SUBCLUSTER_MAX_K = 4
 _RP_SUBCLUSTER_MIN_FRAC = 0.12
+# Minimum size for an RP sub-cluster to be FIT as an independent anchor.
+# The fitter selects a dense core (~top 50% by density) and bootstraps its
+# covariance; a fragment below this size yields a core of only a few, often
+# near-identical, points, whose covariance is rank-deficient and produces an
+# uninterpretable Mahalanobis reference (and noisy per-replicate logging).
+# Such fragments are still reported in the split diagnostics but are not fit
+# independently. Set at 2× the robust-covariance sample floor (2·_MIN_RP_FOR_ROBUST)
+# so the dense core clears that floor. If no fragment qualifies, the whole RP
+# set is fit as a single anchor (the un-split fallback).
+_RP_SUBCLUSTER_MIN_FIT = 2 * _MIN_RP_FOR_ROBUST
+
+# Module flag: True while resampling inside _bootstrap_rp_centroid. The
+# covariance helpers (_safe_inv, _fit_robust_rp_reference) consult it to log
+# expected small-sample / rank-deficiency events at DEBUG instead of
+# INFO/WARNING/ERROR, since per-replicate degeneracy during a bootstrap is
+# normal and the summary is logged once after the loop.
+_IN_BOOTSTRAP = False
 
 # Density-peak detection
 _DENSITY_KDE_BANDWIDTH = "scott"
@@ -152,16 +169,30 @@ def _safe_inv(mat: np.ndarray, rcond: float = 1e-10) -> np.ndarray:
         eigvals, eigvecs = np.linalg.eigh(mat)
         max_eig = float(np.max(eigvals)) if eigvals.size else 0.0
         if max_eig <= 0:
-            logger.error(
-                "Covariance has no positive eigenvalues; returning identity. "
-                "Mahalanobis distances for this genome are not interpretable.",
-            )
+            # During bootstrap resampling a degenerate replicate is expected
+            # and discarded; log it at DEBUG. Outside the bootstrap this is a
+            # genome-level failure worth an ERROR.
+            if _IN_BOOTSTRAP:
+                logger.debug(
+                    "Bootstrap replicate: covariance has no positive "
+                    "eigenvalues; returning identity (replicate contributes "
+                    "nothing to the centroid mean).",
+                )
+            else:
+                logger.error(
+                    "Covariance has no positive eigenvalues; returning identity. "
+                    "Mahalanobis distances for this genome are not interpretable.",
+                )
             _safe_inv.last_rank = 0
             return np.eye(mat.shape[0])
         keep = eigvals > rcond * max_eig
         n_kept = int(keep.sum())
         if n_kept < mat.shape[0]:
-            logger.warning(
+            # Rank deficiency in a single bootstrap replicate is expected for a
+            # small/tight cohort; report at DEBUG while resampling, WARNING
+            # otherwise (where it affects the genome's reported HGT df).
+            _log = logger.debug if _IN_BOOTSTRAP else logger.warning
+            _log(
                 "Singular covariance: keeping %d/%d eigenvectors "
                 "(condition number > %.0e). Chi-squared thresholds will "
                 "use df = %d, not df = %d. Treat HGT calls for this "
@@ -291,7 +322,10 @@ def _fit_robust_rp_reference(
     min_for_mcd = max(min_rp, 2 * n_axes + 3)
 
     if n_rp < max(min_rp, 2 * n_axes + 3):
-        logger.info(
+        # Routine small-sample fallback. Fires once per bootstrap replicate, so
+        # log at DEBUG while resampling to avoid flooding the log; INFO outside.
+        _log = logger.debug if _IN_BOOTSTRAP else logger.info
+        _log(
             "Only %d reference genes (< %d); using empirical covariance",
             n_rp, max(min_rp, 2 * n_axes + 3),
         )
@@ -892,12 +926,22 @@ def _bootstrap_rp_centroid(
     centroids = []
     covs = []
 
-    for b in range(n_bootstraps):
-        boot_idx = rng.choice(n_rp, size=n_rp, replace=True)
-        X_boot = X_rp[boot_idx]
-        c, cv, _, _ = _fit_robust_rp_reference(X_boot, n_axes)
-        centroids.append(c)
-        covs.append(cv)
+    # Mark that we are resampling, so the covariance helpers log expected
+    # per-replicate small-sample / rank-deficiency events at DEBUG rather than
+    # flooding the log with INFO/WARNING/ERROR (the summary is logged once
+    # after the loop). Restored in finally so an exception can't leave it set.
+    global _IN_BOOTSTRAP
+    _prev_in_bootstrap = _IN_BOOTSTRAP
+    _IN_BOOTSTRAP = True
+    try:
+        for b in range(n_bootstraps):
+            boot_idx = rng.choice(n_rp, size=n_rp, replace=True)
+            X_boot = X_rp[boot_idx]
+            c, cv, _, _ = _fit_robust_rp_reference(X_boot, n_axes)
+            centroids.append(c)
+            covs.append(cv)
+    finally:
+        _IN_BOOTSTRAP = _prev_in_bootstrap
 
     mean_centroid = np.mean(centroids, axis=0)
     mean_cov = np.mean(covs, axis=0)
@@ -1473,16 +1517,51 @@ def run_mahal_clustering(
 
     # Detect RP sub-populations
     rp_subclusters = _detect_rp_subclusters(X_rp, rp_ids_list)
+
+    # Only fit sub-clusters large enough to support a stable dense-core
+    # covariance (see _RP_SUBCLUSTER_MIN_FIT). Smaller fragments yield a
+    # rank-deficient covariance and an uninterpretable Mahalanobis reference;
+    # they are kept in the diagnostics below but are not fit as independent
+    # anchors. If filtering leaves nothing (e.g. a small RP set split into
+    # several tiny fragments), fall back to fitting the entire RP set as a
+    # single anchor — the same behaviour as when no split is detected.
+    fittable = [sc for sc in rp_subclusters if sc["n"] >= _RP_SUBCLUSTER_MIN_FIT]
+    n_skipped = len(rp_subclusters) - len(fittable)
+    if not fittable:
+        fittable = [{
+            "X": X_rp,
+            "gene_ids": rp_ids_list,
+            "label": 0,
+            "n": len(rp_ids_list),
+            "avg_dist": 0.0,
+            "n_dims_used": int(X_rp.shape[1]),
+        }]
+        if len(rp_subclusters) > 1:
+            logger.info(
+                "All %d RP sub-cluster(s) below the fit threshold (%d genes); "
+                "fitting the full RP set (%d genes) as a single anchor.",
+                len(rp_subclusters), _RP_SUBCLUSTER_MIN_FIT, len(rp_ids_list),
+            )
+    elif n_skipped:
+        logger.info(
+            "Fitting %d/%d RP sub-cluster(s); %d below the %d-gene fit "
+            "threshold and skipped (kept in diagnostics, not fit).",
+            len(fittable), len(rp_subclusters), n_skipped, _RP_SUBCLUSTER_MIN_FIT,
+        )
+
     results["rp_subcluster_diagnostics"] = {
         "split_detected": len(rp_subclusters) > 1,
         "n_subclusters": len(rp_subclusters),
         "subcluster_sizes": [sc["n"] for sc in rp_subclusters],
+        "n_subclusters_fit": len(fittable),
+        "n_subclusters_skipped_small": n_skipped,
+        "min_fit_size": _RP_SUBCLUSTER_MIN_FIT,
         "all_subclusters": rp_subclusters,
     }
 
-    # Fit each RP sub-cluster independently
+    # Fit each fittable RP sub-cluster independently
     rp_fits = []
-    for sc_idx, sc in enumerate(rp_subclusters):
+    for sc_idx, sc in enumerate(fittable):
         X_sc = sc["X"]
         sc_ids = set(sc["gene_ids"])
 
