@@ -6,6 +6,7 @@ import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from codonpipe.modules.prokka import run_prokka
@@ -699,6 +700,9 @@ def run_single_genome(
     # codon-optimization / HGT downstream, so we keep the chi2 cluster and
     # warn the user.
     _MIN_CORE_FOR_OVERRIDE = 30
+    # A translationally-optimized RP core should occupy a small fraction of the
+    # genome. Above this fraction the consensus core is flagged over-inclusive.
+    _CORE_OVERINCLUSION_FRAC = 0.35
     stability_core_ids = stability_results.get("core_gene_ids")
     stability_core_rscu = stability_results.get("core_rscu")
     stability_core_ids_path = stability_results.get("core_ids_path")
@@ -748,17 +752,35 @@ def run_single_genome(
                 if not _summ.empty:
                     _gd = mahal_results.get("mahal_gene_distances")
                     _core_set = set(stability_core_ids)
+                    # Effective boundary = the distance at which a gene sits at
+                    # the edge of the consensus core. The 95th percentile (not
+                    # max) of core-gene distances is reported, so a single
+                    # outlier in the core cannot misreport the boundary as a
+                    # huge number (the previous .max() produced e.g. 26 in a
+                    # 2-axis space where chi-squared p99 is ~3).
                     _eff = None
                     if _gd is not None:
                         _cd = _gd.loc[_gd.index.isin(_core_set)]
                         if not _cd.empty:
-                            _eff = round(float(_cd.max()), 4)
+                            _eff = round(float(np.percentile(_cd.values, 95)), 4)
+                    # Over-inclusion QC: a translationally-optimized RP core
+                    # should be a small fraction of the genome. If the consensus
+                    # core still spans a large share, the RP anchor is unreliable
+                    # here (often a low-dimensional COA space where RP genes do
+                    # not separate from the bulk). Flag it in the persisted
+                    # record and warn, rather than silently shipping a bloated
+                    # "optimized set".
+                    _n_total = int(_summ.loc[0, "n_genes"]) if "n_genes" in _summ.columns else None
+                    _core_frac = (len(stability_core_ids) / _n_total) if _n_total else float("nan")
+                    _over = bool(np.isfinite(_core_frac) and _core_frac > _CORE_OVERINCLUSION_FRAC)
                     _summ.loc[0, "threshold_method"] = "bootstrap_consensus"
                     _summ.loc[0, "boundary_method"] = "bootstrap"
                     _summ.loc[0, "membership_frequency_threshold"] = stability_core_threshold
                     _summ.loc[0, "n_bootstraps"] = stability_bootstraps
                     _summ.loc[0, "rp_cluster_size"] = len(stability_core_ids)
                     _summ.loc[0, "rscu_pooling"] = "frequency-weighted"
+                    _summ.loc[0, "core_frac_genome"] = round(_core_frac, 4) if np.isfinite(_core_frac) else None
+                    _summ.loc[0, "core_over_inclusive"] = _over
                     if _eff is not None:
                         _summ.loc[0, "mahalanobis_threshold"] = _eff
                     _summ.to_csv(_summary_path, sep="\t", index=False)
@@ -769,6 +791,16 @@ def run_single_genome(
                         len(stability_core_ids),
                         f", effective threshold={_eff}" if _eff is not None else "",
                     )
+                    if _over:
+                        logger.warning(
+                            "Bootstrap consensus core spans %.0f%% of the genome "
+                            "(%d/%s genes) - larger than expected for a "
+                            "translationally-optimized RP core. The RP anchor may "
+                            "be unreliable for this genome (e.g. low-dimensional "
+                            "COA where RP genes do not separate); treat the "
+                            "optimized set and its downstream products with caution.",
+                            100 * _core_frac, len(stability_core_ids), _n_total,
+                        )
             except Exception as e:
                 logger.warning(
                     "Could not rewrite mahal summary for bootstrap core: %s", e

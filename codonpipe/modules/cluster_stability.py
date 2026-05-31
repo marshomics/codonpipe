@@ -27,6 +27,8 @@ from codonpipe.modules.mahal_clustering import (
     _compute_mahalanobis_distances,
     _fit_robust_rp_reference,
     _select_n_axes,
+    _select_rp_dense_core,
+    _detect_rp_subclusters,
     _compute_cluster_rscu,
     _chi2_threshold,
     _MAX_COA_AXES,
@@ -36,6 +38,164 @@ from codonpipe.modules.mahal_clustering import (
     _MIN_RP_FOR_ROBUST,
     _CLUSTER_CHI2_P,
 )
+
+# ── RP sub-cluster stability validation (Hennig 2007) ───────────────────────
+# When a genome's ribosomal-protein genes form two or more distinct
+# populations in COA space (e.g. a canonical RP cohort plus an HGT- or
+# paralogy-derived secondary cohort with non-canonical codon usage), the
+# bootstrap consensus must NOT pool them — pooling produces a centroid and
+# covariance averaged across biologically different references. We therefore
+# (1) detect candidate sub-clusters once on the full RP set via GMM+BIC, then
+# (2) validate each candidate by clusterwise bootstrap stability (the Jaccard
+# resampling of Hennig 2007, "Cluster-wise assessment of cluster stability",
+# the method behind R's fpc::clusterboot). A candidate counts as a genuine
+# cluster only if its mean maximum-Jaccard to the best-matching bootstrap
+# sub-cluster meets _CLUSTER_STABLE_JACCARD; below _CLUSTER_DISSOLVED_JACCARD
+# it is treated as dissolved (noise). The matching step is what makes this
+# robust to label switching across resamples.
+_CLUSTER_STABLE_JACCARD = 0.75      # Hennig: >=0.75 = valid, stable cluster
+_CLUSTER_DISSOLVED_JACCARD = 0.60   # Hennig: <0.60 = dissolved / not a real cluster
+_CLUSTER_VALIDATION_BOOTSTRAPS = 100
+
+
+def _jaccard_index(a: set, b: set) -> float:
+    """Jaccard similarity |a∩b| / |a∪b| (0 when both empty)."""
+    if not a and not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def _validate_rp_subclusters(
+    X_rp: np.ndarray,
+    rp_ids_list: list[str],
+    n_boot: int = _CLUSTER_VALIDATION_BOOTSTRAPS,
+    seed: int = 0,
+) -> list[dict]:
+    """Validate RP sub-clusters by clusterwise Jaccard bootstrap (Hennig 2007).
+
+    Reference partition is the GMM+BIC split from ``_detect_rp_subclusters``.
+    For each of ``n_boot`` resamples of the RP genes (with replacement), the
+    RP set is re-clustered and every *reference* sub-cluster is matched to the
+    bootstrap sub-cluster with which it shares the largest Jaccard index; that
+    maximum Jaccard is recorded. A reference cluster's stability is the mean of
+    these recorded maxima. Clusters with mean Jaccard >= _CLUSTER_STABLE_JACCARD
+    are genuine; this distinguishes two (or more) real RP clusters from one
+    cluster plus outliers, because an outlier pocket does not recur coherently
+    across resamples and dissolves (mean Jaccard < _CLUSTER_DISSOLVED_JACCARD).
+
+    Returns the reference sub-cluster list with three keys added to each:
+      mean_jaccard, jaccard_sd, stability_label ("stable"/"uncertain"/"dissolved").
+    Sorted by descending mean_jaccard, then size.
+    """
+    ref = _detect_rp_subclusters(X_rp, rp_ids_list)
+    if len(ref) <= 1:
+        # No split: single population. Still report its self-stability so the
+        # downstream record is uniform, but no matching is needed.
+        for c in ref:
+            c["mean_jaccard"] = 1.0
+            c["jaccard_sd"] = 0.0
+            c["stability_label"] = "stable"
+        return ref
+
+    ref_sets = [set(c["gene_ids"]) for c in ref]
+    per_cluster_jacc = [[] for _ in ref]
+    id_to_row = {gid: i for i, gid in enumerate(rp_ids_list)}
+    n_rp = len(rp_ids_list)
+    rng = np.random.RandomState(seed)
+
+    for _ in range(n_boot):
+        boot_rows = rng.choice(n_rp, size=n_rp, replace=True)
+        uniq = np.unique(boot_rows)
+        X_b = X_rp[uniq]
+        ids_b = [rp_ids_list[i] for i in uniq]
+        boot_sub = _detect_rp_subclusters(X_b, ids_b)
+        boot_sets = [set(c["gene_ids"]) for c in boot_sub]
+        for ci, rset in enumerate(ref_sets):
+            # Best Jaccard between this reference cluster (restricted to genes
+            # present in the resample, the standard Hennig restriction) and any
+            # bootstrap cluster.
+            rset_in = rset & set(ids_b)
+            best = max((_jaccard_index(rset_in, bset) for bset in boot_sets),
+                       default=0.0)
+            per_cluster_jacc[ci].append(best)
+
+    for ci, c in enumerate(ref):
+        arr = np.array(per_cluster_jacc[ci]) if per_cluster_jacc[ci] else np.array([0.0])
+        mj = float(arr.mean())
+        c["mean_jaccard"] = round(mj, 4)
+        c["jaccard_sd"] = round(float(arr.std()), 4)
+        c["stability_label"] = (
+            "stable" if mj >= _CLUSTER_STABLE_JACCARD
+            else "dissolved" if mj < _CLUSTER_DISSOLVED_JACCARD
+            else "uncertain"
+        )
+
+    ref.sort(key=lambda c: (-c["mean_jaccard"], -c["n"]))
+    return ref
+
+
+def _select_rp_anchor(
+    validated: list[dict],
+    ffn_path: Path | None,
+    rp_rscu_df: pd.DataFrame | None,
+) -> tuple[dict, str]:
+    """Choose which validated RP sub-cluster anchors the optimized core.
+
+    Among sub-clusters that passed stability validation (stability_label !=
+    "dissolved"), the anchor is the one whose codon usage most resembles the
+    canonical ribosomal-protein RSCU consensus (highest cosine similarity),
+    with RP-gene count as the tie-breaker. This mirrors the single-shot
+    run_mahal_clustering rule and is the biologically defensible criterion:
+    "the real translational-optimum cluster looks like the host's ribosomal
+    proteins", not merely "the biggest RP cohort" — a secondary HGT/paralog RP
+    cohort can be large but compositionally aberrant. If no RSCU reference is
+    available, falls back to the largest stable cluster.
+
+    Returns (anchor_subcluster, selection_reason).
+    """
+    candidates = [c for c in validated if c.get("stability_label") != "dissolved"]
+    if not candidates:
+        candidates = list(validated)  # all dissolved: keep the best-Jaccard one
+    if len(candidates) == 1:
+        return candidates[0], "single_validated_cluster"
+
+    # RSCU cosine similarity to the RP consensus for each candidate.
+    have_ref = (
+        ffn_path is not None and ffn_path.exists()
+        and rp_rscu_df is not None and not rp_rscu_df.empty
+    )
+    if have_ref:
+        rscu_cols_all = [c for c in RSCU_COLUMN_NAMES if c in rp_rscu_df.columns]
+        rp_consensus = rp_rscu_df[rscu_cols_all].mean() if rscu_cols_all else None
+        for c in candidates:
+            sim = float("nan")
+            try:
+                if rp_consensus is not None and len(c["gene_ids"]) >= 3:
+                    sub_rscu = _compute_cluster_rscu(ffn_path, set(c["gene_ids"]))
+                    shared = [col for col in rscu_cols_all if col in sub_rscu.index]
+                    if shared:
+                        sim = 1.0 - cosine_dist(
+                            sub_rscu[shared].fillna(0).values,
+                            rp_consensus[shared].fillna(0).values,
+                        )
+            except Exception:
+                sim = float("nan")
+            c["rp_cosine_sim"] = round(sim, 4) if sim == sim else None
+        if any(c.get("rp_cosine_sim") is not None for c in candidates):
+            anchor = max(
+                candidates,
+                key=lambda c: (
+                    c["rp_cosine_sim"] if c.get("rp_cosine_sim") is not None else float("-inf"),
+                    c["n"],
+                ),
+            )
+            return anchor, "rscu_consensus_similarity"
+
+    # No usable RSCU reference: fall back to the largest stable cluster.
+    anchor = max(candidates, key=lambda c: c["n"])
+    return anchor, "largest_stable_cluster_fallback"
 from codonpipe.plotting.utils import DPI, FORMATS, STYLE_PARAMS
 from codonpipe.utils.codon_tables import RSCU_COLUMN_NAMES
 
@@ -147,8 +307,29 @@ def _bootstrap_rp_reference(
     boot_rp_idx = rng.choice(rp_indices, size=n_rp, replace=True)
     X_rp = X[boot_rp_idx]
 
+    # Dense-core selection BEFORE fitting covariance — matches the single-shot
+    # RP path (run_mahal_clustering -> _select_rp_dense_core). Without it, a few
+    # compositionally drifted RP genes inflate the resampled covariance; in
+    # low-dimensional COA spaces (e.g. 2 axes) the resulting chi-squared ellipse
+    # is so large it swallows most of the genome, and the membership-frequency
+    # consensus inherits that bloat (observed: B. subtilis 61-83% of genes in
+    # the "RP" cluster). Fitting from the dense core keeps the boundary on the
+    # translationally-optimized RP cloud. Resampling can duplicate rows, so the
+    # 2-D KDE is run on the unique resampled points to stay well-conditioned.
+    uniq_idx = np.unique(boot_rp_idx)
+    X_rp_uniq = X[uniq_idx]
+    _ids_uniq = [str(i) for i in uniq_idx]
+    try:
+        _, core_id_strs, _ = _select_rp_dense_core(X_rp_uniq, _ids_uniq, density_pctl=50)
+        core_set = set(core_id_strs)
+        X_fit = np.array([X[i] for i in uniq_idx if str(i) in core_set])
+        if len(X_fit) < max(3, n_axes + 1):
+            X_fit = X_rp  # fall back to full resample if the core is too small
+    except Exception:
+        X_fit = X_rp
+
     centroid, cov, cov_inv, _ = _fit_robust_rp_reference(
-        X_rp, n_axes, alpha=_RP_OUTLIER_ALPHA, min_rp=_MIN_RP_FOR_ROBUST,
+        X_fit, n_axes, alpha=_RP_OUTLIER_ALPHA, min_rp=_MIN_RP_FOR_ROBUST,
     )
 
     distances = _compute_mahalanobis_distances(X, centroid, cov_inv)
@@ -242,6 +423,74 @@ def run_stability_analysis(
 
     X, coa_gene_ids, rp_indices, n_axes = coa_prep
 
+    # ── RP sub-cluster identification + stability validation ─────────
+    # If the RP genes form more than one population in COA space, validate
+    # each candidate by clusterwise Jaccard bootstrap (Hennig 2007) and anchor
+    # the optimized core on the single stable cluster whose codon usage best
+    # matches the ribosomal-protein RSCU consensus. This prevents the
+    # membership-frequency bootstrap below from pooling biologically distinct
+    # RP cohorts (e.g. canonical RP genes + an HGT/paralog cohort) into one
+    # averaged reference. With a single RP population this is a no-op: the
+    # full RP index set is used, exactly as before.
+    X_rp_all = X[rp_indices]
+    rp_ids_in_coa = [coa_gene_ids[i] for i in rp_indices]
+    anchor_rp_indices = rp_indices
+    subcluster_records: list[dict] = []
+    anchor_reason = "single_rp_population"
+    try:
+        validated = _validate_rp_subclusters(X_rp_all, rp_ids_in_coa)
+        n_real = sum(1 for c in validated if c.get("stability_label") == "stable")
+        subcluster_records = [
+            {
+                "label": c.get("label"),
+                "n_rp": c["n"],
+                "mean_jaccard": c.get("mean_jaccard"),
+                "jaccard_sd": c.get("jaccard_sd"),
+                "stability_label": c.get("stability_label"),
+                "rp_cosine_sim": c.get("rp_cosine_sim"),
+            }
+            for c in validated
+        ]
+        if len(validated) > 1 and n_real >= 2:
+            anchor, anchor_reason = _select_rp_anchor(validated, ffn_path, rp_rscu_df)
+            anchor_ids = set(anchor["gene_ids"])
+            _row_of = {gid: i for i, gid in enumerate(coa_gene_ids)}
+            anchor_rp_indices = np.array(
+                [_row_of[g] for g in anchor_ids if g in _row_of], dtype=int
+            )
+            for c in validated:
+                c["is_anchor"] = (c is anchor)
+            logger.info(
+                "RP cluster identification: %d candidate sub-cluster(s), %d stable "
+                "(Jaccard>=%.2f); anchored on %d-gene cluster (reason=%s, "
+                "cosine=%s). Sub-cluster sizes/Jaccard: %s",
+                len(validated), n_real, _CLUSTER_STABLE_JACCARD,
+                len(anchor_rp_indices), anchor_reason,
+                anchor.get("rp_cosine_sim"),
+                [(c["n"], c.get("mean_jaccard"), c.get("stability_label")) for c in validated],
+            )
+        elif len(validated) > 1:
+            logger.info(
+                "RP sub-cluster split detected (%d candidates) but only %d passed "
+                "stability validation (Jaccard>=%.2f); treating RP genes as a single "
+                "population (no confident second cluster). Sizes/Jaccard: %s",
+                len(validated), n_real, _CLUSTER_STABLE_JACCARD,
+                [(c["n"], c.get("mean_jaccard"), c.get("stability_label")) for c in validated],
+            )
+            anchor_reason = "split_not_stable_pooled"
+    except Exception as e:
+        logger.warning(
+            "RP sub-cluster validation failed (%s); using full RP set as anchor.", e
+        )
+        anchor_rp_indices = rp_indices
+
+    if len(anchor_rp_indices) < 3:
+        anchor_rp_indices = rp_indices  # safety: never anchor on < 3 genes
+
+    results["rp_subcluster_stability"] = subcluster_records
+    results["rp_anchor_reason"] = anchor_reason
+    results["rp_anchor_n_genes"] = int(len(anchor_rp_indices))
+
     # ── Bootstrap ───────────────────────────────────────────────────
     # Each iteration is independent and the result (a set of gene IDs) is
     # cheap to pickle, so this is a textbook joblib loop. We pass the
@@ -258,7 +507,7 @@ def run_stability_analysis(
         # oob_recovery) so the outer loop can report predictive
         # stability alongside internal consistency.
         return _bootstrap_rp_reference(
-            X, coa_gene_ids, rp_indices, n_axes,
+            X, coa_gene_ids, anchor_rp_indices, n_axes,
             multiplier=0.0,  # unused, chi-squared threshold
             seed=idx,
         )
@@ -403,6 +652,16 @@ def run_stability_analysis(
     core_path.write_text("\n".join(sorted(core_ids)) + "\n")
     results["core_ids_path"] = core_path
     results["core_gene_ids"] = core_ids
+
+    # Persist RP sub-cluster identification + stability (Hennig Jaccard) so the
+    # anchor decision is auditable. One row per candidate RP sub-cluster.
+    if subcluster_records:
+        sc_df = pd.DataFrame(subcluster_records)
+        sc_df.insert(0, "sample_id", sample_id)
+        sc_df["anchor_reason"] = anchor_reason
+        sc_path = stab_dir / f"{sample_id}_rp_subcluster_stability.tsv"
+        sc_df.to_csv(sc_path, sep="\t", index=False)
+        results["rp_subcluster_stability_path"] = sc_path
 
     results["membership_frequencies"] = freq
 
