@@ -261,9 +261,30 @@ def run_batch_statistics(
             result_df.to_csv(out_path, sep="\t", index=False)
             outputs[f"{col}_{aa}_wilcoxon"] = out_path
 
-        # Combined results
+        # Combined results. The per-family TSVs above carry a family-local
+        # BH correction (corrected_p_value), which is the right family when
+        # the question is "within this amino acid, which codons differ".
+        # The combined table answers the broader question "across ALL codons,
+        # which differ", so it must carry a correction over the FULL set of
+        # (codon x group-pair) tests, not a concatenation of family-local
+        # corrections. We recompute BH globally here and expose it as
+        # corrected_p_value_global / significant_global, preserving the
+        # original family-local columns for reference.
         if aa_results:
             all_results = pd.concat(aa_results.values(), ignore_index=True)
+            if "p_value" in all_results.columns and not all_results.empty:
+                all_results = all_results.rename(columns={
+                    "corrected_p_value": "corrected_p_value_family",
+                    "significant": "significant_family",
+                })
+                all_results["corrected_p_value_global"] = benjamini_hochberg(
+                    all_results["p_value"].values
+                )
+                # Reuse the per-family alpha used inside pairwise_mannwhitneyu
+                # (default 0.01) for the global significance flag.
+                all_results["significant_global"] = (
+                    all_results["corrected_p_value_global"] < 0.01
+                )
             combined_path = stats_dir / f"{col}_all_wilcoxon.tsv"
             all_results.to_csv(combined_path, sep="\t", index=False)
             outputs[f"{col}_all_wilcoxon"] = combined_path

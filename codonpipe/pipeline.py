@@ -206,6 +206,7 @@ def run_single_genome(
     skip_gsea: bool = False,
     gsea_permutations: int = 1000,
     skip_codon_optimization: bool = False,
+    skip_codon_pair: bool = False,
 ) -> dict[str, Path]:
     """Run the full codon analysis pipeline on a single genome.
 
@@ -728,6 +729,87 @@ def run_single_genome(
                 expr_df[COL_IN_MAHAL_CLUSTER] = expr_df[COL_GENE].isin(stability_core_ids)
             except Exception:
                 pass
+
+        # ── Rewrite the persisted Mahalanobis summary to describe the
+        # consensus core actually used downstream ───────────────────────
+        # run_mahal_clustering wrote _mahal_summary.tsv for the (now
+        # superseded) empirical-p90 RP cluster. In bootstrap mode the
+        # stability consensus core replaces that cluster everywhere
+        # downstream, so the on-disk summary would otherwise misreport the
+        # boundary. Update threshold_method, the effective threshold, and
+        # the cluster size so the persisted record matches what is used.
+        # Per-resample boundary is chi-squared; the core itself is the
+        # membership-frequency consensus over the bootstraps, hence
+        # threshold_method="bootstrap_consensus".
+        _summary_path = mahal_results.get("mahal_summary_path")
+        if _summary_path is not None and Path(_summary_path).exists():
+            try:
+                _summ = pd.read_csv(_summary_path, sep="\t")
+                if not _summ.empty:
+                    _gd = mahal_results.get("mahal_gene_distances")
+                    _core_set = set(stability_core_ids)
+                    _eff = None
+                    if _gd is not None:
+                        _cd = _gd.loc[_gd.index.isin(_core_set)]
+                        if not _cd.empty:
+                            _eff = round(float(_cd.max()), 4)
+                    _summ.loc[0, "threshold_method"] = "bootstrap_consensus"
+                    _summ.loc[0, "boundary_method"] = "bootstrap"
+                    _summ.loc[0, "membership_frequency_threshold"] = stability_core_threshold
+                    _summ.loc[0, "n_bootstraps"] = stability_bootstraps
+                    _summ.loc[0, "rp_cluster_size"] = len(stability_core_ids)
+                    _summ.loc[0, "rscu_pooling"] = "frequency-weighted"
+                    if _eff is not None:
+                        _summ.loc[0, "mahalanobis_threshold"] = _eff
+                    _summ.to_csv(_summary_path, sep="\t", index=False)
+                    logger.info(
+                        "Rewrote %s to describe the bootstrap consensus core "
+                        "(method=bootstrap_consensus, freq>=%.2f, %d genes%s)",
+                        Path(_summary_path).name, stability_core_threshold,
+                        len(stability_core_ids),
+                        f", effective threshold={_eff}" if _eff is not None else "",
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Could not rewrite mahal summary for bootstrap core: %s", e
+                )
+
+        # ── Rewrite the per-gene clusters TSV to describe the consensus core
+        # The clusters table (written by run_mahal_clustering for the superseded
+        # empirical-p90 RP cluster) is what gene-set / signatures / codon-
+        # optimization read back for in_optimized_set and membership_score. In
+        # bootstrap mode its per-gene membership must be rebuilt against the
+        # consensus core, or those tools silently use stale (p90 RP) membership.
+        # membership_score becomes the bootstrap membership frequency (fraction
+        # of resamples inside the chi-squared boundary), the core's defining
+        # quantity.
+        _clusters_path = mahal_results.get("mahal_clusters_path")
+        _membership_freq = stability_results.get("membership_frequencies") or {}
+        if _clusters_path is not None and Path(_clusters_path).exists():
+            try:
+                _cd2 = pd.read_csv(_clusters_path, sep="\t")
+                if not _cd2.empty and "gene" in _cd2.columns:
+                    _in_core = _cd2["gene"].isin(set(stability_core_ids))
+                    if "in_cluster" in _cd2.columns:
+                        _cd2["in_cluster"] = _in_core
+                    _cd2["in_optimized_set"] = _in_core
+                    _cd2["cluster_id"] = _in_core.astype(int)
+                    if _membership_freq:
+                        _cd2["membership_score"] = (
+                            _cd2["gene"].map(_membership_freq).fillna(0.0)
+                        )
+                    _cd2.to_csv(_clusters_path, sep="\t", index=False)
+                    mahal_results["mahal_clusters_df"] = _cd2
+                    logger.info(
+                        "Rewrote %s: in_optimized_set/membership_score now "
+                        "reflect the bootstrap consensus core (%d genes; "
+                        "membership_score = bootstrap membership frequency)",
+                        Path(_clusters_path).name, int(_in_core.sum()),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Could not rewrite clusters TSV for bootstrap core: %s", e
+                )
 
         # ── Recompute dual-anchor categories against stability core ──────
         # The original dual-anchor categories were computed inside
@@ -1359,6 +1441,35 @@ def run_single_genome(
         all_outputs.update(table_outputs)
     except Exception as e:
         logger.warning("Codon usage table generation failed: %s. Continuing.", e, exc_info=True)
+
+    # ── Step 11b: Codon pair bias ─────────────────────────────────────────
+    # Codon-pair scores (Coleman et al. 2008) capture an adjacency-level
+    # constraint independent of single-codon usage: the host CPS table is the
+    # reference a codon-pair-aware optimizer needs, and the per-gene CPB plus
+    # the bridge-dinucleotide confounder table feed the ecological/evolutionary
+    # read. expr_df (when available) enables the high-vs-low CPB tier test.
+    if not skip_codon_pair:
+        logger.info("[Step 11b/13] Computing codon pair bias")
+        try:
+            from codonpipe.modules.codon_pair import run_codon_pair_analysis
+            cpb_outputs = run_codon_pair_analysis(
+                ffn_path=ffn_path,
+                output_dir=output_dir,
+                sample_id=sample_id,
+                expr_df=expr_df,
+                make_figures=True,
+            )
+            for k, v in cpb_outputs.items():
+                if isinstance(v, Path):
+                    all_outputs[f"codon_pair_{k}"] = v
+            logger.info(
+                "[Step 11b/13] Codon pair bias complete: %d output(s)",
+                len(cpb_outputs),
+            )
+        except Exception as e:
+            logger.warning("Codon pair bias analysis failed: %s. Continuing.", e, exc_info=True)
+    else:
+        logger.info("[Step 11b/13] Codon pair bias skipped (--skip-codon-pair)")
 
     # ── Step 12: Codon-optimization comparison ────────────────────────────
     # Produces per-codon comparison of genome / RP / Mahal-cluster reference

@@ -720,12 +720,24 @@ def compute_corpus_cluster_drivers(
     *,
     skip_noise: bool = True,
 ) -> pd.DataFrame:
-    """Per-cluster differential feature analysis: Mann-Whitney U + Cliff's delta.
+    """Per-cluster differential feature DESCRIPTION: Cliff's delta + (biased) MWU.
 
-    For each (cluster, feature) pair, tests whether cluster members differ
-    from the rest of the corpus (excluding HDBSCAN noise points if
-    *skip_noise* is True). Reports BH-corrected p-values globally across
-    the full (cluster × feature) test panel.
+    For each (cluster, feature) pair, computes Cliff's delta (effect size) and
+    a Mann-Whitney U comparing cluster members against the rest of the corpus
+    (excluding HDBSCAN noise if *skip_noise* is True).
+
+    POST-SELECTION-INFERENCE CAVEAT (read before using the p-values).
+    The clusters were produced by HDBSCAN **on these same feature_cols**, so
+    testing those features for cluster-vs-rest differences is circular
+    ("double dipping" / selective inference): the clustering maximises
+    separation, then the test asks whether the groups are separated. The
+    resulting p-values are anti-conservative and a BH correction does NOT fix
+    it (the null is wrong, not just the multiplicity). They are therefore
+    emitted as DESCRIPTIVE ranking aids only, named ``p_value_naive`` /
+    ``p_adjusted_naive`` with an ``inference`` column set to
+    ``"post_selection_biased"``. Use ``cliffs_delta`` as the primary quantity;
+    do not report these p-values as significance. For genuine inference use a
+    data-/count-splitting scheme (cluster on one split, test on the other).
 
     Args:
         corpus_df: Per-genome feature matrix (one row per genome).
@@ -738,8 +750,8 @@ def compute_corpus_cluster_drivers(
 
     Returns:
         DataFrame with: cluster_id, feature, n_in, n_out, median_in,
-        median_out, U_statistic, p_value, cliffs_delta, abs_effect,
-        p_adjusted, significant.
+        median_out, U_statistic, p_value_naive, cliffs_delta, abs_effect,
+        p_adjusted_naive, inference.
         Sorted by (cluster_id ascending, abs_effect descending) so the
         top drivers per cluster appear first.
     """
@@ -784,16 +796,24 @@ def compute_corpus_cluster_drivers(
                 "median_in": float(np.median(x)),
                 "median_out": float(np.median(y)),
                 "U_statistic": float(u),
-                "p_value": float(p),
+                # *_naive: post-selection-biased, descriptive ranking aid only
+                # (clusters were defined on these same features). See docstring.
+                "p_value_naive": float(p),
                 "cliffs_delta": float(d),
                 "abs_effect": float(abs(d)),
             })
 
     if not rows:
         return pd.DataFrame()
+    logger.warning(
+        "Corpus cluster drivers: p-values are post-selection-biased (clusters "
+        "were defined on the same features being tested). Emitted as "
+        "p_value_naive / p_adjusted_naive — rank by cliffs_delta; do not report "
+        "these p-values as significance."
+    )
     out = pd.DataFrame(rows)
-    out["p_adjusted"] = benjamini_hochberg(out["p_value"].values)
-    out["significant"] = out["p_adjusted"] < 0.05
+    out["p_adjusted_naive"] = benjamini_hochberg(out["p_value_naive"].values)
+    out["inference"] = "post_selection_biased"
     return out.sort_values(
         ["cluster_id", "abs_effect"], ascending=[True, False],
     ).reset_index(drop=True)
@@ -1264,10 +1284,23 @@ def build_corpus(
             if ct.shape[0] < 2 or ct.shape[1] < 2:
                 continue
             try:
-                chi2, p, dof, _ = chi2_contingency(ct.values)
+                chi2, p, dof, expected = chi2_contingency(ct.values)
                 # Cramer's V effect size
                 n_chi = ct.values.sum()
                 v = float(np.sqrt(chi2 / (n_chi * (min(ct.shape) - 1)))) if n_chi else float("nan")
+                # Validity check: the chi-squared approximation (hence Cramer's
+                # V) is unreliable when many cells have expected count < 5
+                # (Cochran's rule). Cluster x metadata tables are often sparse,
+                # so flag it rather than silently reporting an upward-biased V.
+                low_exp_frac = float((expected < 5).mean()) if expected.size else 1.0
+                if low_exp_frac > 0.2:
+                    logger.warning(
+                        "Cramer's V / chi-squared for cluster vs '%s': %.0f%% "
+                        "of cells have expected count < 5 (Cochran advises "
+                        "< 20%%). Treat this association's p-value and V as "
+                        "unreliable; consider collapsing rare categories.",
+                        col, 100 * low_exp_frac,
+                    )
                 val_rows.append({
                     "test": f"cluster_vs_{col}",
                     "r": v,
@@ -1394,10 +1427,14 @@ def build_corpus(
         drv_path = output_dir / "corpus_cluster_drivers.tsv"
         drivers_df.to_csv(drv_path, sep="\t", index=False)
         out["corpus_cluster_drivers"] = drv_path
-        n_sig = int(drivers_df["significant"].sum())
+        # Count large-effect drivers (|Cliff's delta| >= 0.474). The p-values
+        # are post-selection-biased, so we summarise by effect size, not
+        # "significance" (see compute_corpus_cluster_drivers docstring).
+        n_large = int((drivers_df["abs_effect"] >= 0.474).sum())
         logger.info(
-            "Cluster drivers: %d / %d (cluster × feature) tests BH-significant; see %s",
-            n_sig, len(drivers_df), drv_path,
+            "Cluster drivers: %d / %d (cluster × feature) pairs have a large "
+            "effect (|Cliff's delta| >= 0.474); p-values are descriptive only. See %s",
+            n_large, len(drivers_df), drv_path,
         )
 
     # Render the five corpus figures

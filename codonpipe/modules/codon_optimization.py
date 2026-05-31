@@ -113,8 +113,10 @@ def build_three_way_codon_table(
 ) -> pd.DataFrame:
     """Per-codon comparison of genome / RP / Mahal-cluster RSCU and w-values.
 
-    One row per RSCU column (38 independent codons via the project's
-    Ser/Leu/Arg-split convention). Columns:
+    One row per sense-codon RSCU column (59 columns under the project's
+    Ser/Leu/Arg-split convention; the 59 columns carry 38 independent
+    degrees of freedom because each amino-acid family's RSCU sums to its
+    degeneracy). Columns:
         amino_acid, family, codon, codon_col,
         genome_rscu, rp_rscu, mahal_rscu,
         rp_w, mahal_w,

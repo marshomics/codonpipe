@@ -468,7 +468,12 @@ def _aitchison_perm_test(
                 )
             else:
                 idx = rng_local.choice(len(bg_X_local), size=n_goi, replace=False)
-            sampled_mean = bg_X_local[idx].mean(axis=0)
+            # Use nanmean to match the observed GOI mean (pandas .mean() is
+            # skipna=True). Per-gene RSCU legitimately carries NaN for
+            # unobserved amino-acid families; a plain np.mean would propagate
+            # those NaNs and push extra codons to the clr_transform floor,
+            # inflating null distances asymmetrically relative to the observed.
+            sampled_mean = np.nanmean(bg_X_local[idx], axis=0)
             return float(np.linalg.norm(_clr_transform(sampled_mean) - ref_clr))
 
         # Use the seed from the outer rng so a serial run with the same

@@ -1,7 +1,18 @@
 """Pre-ranked Gene Set Enrichment Analysis for codon usage data.
 
 Implements the weighted Kolmogorov-Smirnov statistic from Subramanian et al.
-(2003) with permutation-based significance testing.  Designed for microbial
+(2003) with permutation-based significance testing.
+
+NULL MODEL (read before interpreting p / NES / FDR). The permutation null here
+is the GENE-SET (a.k.a. competitive) permutation: the gene-set membership mask
+is shuffled across a FIXED ranking. This is the correct and only option for a
+single pre-ranked list (there are no phenotype labels to permute), but it does
+NOT preserve gene-gene correlation the way Subramanian's phenotype-permutation
+null does, so the resulting p-values, NES, and FDR are competitive-null
+quantities and are mildly anti-conservative under inter-gene correlation. Read
+them as "is this set enriched relative to the rest of the ranked list", not as
+phenotype-permutation significance. A correlation-aware alternative (e.g. rank
+rotation) would be needed for a stricter test.  Designed for microbial
 genomes where annotation coverage is typically sparse.
 
 Gene set sources

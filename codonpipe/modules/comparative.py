@@ -879,9 +879,23 @@ def permanova_rscu(
 
     Returns dict with F_statistic, p_value, R2, n_perm, distance ("aitchison").
     """
-    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in metrics_df.columns]
-    if not rscu_cols or condition_col not in metrics_df.columns:
+    rscu_cols_full = [c for c in RSCU_COLUMN_NAMES if c in metrics_df.columns]
+    if not rscu_cols_full or condition_col not in metrics_df.columns:
         return {}
+
+    # Reduce to the independent codon set (drop one codon per amino-acid
+    # family) BEFORE the CLR / Aitchison distance. RSCU is not one composition
+    # over 59 codons — it is ~18 per-family compositions, each summing to its
+    # degeneracy. CLR over the full 59-vector mixes families in the
+    # geometric-mean centering and operates on a rank-deficient matrix. The
+    # 38 independent dimensions match the Aitchison treatment used by the
+    # gene-set and corpus signatures, so the PERMANOVA distance is consistent
+    # with the rest of the pipeline. Uses the canonical helper (imported
+    # lazily to avoid any module-load import cycle).
+    from codonpipe.modules.gene_set import _drop_redundant_codon_per_family
+    rscu_cols = _drop_redundant_codon_per_family(rscu_cols_full)
+    if len(rscu_cols) < 2:
+        rscu_cols = rscu_cols_full
 
     df = metrics_df.dropna(subset=[condition_col])
     conditions = df[condition_col].values

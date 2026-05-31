@@ -76,7 +76,9 @@ tryCatch({
     width_df <- data.frame(width = width(fasta))
 
     result <- cbind(scores_df, names_df, width_df)
-    result <- subset(result, width > min_len)
+    # Use >= to match the Python-side filter (>= MIN_GENE_LENGTH is kept);
+    # a strict '>' dropped genes of exactly min_len nt that Python keeps.
+    result <- subset(result, width >= min_len)
 
     if (nrow(result) == 0) {
         message("ERROR: No genes passed the minimum length filter (min_len=", min_len, ")")

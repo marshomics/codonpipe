@@ -113,6 +113,11 @@ def main():
                    "13-step per-genome pipeline; output goes to "
                    "<sample_dir>/codon_optimization/. Skipping doesn't "
                    "affect any other step.")
+@click.option("--skip-codon-pair", is_flag=True,
+              help="Skip the codon pair bias step (Coleman et al. 2008 codon-pair "
+                   "scores + bridge-dinucleotide confounder). Step 11b; output "
+                   "goes to <sample_dir>/codon_usage/codon_pair/. Skipping "
+                   "doesn't affect any other step.")
 @click.option("--mahal-min-k", type=int, default=2, show_default=True,
               help="Minimum number of Mahalanobis clustering components to test.")
 @click.option("--mahal-max-k", type=int, default=8, show_default=True,
@@ -192,6 +197,7 @@ def run(
     skip_gsea: bool,
     gsea_permutations: int,
     skip_codon_optimization: bool,
+    skip_codon_pair: bool,
     mahal_min_k: int,
     mahal_max_k: int,
     mahal_distance_multiplier: float,
@@ -269,6 +275,7 @@ def run(
             skip_gsea=skip_gsea,
             gsea_permutations=gsea_permutations,
             skip_codon_optimization=skip_codon_optimization,
+            skip_codon_pair=skip_codon_pair,
             mahal_min_k=mahal_min_k,
             mahal_max_k=mahal_max_k,
             mahal_distance_multiplier=mahal_distance_multiplier,
@@ -319,6 +326,8 @@ def run(
               help="Number of permutations for GSEA p-value estimation.")
 @click.option("--skip-codon-optimization", is_flag=True,
               help="Skip the codon-optimization comparison step (Step 12).")
+@click.option("--skip-codon-pair", is_flag=True,
+              help="Skip the codon pair bias step (Step 11b).")
 @click.option("--mahal-min-k", type=int, default=2, show_default=True,
               help="Minimum number of Mahalanobis clustering components to test.")
 @click.option("--mahal-max-k", type=int, default=8, show_default=True,
@@ -394,6 +403,7 @@ def batch(
     skip_gsea: bool,
     gsea_permutations: int,
     skip_codon_optimization: bool,
+    skip_codon_pair: bool,
     force: bool,
     verbose: bool,
     log_file: Path | None,
@@ -478,6 +488,7 @@ def batch(
             skip_gsea=skip_gsea,
             gsea_permutations=gsea_permutations,
             skip_codon_optimization=skip_codon_optimization,
+            skip_codon_pair=skip_codon_pair,
         )
         logger.info("Batch analysis complete. %d output files.", len(outputs))
     except Exception as e:

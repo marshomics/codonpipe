@@ -429,9 +429,17 @@ def hypergeometric_enrichment(
             "will fall back to bare ko##### IDs",
         )
 
-    # Population sizes: use all genes, not just those with pathway annotations
-    M = len(background_kos)
-    N = len(test_kos)
+    # Population sizes: restrict to the pathway-annotated universe, not all
+    # annotated genes. Many KOs map to zero pathways; counting them in M (and
+    # N) inflates the population relative to the quantity the pathway-level
+    # hypergeometric actually conditions on, which deflates p-values and
+    # over-calls enrichment. The standard universe for pathway over-
+    # representation is "genes assigned to at least one pathway" — and that is
+    # exactly what the docstring specifies. n (pathway size) and k (test hits
+    # in pathway) are already counted within this universe by construction.
+    annotated_bg = {ko for ko in background_kos if ko_pathway_map.get(ko)}
+    M = len(annotated_bg)
+    N = len({ko for ko in test_kos if ko in annotated_bg})
 
     if M == 0 or N == 0:
         return pd.DataFrame()

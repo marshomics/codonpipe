@@ -721,15 +721,32 @@ def detect_hgt_candidates(
         n_features = X.shape[1]
         pca_applied = True
 
-    # Compute robust covariance via LedoitWolf
+    # Compute robust covariance via LedoitWolf. Capture the shrinkage
+    # intensity and the covariance condition number so the regularisation of
+    # this n_features-dimensional covariance is auditable: shrinkage in [0,1]
+    # (higher = more pull toward a scaled identity), condition number = ratio
+    # of largest to smallest eigenvalue (lower = better conditioned). These are
+    # surfaced as cov_shrinkage / cov_condition_number columns so a reviewer
+    # can confirm the (typically 38-d) covariance was actually invertible.
     try:
-        lw = LedoitWolf()
-        cov, _ = lw.fit(X).covariance_, lw.shrinkage_
+        lw = LedoitWolf().fit(X)
+        cov = lw.covariance_
+        shrinkage = float(lw.shrinkage_)
         cov_inv = np.linalg.pinv(cov)
+        cov_cond = float(np.linalg.cond(cov))
     except Exception as e:
         logger.warning("Covariance estimation failed (%s); using standard covariance", e)
         cov = np.cov(X.T)
         cov_inv = np.linalg.pinv(cov)
+        shrinkage = float("nan")
+        cov_cond = float(np.linalg.cond(cov))
+    logger.info(
+        "HGT Mahalanobis: %d-d covariance, Ledoit-Wolf shrinkage=%s, "
+        "condition number=%.1f",
+        n_features,
+        ("%.3f" % shrinkage) if shrinkage == shrinkage else "N/A (empirical cov)",
+        cov_cond,
+    )
 
     # Reference centroid: Mahalanobis cluster RSCU if provided, else genome mean
     if reference_rscu is not None:
@@ -737,8 +754,11 @@ def detect_hgt_candidates(
         # Align to the same RSCU column order used in X
         ref_vals = np.array([ref_series.get(c, np.nan) for c in rscu_cols])
         if np.any(np.isnan(ref_vals)):
-            # Fill missing codons with genome mean for those positions
-            genome_mean = X.mean(axis=0) if not pca_applied else rscu_gene_df[rscu_cols].values.mean(axis=0)
+            # Fill missing codons with genome mean for those positions.
+            # The PCA branch reads the raw (unfiltered) RSCU matrix, which
+            # still contains NaN rows dropped from X by valid_mask; use
+            # nanmean so a single NaN doesn't poison the reference centroid.
+            genome_mean = X.mean(axis=0) if not pca_applied else np.nanmean(rscu_gene_df[rscu_cols].values, axis=0)
             nan_mask = np.isnan(ref_vals)
             ref_vals[nan_mask] = genome_mean[nan_mask]
         # If PCA was applied, project reference into PCA space
@@ -852,6 +872,15 @@ def detect_hgt_candidates(
         "sensitivity": sensitivity,
         "fdr_alpha": fdr_alpha,
         "adaptive_cutoff": adaptive_cutoff,
+        # Dimensionality + regularisation diagnostics (constant per run) so the
+        # 38-d covariance behind these distances is auditable: n_features is the
+        # independent codon dimensionality (59 - 21 = 38 in the normal path,
+        # fewer only if PCA reduction kicked in for a tiny genome); cov_shrinkage
+        # is the Ledoit-Wolf intensity; cov_condition_number is the covariance
+        # condition number.
+        "n_features": n_features,
+        "cov_shrinkage": shrinkage,
+        "cov_condition_number": cov_cond,
     })
 
     # Merge expression class if available
@@ -930,10 +959,17 @@ def predict_growth_rate(
             with open(rp_path) as f:
                 ref_genes = set(line.strip() for line in f if line.strip())
     if not ref_genes:
-        # Heuristic fallback: match genes with "ribosomal" or "rp" in name
+        # Heuristic fallback: match ribosomal-protein gene symbols. The old
+        # "ribosomal|rp" alternation also matched rpoA (RNA polymerase),
+        # trpA/B/C (tryptophan), grpE, etc., silently contaminating the RP
+        # reference set. Anchor on the rps/rpl/rpm symbols (small/large subunit
+        # r-proteins, optional subunit letter) plus the explicit description.
+        # gene_names is already lower-cased, so the pattern is lower-case.
         gene_names = expr_df["gene"].str.lower()
         ref_genes = set(expr_df.loc[
-            gene_names.str.contains("ribosomal|rp", na=False), "gene"
+            gene_names.str.contains(r"\brp[slm][a-z]?\b|ribosomal protein",
+                                    na=False, regex=True),
+            "gene",
         ])
     ref_label = "ribosomal_proteins"
     logger.info("Growth rate proxy (direction only) using RP-CAI (%d genes); "

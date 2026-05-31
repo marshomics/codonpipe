@@ -40,6 +40,32 @@ from codonpipe.utils.statistics import benjamini_hochberg
 logger = logging.getLogger("codonpipe")
 
 
+# Generous upper bound on the number of COA axes emitted for downstream
+# Mahalanobis axis selection. The selector (mahal_clustering._select_n_axes)
+# trims this to the variance-retained subset; emitting more than the historical
+# hard cap of 4 ensures a real-but-minor selection axis (e.g. a translational-
+# selection axis displaced to axis 3-5 in a high-GC genome) is not discarded
+# before the selector ever sees it.
+_COA_AXIS_EMIT_CAP = 15
+
+
+def _broken_stick_pct(p: int) -> np.ndarray:
+    """Expected % inertia per ranked axis under the broken-stick null model.
+
+    Under the null that total inertia is partitioned at random (a stick of
+    unit length broken at p-1 uniformly random points), the expected
+    proportion held by the k-th largest piece is (1/p) * sum_{i=k}^{p} (1/i).
+    Observed axes whose inertia exceeds this null are "real"; the first axis
+    that falls below it marks the noise floor. Standard scree alternative
+    (Frontier 1976; Jackson 1993; Legendre & Legendre 2012).
+    """
+    if p <= 0:
+        return np.array([])
+    inv = 1.0 / np.arange(1, p + 1)
+    bs = np.array([inv[k:].sum() for k in range(p)])
+    return bs / p * 100.0
+
+
 # ─── Correspondence Analysis on RSCU ────────────────────────────────────────
 
 
@@ -59,10 +85,13 @@ def compute_coa_on_rscu(
 
     Returns:
         Dict with:
-            - 'coa_coords': DataFrame (gene, Axis1, Axis2, Axis3, Axis4,
-              inertia_pct_1..4, plus expression tier columns if expr_df given)
+            - 'coa_coords': DataFrame (gene, Axis1..AxisN, plus expression tier
+              columns if expr_df given). N is variance-retained (up to
+              _COA_AXIS_EMIT_CAP), not a fixed 4; the downstream Mahalanobis
+              step selects the working subset from these.
             - 'coa_codon_coords': DataFrame (codon, Axis1, Axis2)
-            - 'coa_inertia': DataFrame (axis, eigenvalue, pct_inertia, cum_pct)
+            - 'coa_inertia': DataFrame (axis, eigenvalue, pct_inertia, cum_pct,
+              broken_stick_pct)
     """
     rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rscu_gene_df.columns]
     if len(rscu_cols) < 4 or len(rscu_gene_df) < 10:
@@ -118,24 +147,46 @@ def compute_coa_on_rscu(
     # Residual matrix
     S = (X / grand_total - E / grand_total) / np.sqrt(E / grand_total)
 
-    # SVD
-    n_axes = min(4, min(S.shape) - 1)
-    if n_axes < 2:
+    # SVD on the full standardized-residual matrix.
+    U_full, sigma_full, Vt_full = np.linalg.svd(S, full_matrices=False)
+    all_sigma = sigma_full.copy()
+    rank = len(all_sigma)
+    if rank < 2:
         return {}
+    total_inertia = float(np.sum(all_sigma ** 2))
 
-    U, sigma, Vt = np.linalg.svd(S, full_matrices=False)
-    # Save all singular values before truncation
-    all_sigma = sigma.copy()
-    # Keep top axes
-    U = U[:, :n_axes]
-    sigma = sigma[:n_axes]
-    V = Vt[:n_axes, :].T
+    # Variance-retained axis emission (replaces the old hard cap of 4). We emit
+    # a generous, bounded set of axes here and let the downstream Mahalanobis
+    # step (mahal_clustering._select_n_axes) pick the working dimensionality by
+    # a 90%-inertia + broken-stick rule. Emitting up to _COA_AXIS_EMIT_CAP
+    # ensures a genuine but minor codon-usage axis is available to that selector
+    # instead of being truncated away a priori. Inertia percentages are computed
+    # against the FULL spectrum (total_inertia), so they remain correct
+    # regardless of how many axes are emitted.
+    full_pct = (all_sigma ** 2) / total_inertia * 100 if total_inertia > 0 else np.zeros(rank)
+    bs_pct = _broken_stick_pct(rank)
+    n_axes = max(2, min(_COA_AXIS_EMIT_CAP, rank, min(S.shape) - 1))
+
+    U = U_full[:, :n_axes]
+    sigma = sigma_full[:n_axes]
+    V = Vt_full[:n_axes, :].T
 
     eigenvalues = sigma ** 2
-    total_inertia = np.sum(all_sigma ** 2)
-    pct_inertia = eigenvalues / total_inertia * 100 if total_inertia > 0 else np.zeros(n_axes)
+    pct_inertia = full_pct[:n_axes]
 
-    # Row (gene) coordinates: scale by sqrt(row_masses)
+    # Row (gene) coordinates: scale by sqrt(row_masses).
+    # SCALING-CONVENTION NOTE: this 1/sqrt(mass) rescaling is applied on top of
+    # an S matrix already standardized as (P - E)/sqrt(E), so the resulting gene
+    # coordinates are NOT identical to canonical CA principal coordinates from
+    # vegan / ade4 / `ca` (absolute positions are stretched per-gene by
+    # ~1/sqrt(row_mass)). Axis ORDERING and the inertia percentages above are
+    # unaffected, and because RSCU row sums are near-constant across genes the
+    # distortion is mild. CodonPipe uses these coordinates only as an internal,
+    # self-consistent space for Mahalanobis clustering — do not compare the raw
+    # coordinate values to external CA tools. Left as-is intentionally: changing
+    # the scaling would shift every downstream cluster result (and any published
+    # numbers derived from it), so it is flagged for a deliberate, versioned
+    # migration rather than changed silently here.
     row_coords = np.diag(1.0 / np.sqrt(row_masses + 1e-30)) @ U * sigma[np.newaxis, :]
     # Column (codon) coordinates
     col_coords = np.diag(1.0 / np.sqrt(col_masses + 1e-30)) @ V * sigma[np.newaxis, :]
@@ -163,6 +214,9 @@ def compute_coa_on_rscu(
         "eigenvalue": eigenvalues,
         "pct_inertia": pct_inertia,
         "cum_pct": np.cumsum(pct_inertia),
+        # Broken-stick null expectation per axis; the downstream selector keeps
+        # only leading axes whose pct_inertia exceeds this.
+        "broken_stick_pct": bs_pct[:n_axes],
     })
 
     return {

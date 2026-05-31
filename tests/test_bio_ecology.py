@@ -137,7 +137,7 @@ class TestGrowthRate:
     def test_basic_prediction(self, tmp_path):
         expr_df = _make_expr_df(100)
         rp_ids = tmp_path / "rp_ids.txt"
-        rp_ids.write_text("\n".join([f"gene_{i:04d}" for i in range(10)]) + "\n")
+        rp_ids.write_text("\n".join([f"gene_{i:04d}" for i in range(20)]) + "\n")
         result = predict_growth_rate(expr_df, rp_ids)
         assert result is not None
         assert "mean_metric_rp" in result
@@ -148,14 +148,14 @@ class TestGrowthRate:
     def test_doubling_time_positive(self, tmp_path):
         expr_df = _make_expr_df(100)
         rp_ids = tmp_path / "rp_ids.txt"
-        rp_ids.write_text("\n".join([f"gene_{i:04d}" for i in range(10)]) + "\n")
+        rp_ids.write_text("\n".join([f"gene_{i:04d}" for i in range(20)]) + "\n")
         result = predict_growth_rate(expr_df, rp_ids)
         assert result["predicted_doubling_time_hours"] > 0
 
     def test_growth_class_values(self, tmp_path):
         expr_df = _make_expr_df(100)
         rp_ids = tmp_path / "rp_ids.txt"
-        rp_ids.write_text("\n".join([f"gene_{i:04d}" for i in range(10)]) + "\n")
+        rp_ids.write_text("\n".join([f"gene_{i:04d}" for i in range(20)]) + "\n")
         result = predict_growth_rate(expr_df, rp_ids)
         assert result["growth_class"] in ("fast", "moderate", "slow")
 

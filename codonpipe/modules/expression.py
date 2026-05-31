@@ -124,7 +124,11 @@ tryCatch({
     width_df <- data.frame(width = width(fasta))
 
     result <- cbind(scores_df, names_df, width_df)
-    result <- subset(result, width > __MIN_LEN__)
+    # Use >= to match the Python-side filter (len(seq) < MIN_GENE_LENGTH is
+    # dropped, i.e. >= MIN_GENE_LENGTH is kept). Previously this was a strict
+    # '>' which dropped genes of exactly MIN_GENE_LENGTH nt that the Python
+    # modules keep, creating a 1-gene-class discrepancy between R and Python.
+    result <- subset(result, width >= __MIN_LEN__)
 
     write.table(result, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
     cat("__METRIC__ analysis complete:", nrow(result), "genes\n")

@@ -70,8 +70,14 @@ logger = logging.getLogger("codonpipe")
 
 _MIN_GENES_FOR_CLUSTERING = 50
 _MIN_COA_AXES = 2
+# Ceiling on retained COA axes. The RP cohort (~50 genes) caps the estimable
+# covariance dimensionality, so the cluster Mahalanobis distance uses a small
+# COA space (not the full 38 independent codon dims the genome-wide HGT scan
+# can afford). An n~50 RP set supports ~8 dims under MCD/shrinkage.
 _MAX_COA_AXES = 8
-_CUMULATIVE_INERTIA_TARGET = 0.80
+# Target cumulative inertia for variance-retained axis selection (replaces the
+# old fixed 80%); paired with a broken-stick guard in _select_n_axes.
+_CUMULATIVE_INERTIA_TARGET = 0.90
 _MIN_CLUSTER_SIZE = 10
 
 # Robust covariance fitting
@@ -189,16 +195,55 @@ def _empirical_cov(X: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def _select_n_axes(coa_inertia: pd.DataFrame, max_axes: int = _MAX_COA_AXES) -> int:
-    """Select number of COA axes to retain based on cumulative inertia."""
-    if coa_inertia.empty:
+    """Choose how many COA axes to keep for the cluster Mahalanobis distance.
+
+    Data-driven criterion (replaces the old fixed cumulative-inertia rule,
+    which in any case never saw more than 4 axes because COA used to emit a
+    hard 4). The working dimensionality is the SMALLER of two counts, then
+    bounded:
+
+      1. Cumulative inertia: leading axes up to _CUMULATIVE_INERTIA_TARGET
+         (default 90%). Adapts to the genome's codon-usage structure but is
+         known to over-retain on slowly-decaying spectra.
+      2. Broken-stick: leading axes whose observed inertia exceeds the
+         broken-stick null (computed by COA against the full ~38-axis
+         spectrum), stopping at the first that does not. This is the standard,
+         conservative scree-stopping rule and is the binding term in essentially
+         every real spectrum. Note it is genuinely conservative: a uniform or
+         near-equal spread *is* the broken-stick null, so it floors to the
+         minimum, and only axes that clearly beat the per-axis null (~11.1 /
+         8.5 / 7.2 / 6.3 / 5.6 % for axes 1-5) are kept. A sub-dominant
+         translational-selection axis in a high-GC genome is retained only if
+         it genuinely clears that floor; a marginal (~5%) one is dropped, which
+         is appropriate because such a direction is not reliably estimable from
+         a ~50-gene RP cohort.
+
+      Floor at _MIN_COA_AXES (covariance needs >= 2 dims); ceiling at
+      *max_axes* (keeps the RP-cohort covariance estimable — see _MAX_COA_AXES).
+      When the broken_stick_pct column is absent (older COA output), only the
+      cumulative-inertia rule applies.
+    """
+    if coa_inertia is None or coa_inertia.empty or "cum_pct" not in coa_inertia.columns:
         return _MIN_COA_AXES
     cum_pct = coa_inertia["cum_pct"].values
     target = _CUMULATIVE_INERTIA_TARGET * 100
-    n = _MIN_COA_AXES
-    for i, cp in enumerate(cum_pct):
-        n = i + 1
-        if cp >= target:
-            break
+    n_target = int(np.searchsorted(cum_pct, target) + 1)
+
+    # Broken-stick guard: count leading axes whose observed inertia exceeds the
+    # broken-stick null, stopping at the first that does not.
+    n_bs = n_target
+    if {"pct_inertia", "broken_stick_pct"}.issubset(coa_inertia.columns):
+        obs = coa_inertia["pct_inertia"].values
+        bs = coa_inertia["broken_stick_pct"].values
+        n_bs = 0
+        for o, b in zip(obs, bs):
+            if o > b:
+                n_bs += 1
+            else:
+                break
+        n_bs = max(n_bs, _MIN_COA_AXES)
+
+    n = min(n_target, n_bs)
     return max(_MIN_COA_AXES, min(n, max_axes, len(cum_pct)))
 
 
@@ -1612,18 +1657,32 @@ def run_mahal_clustering(
 
     median_rp_dist = float(np.median(rp_dists_all[~rp_outlier_mask])) if rp_outlier_mask.any() and len(rp_dists_all) == len(rp_outlier_mask) else float(np.median(rp_dists_all))
 
-    # Backward-compatible threshold diagnostics
+    # Threshold diagnostics. The RP cluster boundary is the empirical
+    # _RP_EMPIRICAL_PCTL-th percentile of the cleaned core-RP Mahalanobis
+    # distances (see emp_threshold above) — NOT a parametric chi-squared
+    # quantile. Label it honestly so anyone reading the diagnostics does
+    # not mistake it for a chi2 boundary. (The genome-wide HGT p-values
+    # computed below DO use a chi-squared tail; that is a separate step.)
     threshold_diag = {
-        "method": "chi2",
-        "chi2_p": _CLUSTER_CHI2_P,
-        "chi2_df": n_axes,
+        "method": f"empirical_p{_RP_EMPIRICAL_PCTL:g}",
+        "empirical_pctl": _RP_EMPIRICAL_PCTL,
+        "n_coa_axes": n_axes,
         "threshold": round(threshold, 4),
         "effective_multiplier": round(threshold / median_rp_dist, 4) if median_rp_dist > 0 else 0.0,
         "projection": "full",
     }
     results["threshold_diagnostics"] = threshold_diag
 
-    # RP-vs-cluster cosine similarity
+    # RP-vs-cluster cosine similarity.
+    # QC / SELF-CONSISTENCY DIAGNOSTIC ONLY — NOT independent validation.
+    # The optimized cluster is anchored on the RP centroid and (when multiple
+    # subclusters exist) the primary is *selected* to maximise cosine to the
+    # RP consensus, so a high cluster-vs-RP cosine is largely guaranteed by
+    # construction. Read this as "did the RP anchor hold / is the cluster
+    # internally consistent with its seed", never as evidence that the cluster
+    # is translationally optimized. For genuine validation use an axis the
+    # cluster was not built from (measured expression / proteomics, dN/dS,
+    # or growth rate).
     rp_cosine_sim = np.nan
     if rp_rscu_df is not None and not rp_rscu_df.empty:
         rscu_cols = [c for c in RSCU_COLUMN_NAMES
@@ -1636,9 +1695,9 @@ def run_mahal_clustering(
             )
 
     logger.info(
-        "RP cluster: threshold=%.2f (chi2, p=%.2f, df=%d), "
-        "%d genes (%d RPs + %d non-RP)",
-        threshold, _CLUSTER_CHI2_P, n_axes,
+        "RP cluster: threshold=%.2f (empirical %gth pctl of cleaned core "
+        "RP distances in %d COA axes), %d genes (%d RPs + %d non-RP)",
+        threshold, _RP_EMPIRICAL_PCTL, n_axes,
         n_cluster, n_rp_in_cluster, n_cluster - n_rp_in_cluster,
     )
 
@@ -1681,7 +1740,14 @@ def run_mahal_clustering(
     # of HGT calls instead of relying on the per-gene 95% chi-squared
     # threshold (Bonferroni-naive, which yields ~5% FP across thousands
     # of genes).
-    effective_df = _safe_inv.last_rank or n_axes
+    # df = the COA dimensionality the PRIMARY cluster's distances were computed
+    # in. These ``distances`` use the primary cluster's covariance, built in
+    # n_axes orthogonal COA axes (full rank by construction), so n_axes is the
+    # correct df. The previous code read _safe_inv.last_rank — a mutable
+    # function attribute set by whichever covariance was inverted LAST during
+    # sub-cluster fitting, not necessarily the primary's — which could silently
+    # apply the wrong df to this genome-wide tail test.
+    effective_df = n_axes if n_axes >= 1 else 1
     chi2_pvalues = chi2.sf(distances ** 2, df=effective_df)
     chi2_qvalues = benjamini_hochberg(chi2_pvalues)
 
@@ -1726,7 +1792,7 @@ def run_mahal_clustering(
         "total_rp_genes": len(rp_gene_ids),
         "rp_outliers_removed": int(rp_outlier_mask.sum()) if len(rp_outlier_mask) > 0 else 0,
         "mahalanobis_threshold": round(threshold, 4),
-        "threshold_method": "chi2",
+        "threshold_method": f"empirical_p{_RP_EMPIRICAL_PCTL:g}",
         "threshold_projection": "full",
         "threshold_effective_multiplier": threshold_diag["effective_multiplier"],
         "threshold_kde_valley": None,
@@ -1736,7 +1802,8 @@ def run_mahal_clustering(
         "median_rp_distance": round(median_rp_dist, 4),
         "rscu_pooling": "distance-weighted",
         "mean_rscu_weight": round(mean_weight, 4),
-        "rp_cosine_similarity": round(rp_cosine_sim, 4) if not np.isnan(rp_cosine_sim) else None,
+        # QC self-consistency diagnostic, NOT validation (see computation site).
+        "rp_cosine_similarity_qc": round(rp_cosine_sim, 4) if not np.isnan(rp_cosine_sim) else None,
     }
     summary_df = pd.DataFrame([summary])
     summary_path = mahal_dir / f"{sample_id}_mahal_summary.tsv"
