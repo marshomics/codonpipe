@@ -267,6 +267,36 @@ class TestTranslationalSelection:
         result = quantify_translational_selection(rscu_df, enc_df, expr_df, ffn)
         assert set(result) >= {"optimal_codons", "fop_gradient", "position_effects"}
 
+    def test_optimal_codon_idxmax_all_na_group_does_not_raise(self, tmp_path):
+        # Regression for the real E. coli crash "Encountered all NA values":
+        # under pandas >= 2.1 an all-NA Series.idxmax() RAISES (older pandas only
+        # warned). The per-amino-acid "mark most-enriched codon" loop hit this
+        # when a family's delta_rscu was all-NA. We promote that FutureWarning to
+        # an error here so this test reproduces the newer-pandas behavior and
+        # fails on the old code, passes on the fix.
+        import warnings as _w
+
+        n = 80
+        rscu_df = _make_rscu_gene_df(n)
+        enc_df = _make_enc_df(n)
+        ffn = _write_fasta(tmp_path, n)
+        # MELP mostly floor-saturated so the high-expression set is small and
+        # some AA families end up with undefined (NaN) delta_rscu.
+        melp = np.zeros(n)
+        melp[-6:] = np.linspace(1.0, 3.0, 6)
+        expr_df = pd.DataFrame({
+            "gene": [f"gene_{i:04d}" for i in range(n)],
+            "MELP": melp,
+            "expression_class": (["low"] * 74 + ["high"] * 6),
+        })
+        with _w.catch_warnings():
+            # Make the all-NA idxmax FutureWarning behave like the newer-pandas
+            # hard error; the patched code must avoid calling idxmax on all-NA.
+            _w.filterwarnings("error", message=".*idxmax with all-NA.*",
+                              category=FutureWarning)
+            result = quantify_translational_selection(rscu_df, enc_df, expr_df, ffn)
+        assert "optimal_codons" in result
+
 
 # ── Phage/Mobile Element Detection ────────────────────────────────────────
 

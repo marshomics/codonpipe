@@ -31,6 +31,38 @@ from codonpipe.utils.codon_tables import AMINO_ACID_FAMILIES, RSCU_COLUMN_NAMES,
 logger = logging.getLogger("codonpipe")
 
 
+import contextlib as _contextlib
+import os as _os
+
+
+@_contextlib.contextmanager
+def _suppress_fd_stderr():
+    """Redirect the process stderr file descriptor (fd 2) to os.devnull for the
+    duration of the block, then restore it.
+
+    Needed because some subprocesses (notably plotly's kaleido renderer, which
+    pulls in a TensorFlow-backed stack) write banner lines straight to fd 2
+    before any Python-level logging configuration applies, so neither
+    ``warnings`` filters nor environment variables can suppress them. Operating
+    at the descriptor level catches that output. Best-effort: if the platform
+    does not support the dup/dup2 dance, the block still runs unredirected.
+    """
+    try:
+        saved_fd = _os.dup(2)
+    except (OSError, ValueError, AttributeError):
+        # No usable stderr fd (e.g. captured to a non-fd object); run as-is.
+        yield
+        return
+    devnull = _os.open(_os.devnull, _os.O_WRONLY)
+    try:
+        _os.dup2(devnull, 2)
+        yield
+    finally:
+        _os.dup2(saved_fd, 2)
+        _os.close(devnull)
+        _os.close(saved_fd)
+
+
 def _gene_labels_with_definition(
     df: pd.DataFrame,
     *,
@@ -2586,10 +2618,19 @@ def plot_coa_kde_dual_anchor_3d_interactive(
     fig.write_html(str(html_path), include_plotlyjs="cdn")
     logger.info("Saved interactive 3-D plot: %s", html_path)
 
-    # Also save a static PNG via plotly's kaleido if available
+    # Also save a static PNG via plotly's kaleido if available.
+    # kaleido renders in a headless Chromium subprocess that pulls in a
+    # TensorFlow-backed stack; its CUDA-driver probe writes
+    #   "Could not find cuda drivers ... GPU will not be used"
+    # (and the absl pre-init banner) straight to the process's stderr file
+    # descriptor *before* any Python/absl log-level setting can take effect, so
+    # env vars (TF_CPP_MIN_LOG_LEVEL, CUDA_VISIBLE_DEVICES) do not suppress it.
+    # Redirect fd 2 to /dev/null for just this call so the banner does not
+    # clutter run logs; real Python-level errors are still caught below.
     try:
         png_path = output_path.with_suffix(".png")
-        fig.write_image(str(png_path), width=950, height=750, scale=2)
+        with _suppress_fd_stderr():
+            fig.write_image(str(png_path), width=950, height=750, scale=2)
     except Exception:
         logger.debug("Static PNG export from plotly failed (kaleido not installed?)")
 

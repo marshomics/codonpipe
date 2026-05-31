@@ -1159,11 +1159,16 @@ def quantify_translational_selection(
             })
         optimal_df = pd.DataFrame(optimal_rows)
 
-        # Mark the single most enriched codon per AA
+        # Mark the single most enriched codon per AA. delta_rscu can be all-NaN
+        # for an amino-acid family when its high-expression RSCU is undefined
+        # (e.g. heavy MELP-floor saturation leaves too few clean high-expression
+        # genes). On pandas >= 2.1 idxmax() raises "Encountered all NA values"
+        # for an all-NA group (older pandas only warned), which crashed the
+        # whole translational-selection analysis. Skip those groups.
         for aa in optimal_df["amino_acid"].unique():
-            aa_mask = optimal_df["amino_acid"] == aa
-            if aa_mask.sum() > 0:
-                max_idx = optimal_df.loc[aa_mask, "delta_rscu"].idxmax()
+            aa_vals = optimal_df.loc[optimal_df["amino_acid"] == aa, "delta_rscu"]
+            if aa_vals.notna().any():
+                max_idx = aa_vals.idxmax()
                 optimal_df.loc[max_idx, "is_optimal"] = 2  # Mark as top optimal
 
     # --- B. Fop gradient across expression quintiles ---
