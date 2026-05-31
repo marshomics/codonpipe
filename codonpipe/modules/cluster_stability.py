@@ -148,6 +148,140 @@ def _jaccard_index(a: set, b: set) -> float:
     return inter / union if union else 0.0
 
 
+# Margin below the weakest core RP gene's cosine that a rescued gene is still
+# allowed to sit at, so the rescue threshold is not hostage to a single odd
+# core member. 0.0 = exactly the weakest core member; a small margin lets a
+# gene that is essentially as RP-like also qualify.
+_RESCUE_COSINE_MARGIN = 0.005
+# Geometric sanity cap on the rescue: a rescued gene must sit within this
+# multiple of the cluster's Mahalanobis boundary. RSCU cosine alone is too
+# permissive because all ribosomal proteins share amino-acid composition and
+# therefore look somewhat RP-like even when scattered far from the cluster in
+# COA space (observed: B. subtilis RP genes at distance 13-18 near the genome
+# bulk score high cosine). Requiring BOTH RP-like codon usage AND geometric
+# proximity recovers the cohort's borderline tail (distance just past the cut)
+# without admitting the far-flung RP genes. The cohort tail and the scattered
+# RP genes are well separated in distance (B. subtilis: tail ends ~5.8, next
+# RP gene at ~8.5), so 2x the boundary cleanly divides them.
+_RESCUE_DISTANCE_MULT = 2.0
+
+
+def _rescue_rp_by_rscu(core_ids, rp_gene_ids, ffn_path, rp_rscu_df,
+                       distances=None, gene_ids=None, boundary=None):
+    """Rescue annotated RP genes whose codon usage is as ribosomal-like as the
+    weakest RP gene already in the core AND which sit within a sanity distance
+    of the cluster.
+
+    The geometric (Mahalanobis) boundary can clip legitimate RP genes when the
+    cohort's distances trail off without a clean gap. Membership in the
+    translational-optimum core is fundamentally about ribosomal-protein-like
+    codon usage, so we compare each gene's RSCU to the RP consensus by cosine
+    similarity and admit any out-of-core RP gene whose similarity is at least
+    that of the weakest in-core RP gene (minus a small margin) AND whose
+    Mahalanobis distance is within ``_RESCUE_DISTANCE_MULT`` x the cluster
+    boundary. The cosine test keeps the rescue biologically grounded; the
+    distance cap prevents compositionally-RP-but-geometrically-distant genes
+    from being pulled in. The rescue is restricted to annotated RP genes, so it
+    can never add non-RP bulk genes.
+
+    Returns the set of rescued gene IDs (possibly empty). Needs the per-gene
+    nucleotide FASTA (to compute each gene's RSCU) and the RP-only RSCU table
+    (for the consensus); the distance cap is applied only when ``distances``,
+    ``gene_ids`` and ``boundary`` are supplied. Returns an empty set when the
+    FASTA or RP RSCU table is unavailable.
+    """
+    if not core_ids or not rp_gene_ids:
+        return set()
+    if ffn_path is None or not Path(ffn_path).exists():
+        return set()
+    if rp_rscu_df is None or rp_rscu_df.empty:
+        return set()
+
+    # Optional geometric sanity cap: max distance a rescued gene may sit at.
+    dist_cap = None
+    gid_to_dist = None
+    if distances is not None and gene_ids is not None and boundary is not None:
+        dist_cap = float(boundary) * _RESCUE_DISTANCE_MULT
+        gid_to_dist = {g: float(d) for g, d in zip(gene_ids, np.asarray(distances, float))}
+
+    rscu_cols = [c for c in RSCU_COLUMN_NAMES if c in rp_rscu_df.columns]
+    if not rscu_cols:
+        return set()
+    consensus = rp_rscu_df[rscu_cols].mean()
+    cvec = np.nan_to_num(consensus.to_numpy(dtype=float), nan=0.0)
+    cnorm = np.linalg.norm(cvec)
+    if cnorm == 0:
+        return set()
+
+    # Per-gene RSCU for the union of the current core and all RP genes (so we
+    # can score both the weakest core member and every rescue candidate).
+    need_ids = set(core_ids) | set(rp_gene_ids)
+    gene_rscu = _compute_per_gene_rscu(ffn_path, need_ids)
+    if gene_rscu is None or gene_rscu.empty:
+        return set()
+    cols_present = [c for c in rscu_cols if c in gene_rscu.columns]
+    if not cols_present:
+        return set()
+    cvec = np.nan_to_num(consensus[cols_present].to_numpy(dtype=float), nan=0.0)
+    cnorm = np.linalg.norm(cvec)
+    if cnorm == 0:
+        return set()
+
+    def _cos(gid):
+        if gid not in gene_rscu.index:
+            return None
+        v = np.nan_to_num(gene_rscu.loc[gid, cols_present].to_numpy(dtype=float), nan=0.0)
+        vn = np.linalg.norm(v)
+        if vn == 0:
+            return None
+        return float(v @ cvec / (vn * cnorm))
+
+    # Weakest cosine among RP genes already in the core defines the bar.
+    core_rp = [g for g in core_ids if g in rp_gene_ids]
+    core_cos = [c for c in (_cos(g) for g in core_rp) if c is not None]
+    if not core_cos:
+        return set()
+    bar = float(min(core_cos)) - _RESCUE_COSINE_MARGIN
+
+    rescued = set()
+    for g in rp_gene_ids:
+        if g in core_ids:
+            continue
+        # Geometric sanity cap: skip genes too far from the cluster, even if
+        # their codon usage is RP-like.
+        if dist_cap is not None and gid_to_dist is not None:
+            d = gid_to_dist.get(g)
+            if d is None or not np.isfinite(d) or d > dist_cap:
+                continue
+        c = _cos(g)
+        if c is not None and c >= bar:
+            rescued.add(g)
+    return rescued
+
+
+def _compute_per_gene_rscu(ffn_path, gene_ids):
+    """Per-gene RSCU table (genes × codon columns) for a set of gene IDs.
+
+    Thin wrapper over the project's per-gene RSCU computation so the rescue
+    helper stays decoupled from the exact RSCU implementation. Returns a
+    DataFrame indexed by gene ID, or None if it cannot be computed.
+    """
+    try:
+        from codonpipe.modules.rscu import compute_rscu_per_gene
+    except Exception:
+        return None
+    try:
+        df = compute_rscu_per_gene(Path(ffn_path))
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    if "gene" in df.columns:
+        df = df.set_index("gene")
+    keep = [g for g in gene_ids if g in df.index]
+    return df.loc[keep] if keep else None
+
+
 def _validate_rp_subclusters(
     X_rp: np.ndarray,
     rp_ids_list: list[str],
@@ -626,6 +760,61 @@ def run_stability_analysis(
     core_mask = all_freqs >= core_threshold
     n_core = int(core_mask.sum())
     core_ids = {gid for gid, f in freq.items() if f >= core_threshold}
+
+    # ── RSCU-similarity rescue of borderline RP genes ──────────────
+    # The membership-frequency boundary is geometric (Mahalanobis distance in
+    # COA space). On genomes where the RP cohort's distances trail off smoothly
+    # with no clean gap (e.g. B. subtilis), that boundary clips legitimate
+    # ribosomal-protein genes whose codon usage is still strongly RP-like — the
+    # distance is marginally beyond the cut, but the gene IS ribosomal. Because
+    # the optimized core is meant to be "genes with ribosomal-protein-like codon
+    # usage", we rescue any annotated RP gene whose RSCU cosine to the RP
+    # consensus is at least as high as the weakest RP gene already in the core.
+    # This recovers genuine members while still excluding the truly drifted RP
+    # outliers (whose codon usage has diverged from the consensus). The rescue
+    # is RP-only and threshold-data-driven (no magic constant), so it cannot
+    # pull in non-RP bulk genes.
+    rescued_ids: set = set()
+    try:
+        # Representative per-gene distances + boundary for the geometric sanity
+        # cap: fit the anchor RP centroid once (deterministically, no resample)
+        # on its dense core and take the gap boundary, mirroring the per-replicate
+        # geometry without the bootstrap noise.
+        _rescue_dist = None
+        _rescue_boundary = None
+        try:
+            _anchor_X = X[anchor_rp_indices]
+            _au = np.unique(anchor_rp_indices)
+            _ids_u = [str(i) for i in _au]
+            _, _core_strs, _ = _select_rp_dense_core(X[_au], _ids_u, density_pctl=50)
+            _cset = set(_core_strs)
+            _Xfit = np.array([X[i] for i in _au if str(i) in _cset])
+            if len(_Xfit) < max(3, n_axes + 1):
+                _Xfit = _anchor_X
+            _cen, _cov, _cinv, _ = _fit_robust_rp_reference(
+                _Xfit, n_axes, alpha=_RP_OUTLIER_ALPHA, min_rp=_MIN_RP_FOR_ROBUST,
+            )
+            _rescue_dist = _compute_mahalanobis_distances(X, _cen, _cinv)
+            _rescue_boundary, _ = _gap_boundary(_rescue_dist[anchor_rp_indices], n_axes)
+        except Exception as _e:
+            logger.debug("Rescue distance prep failed (%s); cosine-only rescue", _e)
+
+        rescued_ids = _rescue_rp_by_rscu(
+            core_ids, rp_gene_ids, ffn_path, rp_rscu_df,
+            distances=_rescue_dist, gene_ids=coa_gene_ids, boundary=_rescue_boundary,
+        )
+        if rescued_ids:
+            core_ids = core_ids | rescued_ids
+            core_mask = np.array([gid in core_ids for gid in all_gene_ids])
+            n_core = int(core_mask.sum())
+            logger.info(
+                "RSCU-similarity rescue: added %d borderline RP gene(s) whose "
+                "codon usage is as ribosomal-like as the weakest core member "
+                "(core %d -> %d genes)",
+                len(rescued_ids), n_core - len(rescued_ids), n_core,
+            )
+    except Exception as e:
+        logger.debug("RSCU-similarity rescue skipped (%s)", e)
 
     # ── Stability metrics ──────────────────────────────────────────
     # Pairwise Jaccard

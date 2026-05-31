@@ -99,3 +99,79 @@ class TestAnchorSelection:
         anchor, reason = CS._select_rp_anchor([dead, stable], None, None)
         assert anchor is stable
         assert reason == "single_validated_cluster"
+
+
+class TestRscuRescue:
+    """Borderline RP genes whose codon usage is as ribosomal-like as the
+    weakest core member are rescued, but only within a distance sanity cap so
+    compositionally-RP-but-geometrically-distant genes are not pulled in."""
+
+    def _setup(self, monkeypatch, tmp_path):
+        import pandas as pd
+        from codonpipe.utils.codon_tables import RSCU_COLUMN_NAMES
+        cols = list(RSCU_COLUMN_NAMES[:6])
+
+        # RP consensus vector (all-ones over the used columns).
+        rp_rscu_df = pd.DataFrame([{c: 1.0 for c in cols} for _ in range(5)])
+
+        # Per-gene RSCU: core genes + an RP-like-but-far gene + an RP-unlike gene.
+        rows = {
+            # core RP genes, clearly RP-like
+            "core1": {c: 1.0 for c in cols},
+            "core2": {c: 0.95 for c in cols},
+            "core3": {c: 0.90 for c in cols},   # weakest core member sets the bar
+            # borderline RP gene: as RP-like as core3, just past the boundary
+            "border": {c: 0.92 for c in cols},
+            # RP-like in composition but geometrically far away
+            "far": {c: 0.99 for c in cols},
+            # RP gene whose codon usage has drifted (low cosine)
+            "drift": {c: (1.0 if i == 0 else -1.0) for i, c in enumerate(cols)},
+        }
+        gene_rscu = pd.DataFrame(rows).T
+        monkeypatch.setattr(CS, "_compute_per_gene_rscu",
+                            lambda ffn, ids: gene_rscu.loc[[g for g in ids if g in gene_rscu.index]])
+
+        ffn = tmp_path / "x.ffn"
+        ffn.write_text(">core1\nATG\n")  # only needs to exist
+        return rp_rscu_df, ffn
+
+    def test_rescues_borderline_within_distance_cap(self, monkeypatch, tmp_path):
+        rp_rscu_df, ffn = self._setup(monkeypatch, tmp_path)
+        core = {"core1", "core2", "core3"}
+        rp_ids = {"core1", "core2", "core3", "border", "far", "drift"}
+        gene_ids = ["core1", "core2", "core3", "border", "far", "drift"]
+        # boundary ~3.5; border just past it, far well beyond 2x cap, drift near.
+        dist = [1.0, 2.0, 3.0, 4.0, 20.0, 3.5]
+        rescued = CS._rescue_rp_by_rscu(core, rp_ids, ffn, rp_rscu_df,
+                                        distances=dist, gene_ids=gene_ids, boundary=3.5)
+        assert "border" in rescued          # RP-like + within distance cap
+        assert "far" not in rescued         # RP-like but beyond the distance cap
+        assert "drift" not in rescued       # close but not RP-like
+
+    def test_distance_cap_excludes_far_rp_like_genes(self, monkeypatch, tmp_path):
+        rp_rscu_df, ffn = self._setup(monkeypatch, tmp_path)
+        core = {"core1", "core2", "core3"}
+        rp_ids = {"core1", "core2", "core3", "far"}
+        gene_ids = ["core1", "core2", "core3", "far"]
+        dist = [1.0, 2.0, 3.0, 20.0]
+        rescued = CS._rescue_rp_by_rscu(core, rp_ids, ffn, rp_rscu_df,
+                                        distances=dist, gene_ids=gene_ids, boundary=3.5)
+        assert rescued == set()
+
+    def test_rescue_is_rp_only(self, monkeypatch, tmp_path):
+        # A non-RP gene that happens to be RP-like must never be rescued, because
+        # the candidate loop iterates only over rp_gene_ids.
+        rp_rscu_df, ffn = self._setup(monkeypatch, tmp_path)
+        core = {"core1", "core2", "core3"}
+        rp_ids = {"core1", "core2", "core3"}     # 'border' is NOT an RP gene here
+        gene_ids = ["core1", "core2", "core3", "border"]
+        dist = [1.0, 2.0, 3.0, 4.0]
+        rescued = CS._rescue_rp_by_rscu(core, rp_ids, ffn, rp_rscu_df,
+                                        distances=dist, gene_ids=gene_ids, boundary=3.5)
+        assert "border" not in rescued
+
+    def test_no_ffn_returns_empty(self, monkeypatch, tmp_path):
+        import pandas as pd
+        rp_rscu_df, _ = self._setup(monkeypatch, tmp_path)
+        rescued = CS._rescue_rp_by_rscu({"core1"}, {"core1", "border"}, None, rp_rscu_df)
+        assert rescued == set()
